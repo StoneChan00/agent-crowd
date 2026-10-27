@@ -104,6 +104,8 @@ export interface Character {
   enabled: boolean
   /** Cross-room identity anchor (long-term memory owner); bound on first turn. */
   identityId: string | null
+  /** Library template this character was created from; powers the "↻ 同步" refresh. */
+  presetId: string | null
   createdAt: number
 }
 

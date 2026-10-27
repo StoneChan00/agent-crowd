@@ -1,10 +1,19 @@
-import type { Character, HarnessMap } from '../types'
+import type { Character, CharacterPreset, HarnessMap } from '../types'
 import { Avatar } from './Avatar'
 import { HARNESS_META, modelShort, triggerSummary } from '../lib/format'
+
+/**
+ * Fields the server-side sync overwrites (db.syncCharacterFromPreset:
+ * name/aliases/avatar/color/harness/model/persona/cwd/triggers/
+ * commandTemplate/autoApprove); enabled, identity-bound memory and chat
+ * history are preserved. Keep the tooltip honest about the blast radius.
+ */
+const SYNC_COVERAGE = '名字、别名、外观、人设、harness、模型、工作目录、触发规则、命令模板与自动批准'
 
 interface CharacterPanelProps {
   characters: Character[]
   members: Character[]
+  presets: CharacterPreset[]
   harnesses: HarnessMap
   activeCharacterId: string | null
   onAdd: () => void
@@ -12,11 +21,13 @@ interface CharacterPanelProps {
   onEdit: (character: Character) => void
   onRun: (character: Character) => void
   onToggle: (character: Character, enabled: boolean) => void
+  onSync: (character: Character) => void
 }
 
 export function CharacterPanel({
   characters,
   members,
+  presets,
   harnesses,
   activeCharacterId,
   onAdd,
@@ -24,7 +35,12 @@ export function CharacterPanel({
   onEdit,
   onRun,
   onToggle,
+  onSync,
 }: CharacterPanelProps) {
+  // Mirrors the router: with no @mention the first *enabled* character takes
+  // the user message. The badge below makes that fallback visible.
+  const firstEnabledId = characters.find((character) => character.enabled)?.id ?? null
+
   return (
     <aside className="character-panel">
       <div className="panel-head">
@@ -48,6 +64,20 @@ export function CharacterPanel({
           const available = harnesses[character.harness]?.available ?? true
           const triggers = triggerSummary(character, members)
           const isActive = character.id === activeCharacterId
+          const isDefaultResponder = character.id === firstEnabledId
+          // Mirrors the server's sync rule: the linked template (preset_id)
+          // wins; otherwise only a *unique* same-name template can be
+          // adopted — several presets sharing the name are ambiguous and
+          // the route would 409, so the panel must not offer the button.
+          const exactPreset = character.presetId
+            ? presets.find((preset) => preset.id === character.presetId)
+            : undefined
+          const sameNamePresets = exactPreset
+            ? []
+            : presets.filter((preset) => preset.name === character.name)
+          const linkedPreset = exactPreset ?? (sameNamePresets.length === 1 ? sameNamePresets[0] : undefined)
+          const presetMissing = Boolean(character.presetId) && !linkedPreset
+          const presetAmbiguous = !linkedPreset && sameNamePresets.length > 1
 
           return (
             <div
@@ -76,6 +106,19 @@ export function CharacterPanel({
                       {modelShort(character.model)}
                     </span>
                     {!available && <span className="warn-tag">未安装</span>}
+                    {presetMissing && (
+                      <span className="warn-tag" title="角色库里的模板已被删除，无法再对齐">
+                        模板已删除
+                      </span>
+                    )}
+                    {presetAmbiguous && (
+                      <span
+                        className="warn-tag"
+                        title="角色库里存在多个同名模板，无法确定对齐目标；请先在角色库里消除重名"
+                      >
+                        模板重名
+                      </span>
+                    )}
                     {character.aliases.map((alias) => (
                       <span key={alias} className="alias-tag" title={`@${alias} 也能唤醒 ${character.name}`}>
                         @{alias}
@@ -88,6 +131,14 @@ export function CharacterPanel({
               {character.persona && <p className="character-persona">{character.persona.split('\n')[0]}</p>}
 
               <div className="trigger-row">
+                {isDefaultResponder && (
+                  <span
+                    className="trigger-chip default-chip"
+                    title="没有 @ 任何人时，用户消息默认由这个（第一个启用的）角色接手回复"
+                  >
+                    用户发言·默认
+                  </span>
+                )}
                 {triggers.map((trigger) => (
                   <span key={trigger} className="trigger-chip">
                     {trigger}
@@ -99,6 +150,19 @@ export function CharacterPanel({
                 <button className="btn btn-ghost btn-sm" onClick={() => onEdit(character)}>
                   编辑
                 </button>
+                {linkedPreset && (
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => onSync(character)}
+                    title={
+                      exactPreset
+                        ? `用角色库模板「${linkedPreset.name}」覆盖${SYNC_COVERAGE}（保留启用状态、长期记忆与聊天历史）`
+                        : `关联角色库同名模板「${linkedPreset.name}」并同步：覆盖${SYNC_COVERAGE}（保留启用状态、长期记忆与聊天历史）`
+                    }
+                  >
+                    ↻ 对齐
+                  </button>
+                )}
                 <button
                   className="btn btn-ghost btn-sm"
                   onClick={() => onRun(character)}

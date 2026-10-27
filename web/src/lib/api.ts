@@ -68,6 +68,10 @@ export const api = {
       body: JSON.stringify({ presetIds }),
     }),
 
+  /** Re-copy the linked library template onto this room character. */
+  syncCharacterFromPreset: (characterId: string) =>
+    request<Character>(`/api/characters/${characterId}/sync-preset`, { method: 'POST' }),
+
   presets: () => request<{ presets: CharacterPreset[] }>('/api/presets'),
 
   createPreset: (input: Partial<CharacterPreset>) =>

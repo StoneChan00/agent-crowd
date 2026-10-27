@@ -281,6 +281,16 @@ export default function App() {
     }
   }
 
+  const syncCharacter = async (character: Character) => {
+    try {
+      const updated = await api.syncCharacterFromPreset(character.id)
+      await refresh()
+      setNotice(`「${updated.name}」已与角色库对齐`)
+    } catch (error) {
+      setNotice(`对齐失败：${error instanceof Error ? error.message : error}`)
+    }
+  }
+
   const runCharacter = async (character: Character) => {
     try {
       await api.runCharacter(character.id)
@@ -438,6 +448,7 @@ export default function App() {
         <CharacterPanel
           characters={characters}
           members={characters}
+          presets={presets}
           harnesses={bootstrap.harnesses}
           activeCharacterId={activeCharacterId}
           onAdd={() => setEditingCharacter(null)}
@@ -445,6 +456,7 @@ export default function App() {
           onEdit={(character) => setEditingCharacter(character)}
           onRun={runCharacter}
           onToggle={toggleCharacter}
+          onSync={syncCharacter}
         />
       )}
 

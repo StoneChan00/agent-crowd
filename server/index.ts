@@ -591,6 +591,31 @@ app.post('/api/rooms/:id/characters/from-presets', (req, res) => {
   res.status(201).json(db.addPresetsToRoom(room.id, presetIds))
 })
 
+app.post('/api/characters/:id/sync-preset', (req, res) => {
+  const character = db.getCharacter(req.params.id)
+  if (!character) return fail(res, 404, '角色不存在')
+  // Linked characters know their template. Legacy rows (created before
+  // preset_id existed) can adopt a unique same-name template instead.
+  const linked = character.presetId ? db.getPreset(character.presetId) : undefined
+  const sameName = linked ? [] : db.listPresets().filter((preset) => preset.name === character.name)
+  const preset = linked ?? (sameName.length === 1 ? sameName[0] : undefined)
+  if (!preset) {
+    return fail(
+      res,
+      409,
+      character.presetId
+        ? '角色库里的模板已被删除，无法对齐；请先在角色库重建同名模板'
+        : '这个角色不是从角色库添加的（也没有唯一的同名模板），无法对齐',
+    )
+  }
+  try {
+    res.json(db.syncCharacterFromPreset(character, preset))
+  } catch (error) {
+    if (error instanceof db.CallNameConflictError) return fail(res, 400, error.message)
+    throw error
+  }
+})
+
 app.patch('/api/characters/:id', (req, res) => {
   const current = db.getCharacter(req.params.id)
   if (!current) return fail(res, 404, '角色不存在')

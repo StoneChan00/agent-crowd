@@ -50,6 +50,7 @@ db.exec(`
     auto_approve integer not null default 1,
     enabled integer not null default 1,
     identity_id text,
+    preset_id text,
     created_at integer not null
   );
   create index if not exists idx_characters_room on characters(room_id);
@@ -144,6 +145,9 @@ function addColumnIfMissing(table: string, column: string, ddl: string): void {
 addColumnIfMissing('characters', 'aliases', "aliases text not null default '[]'")
 addColumnIfMissing('character_presets', 'aliases', "aliases text not null default '[]'")
 addColumnIfMissing('characters', 'identity_id', 'identity_id text')
+// Persists which library template a room character was born from, so the
+// "↻ 对齐" refresh knows what to realign against (docs/memory-plan.md L1).
+addColumnIfMissing('characters', 'preset_id', 'preset_id text')
 // Persisted so the boot sweep can taskkill CLI trees orphaned by a hard kill.
 addColumnIfMissing('turns', 'pid', 'pid integer')
 
@@ -322,6 +326,7 @@ function mapCharacter(row: Record<string, unknown>): Character {
     autoApprove: Number(row.auto_approve ?? 1) === 1,
     enabled: Number(row.enabled ?? 1) === 1,
     identityId: row.identity_id === null || row.identity_id === undefined ? null : String(row.identity_id),
+    presetId: row.preset_id === null || row.preset_id === undefined ? null : String(row.preset_id),
     createdAt: Number(row.created_at),
   }
 }
@@ -356,6 +361,8 @@ export interface CharacterInput {
   commandTemplate?: string
   autoApprove?: boolean
   enabled?: boolean
+  /** Library template this character is copied from; null for hand-made characters. */
+  presetId?: string | null
 }
 
 export function createCharacter(input: CharacterInput): Character {
@@ -376,14 +383,15 @@ export function createCharacter(input: CharacterInput): Character {
     autoApprove: input.autoApprove ?? true,
     enabled: input.enabled ?? true,
     identityId: null,
+    presetId: input.presetId ?? null,
     createdAt: now(),
   }
   // Ambiguous call-names would make @mentions wake the wrong character.
   assertCallNamesFree(input.roomId, null, character.name, character.aliases)
   db.prepare(
     `insert into characters
-       (id, room_id, name, aliases, avatar, color, harness, model, persona, cwd, triggers, command_template, auto_approve, enabled, created_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, room_id, name, aliases, avatar, color, harness, model, persona, cwd, triggers, command_template, auto_approve, enabled, preset_id, created_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     character.id,
     character.roomId,
@@ -399,6 +407,7 @@ export function createCharacter(input: CharacterInput): Character {
     character.commandTemplate,
     character.autoApprove ? 1 : 0,
     character.enabled ? 1 : 0,
+    character.presetId,
     character.createdAt,
   )
   return character
@@ -1036,6 +1045,7 @@ export function createCharacterFromPreset(preset: CharacterPreset, roomId: strin
     triggers: { ...preset.triggers, onCharacters: ids },
     commandTemplate: preset.commandTemplate,
     autoApprove: preset.autoApprove,
+    presetId: preset.id,
   })
 }
 
@@ -1072,6 +1082,35 @@ export function addPresetsToRoom(
     existing.add(character.name)
   }
   return { created, skipped }
+}
+
+/**
+ * Re-align a room character with the library template it was copied from.
+ * The template owns looks/persona/harness/model/triggers; room-local state
+ * (enabled, identity binding, message history) is left untouched. Name-based
+ * relay rules are resolved against this room again, exactly like an import.
+ */
+export function syncCharacterFromPreset(character: Character, preset: CharacterPreset): Character {
+  const members = listCharacters(character.roomId)
+  const ids = preset.triggers.onCharacterNames
+    .map((name) => members.find((member) => member.id !== character.id && member.name === name)?.id)
+    .filter((id): id is string => Boolean(id))
+  const next = updateCharacter(character.id, {
+    name: preset.name,
+    aliases: preset.aliases,
+    avatar: preset.avatar,
+    color: preset.color,
+    harness: preset.harness,
+    model: preset.model,
+    persona: preset.persona,
+    cwd: preset.cwd,
+    triggers: { ...preset.triggers, onCharacters: ids },
+    commandTemplate: preset.commandTemplate,
+    autoApprove: preset.autoApprove,
+  })
+  if (!next) throw new Error('角色不存在')
+  db.prepare('update characters set preset_id = ? where id = ?').run(preset.id, character.id)
+  return { ...next, presetId: preset.id }
 }
 
 /** Snapshot a room character into a portable library template. */
