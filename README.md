@@ -19,6 +19,8 @@
 
 ## 快速开始
 
+前置依赖：Node.js ≥ 23.4（server 依赖内置 `node:sqlite`，该版本起无需实验标志；开发实测 v24）与 pnpm（`npm install -g pnpm` 可装）。
+
 ```powershell
 git clone https://github.com/StoneChan00/agent-crowd.git
 cd agent-crowd
