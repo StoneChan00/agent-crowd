@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+workspace/
+.probe/
+.edge-profile/
+shot*.png
+*.log
+.env
+.DS_Store
