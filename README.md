@@ -20,7 +20,8 @@
 ## 快速开始
 
 ```powershell
-cd D:\2_Projects\agent-crowd
+git clone https://github.com/StoneChan00/agent-crowd.git
+cd agent-crowd
 pnpm install
 pnpm dev
 ```
@@ -191,7 +192,7 @@ agent-crowd/
 
 ## 已知限制 / 下一步
 
-- 每个回合是无状态的一次性调用，上下文靠重放最近 80 条群聊消息；还没有 per-character 会话续接或长期记忆（设计规划见 `docs/memory-plan.md`）。
+- 每个回合是无状态的一次性调用，上下文靠重放最近 80 条群聊消息；长期记忆已落地（身份绑定 + 房间共享记忆 + 手动归档，见「用法」第 6 条），还没有 per-character 会话续接（ACP）与轮末自动提取（规划见 `docs/memory-plan.md`）。
 - 网页里没有权限确认弹窗，靠 `--auto` / `--dangerously-skip-permissions` / `--yolo` 让 harness 无人值守运行——只建议在本机、可信目录里用。
 - 接力是串行的（同一房间同一时刻只有一个角色在跑），避免多个 agent 同时改同一批文件。
 - 角色库的模板和房间副本是**快照关系**：改了模板不会回写已加入房间的角色，反之亦然（避免误改线上配置）。
