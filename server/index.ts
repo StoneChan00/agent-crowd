@@ -4,7 +4,15 @@ import { join } from 'node:path'
 import * as db from './db.ts'
 import { broadcast, send, subscribe } from './events.ts'
 import { cachedModels, listAdapters, listModels } from './harnesses/index.ts'
-import { resolveCannbot, resolveDsh, resolveHermes, resolveOpencode, type LaunchSpec } from './harnesses/bins.ts'
+import {
+  resolveCannbot,
+  resolveClaude,
+  resolveCodex,
+  resolveDsh,
+  resolveHermes,
+  resolveOpencode,
+  type LaunchSpec,
+} from './harnesses/bins.ts'
 import { dshCredentialStatus } from './harnesses/dsh.ts'
 import {
   idleTimeoutMs,
@@ -73,6 +81,10 @@ function resolveSpec(harness: HarnessKind): LaunchSpec | null {
       return resolveDsh()
     case 'hermes':
       return resolveHermes()
+    case 'claude':
+      return resolveClaude()
+    case 'codex':
+      return resolveCodex()
     default:
       return null // mock runs in-process: no pid to own
   }
@@ -196,6 +208,8 @@ function harnessInfo() {
   const cannbot = resolveCannbot()
   const dsh = resolveDsh()
   const hermes = resolveHermes()
+  const claude = resolveClaude()
+  const codex = resolveCodex()
   return {
     opencode: { label: HARNESS_LABELS.opencode, available: Boolean(opencode), detail: opencode?.source ?? null },
     cannbot: { label: HARNESS_LABELS.cannbot, available: Boolean(cannbot), detail: cannbot?.source ?? null },
@@ -205,6 +219,8 @@ function harnessInfo() {
       detail: dsh ? `${dsh.source} · DeepSeek 凭据：${credentialLabel()}` : null,
     },
     hermes: { label: HARNESS_LABELS.hermes, available: Boolean(hermes), detail: hermes?.source ?? null },
+    claude: { label: HARNESS_LABELS.claude, available: Boolean(claude), detail: claude?.source ?? null },
+    codex: { label: HARNESS_LABELS.codex, available: Boolean(codex), detail: codex?.source ?? null },
     mock: { label: HARNESS_LABELS.mock, available: true, detail: 'built-in' },
     custom: { label: HARNESS_LABELS.custom, available: true, detail: 'cmd.exe' },
   }

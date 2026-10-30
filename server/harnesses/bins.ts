@@ -108,6 +108,61 @@ export function resolveHermes(): LaunchSpec | null {
   return null
 }
 
+/**
+ * Claude Code ships a native exe inside the npm package; the PATH entry is
+ * only a .cmd shim, so prefer the packaged binary (same shape as CANNBot).
+ */
+export function resolveClaude(): LaunchSpec | null {
+  const override = process.env.AC_CLAUDE_BIN
+  if (override && existsSync(override)) {
+    if (override.toLowerCase().endsWith('.js')) {
+      return { command: process.execPath, argsPrefix: [override], source: 'AC_CLAUDE_BIN' }
+    }
+    return { command: override, argsPrefix: [], source: 'AC_CLAUDE_BIN' }
+  }
+  const exe = whereExe('claude')
+  if (exe) return { command: exe, argsPrefix: [], source: 'where claude' }
+  const root = npmGlobalRoot()
+  if (root) {
+    const candidate = join(root, '@anthropic-ai', 'claude-code', 'bin', 'claude.exe')
+    if (existsSync(candidate)) return { command: candidate, argsPrefix: [], source: 'npm global @anthropic-ai/claude-code' }
+  }
+  return null
+}
+
+/**
+ * Codex is an npm wrapper around a Rust binary; the vendored exe lives in the
+ * platform package, PATH only carries a .cmd shim.
+ */
+export function resolveCodex(): LaunchSpec | null {
+  const override = process.env.AC_CODEX_BIN
+  if (override && existsSync(override)) {
+    if (override.toLowerCase().endsWith('.js')) {
+      return { command: process.execPath, argsPrefix: [override], source: 'AC_CODEX_BIN' }
+    }
+    return { command: override, argsPrefix: [], source: 'AC_CODEX_BIN' }
+  }
+  const exe = whereExe('codex')
+  if (exe) return { command: exe, argsPrefix: [], source: 'where codex' }
+  const root = npmGlobalRoot()
+  if (root) {
+    const candidate = join(
+      root,
+      '@openai',
+      'codex',
+      'node_modules',
+      '@openai',
+      'codex-win32-x64',
+      'vendor',
+      'x86_64-pc-windows-msvc',
+      'bin',
+      'codex.exe',
+    )
+    if (existsSync(candidate)) return { command: candidate, argsPrefix: [], source: 'npm global @openai/codex' }
+  }
+  return null
+}
+
 /** Absolute path to the harness home used for DSH settings. */
 export function dshHome(): string {
   if (process.env.DSH_HOME) return process.env.DSH_HOME

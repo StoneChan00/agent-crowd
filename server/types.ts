@@ -1,6 +1,14 @@
 /** Shared data model for agent-crowd. */
 
-export type HarnessKind = 'mock' | 'opencode' | 'cannbot' | 'dsh' | 'hermes' | 'custom'
+export type HarnessKind =
+  | 'mock'
+  | 'opencode'
+  | 'cannbot'
+  | 'dsh'
+  | 'hermes'
+  | 'claude'
+  | 'codex'
+  | 'custom'
 
 export const HARNESS_LABELS: Record<HarnessKind, string> = {
   mock: 'Mock（本地演示）',
@@ -8,6 +16,8 @@ export const HARNESS_LABELS: Record<HarnessKind, string> = {
   cannbot: 'CANNBot',
   dsh: 'DeepSeek Harness',
   hermes: 'Hermes',
+  claude: 'Claude Code',
+  codex: 'Codex',
   custom: '自定义命令',
 }
 

@@ -630,6 +630,16 @@ select {
   border-color: rgba(240, 167, 90, 0.32);
   background: rgba(240, 167, 90, 0.08);
 }
+.harness-claude {
+  color: #f5c0ab;
+  border-color: rgba(217, 119, 87, 0.38);
+  background: rgba(217, 119, 87, 0.1);
+}
+.harness-codex {
+  color: #7fe3c4;
+  border-color: rgba(16, 163, 127, 0.35);
+  background: rgba(16, 163, 127, 0.09);
+}
 
 .msg-system {
   justify-content: center;

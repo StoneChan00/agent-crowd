@@ -26,7 +26,7 @@ export function Sidebar({
   onNewRoom,
   onViewChange,
 }: SidebarProps) {
-  const harnessKinds = ['cannbot', 'opencode', 'dsh', 'hermes'] as const
+  const harnessKinds = ['cannbot', 'opencode', 'dsh', 'hermes', 'claude', 'codex'] as const
 
   return (
     <aside className="sidebar">

@@ -1,5 +1,7 @@
 import type { HarnessKind } from '../types.ts'
 import { cannbotAdapter } from './cannbot.ts'
+import { claudeAdapter } from './claude.ts'
+import { codexAdapter } from './codex.ts'
 import { customAdapter } from './custom.ts'
 import { dshAdapter } from './dsh.ts'
 import { hermesAdapter } from './hermes.ts'
@@ -13,6 +15,8 @@ const adapters: Record<HarnessKind, HarnessAdapter> = {
   cannbot: cannbotAdapter,
   dsh: dshAdapter,
   hermes: hermesAdapter,
+  claude: claudeAdapter,
+  codex: codexAdapter,
   custom: customAdapter,
 }
 
@@ -21,7 +25,16 @@ export function getAdapter(kind: HarnessKind): HarnessAdapter {
 }
 
 export function listAdapters(): HarnessAdapter[] {
-  return [opencodeAdapter, cannbotAdapter, dshAdapter, hermesAdapter, mockAdapter, customAdapter]
+  return [
+    opencodeAdapter,
+    cannbotAdapter,
+    dshAdapter,
+    hermesAdapter,
+    claudeAdapter,
+    codexAdapter,
+    mockAdapter,
+    customAdapter,
+  ]
 }
 
 /** Model suggestions per harness, cached to keep the character editor snappy. */

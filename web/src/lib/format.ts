@@ -5,11 +5,22 @@ export const HARNESS_META: Record<HarnessKind, { label: string; glyph: string; c
   cannbot: { label: 'CANNBot', glyph: '◆', color: '#f97316' },
   dsh: { label: 'DSH', glyph: '◈', color: '#8b76f6' },
   hermes: { label: 'Hermes', glyph: '✦', color: '#2dd4bf' },
+  claude: { label: 'Claude Code', glyph: '✳', color: '#d97757' },
+  codex: { label: 'Codex', glyph: '⬡', color: '#10a37f' },
   mock: { label: 'Mock', glyph: '○', color: '#8a8f98' },
   custom: { label: 'Custom', glyph: '⚙', color: '#f0a75a' },
 }
 
-export const HARNESS_ORDER: HarnessKind[] = ['cannbot', 'opencode', 'dsh', 'hermes', 'mock', 'custom']
+export const HARNESS_ORDER: HarnessKind[] = [
+  'cannbot',
+  'opencode',
+  'dsh',
+  'hermes',
+  'claude',
+  'codex',
+  'mock',
+  'custom',
+]
 
 export function clock(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' })
