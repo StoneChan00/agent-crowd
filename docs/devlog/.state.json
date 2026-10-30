@@ -1,0 +1,6 @@
+{
+  "lastSha": "b7c5447",
+  "lastSubject": "新增 claude / codex CLI 适配器（权限映射、失败兜底与前端展示）",
+  "lastRecordedAt": "2026-10-30T13:55:27.226Z",
+  "note": "devlog 0001 覆盖到 b7c5447 为止；下次生成草稿从这里往后拉取。"
+}

@@ -4,6 +4,10 @@
 # 做什么：    停掉正在监听 8787 的旧 server（连同子进程树），然后以
 #             AC_TURN_TIMEOUT_MS=30m 启动新 server（终端里已设置过则沿用）。
 # 用法：      在项目根目录运行  .\restart-server.ps1    （可加 -Port 8790 指定端口）
+# 注意：      本脚本是交互式用途（日志留在当前终端）。headless / 计划任务场景用
+#             scripts\restart-and-verify.ps1（独立时间戳日志 + 六阶段自动验证）。
+#             绝不要用 `*>` 把本脚本输出重定向到固定日志文件——会撞上运行中
+#             server 的日志写句柄（见 docs/devlog/0001-restart-lockout.md）。
 param(
   [int]$Port = 8787
 )

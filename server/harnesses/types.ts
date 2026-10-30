@@ -28,6 +28,19 @@ export interface RunOutput {
   tokens?: TurnTokens
   exitCode: number
   durationMs: number
+  /**
+   * Rigid error contract, consumed by the orchestrator's turn pump:
+   * - non-empty = the turn FAILED. `error && empty text` → turn status
+   *   `error` + a system failure message (with one fast-fail auto-retry);
+   *   `error && partial text` (e.g. hard timeout) → the text still lands as
+   *   the character's message, flagged via meta.error.
+   * - In BOTH cases the orchestrator never enqueues followers: a broken or
+   *   half-finished reply must not chain the room on.
+   * - Adapters MUST guarantee a non-empty error on every known failure path
+   *   (claude `result.is_error` with/without an `error` string, non-zero
+   *   exit without usable text, timeout, spawn failure). Never return an
+   *   empty error from a failed run.
+   */
   error?: string
 }
 
