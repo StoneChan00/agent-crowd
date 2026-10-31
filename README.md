@@ -19,7 +19,7 @@
 
 ## 快速开始
 
-前置依赖：Node.js ≥ 23.4（server 依赖内置 `node:sqlite`，该版本起无需实验标志；开发实测 v24）与 pnpm（`npm install -g pnpm` 可装）。
+前置依赖：Node.js ≥ 23.6（server 依赖内置 `node:sqlite`，`npm test` 的护栏脚本直接 import `.ts` 依赖类型剥离，均需该版本起才无需实验标志；开发实测 v24）与 pnpm（`npm install -g pnpm` 可装）。
 
 ```powershell
 git clone https://github.com/StoneChan00/agent-crowd.git
@@ -41,6 +41,8 @@ pnpm serve        # = vite build + tsx server/index.ts
 或者直接双击/运行 `start.ps1`，它会自动装依赖、构建、启动并打开浏览器。
 
 改了 server 端代码或环境变量之后，用 `.\restart-server.ps1` 一键重启后端：它会停掉 8787 上的旧进程并以 `AC_TURN_TIMEOUT_MS=30m` 启动新进程（终端里已设置过该变量则沿用）。
+
+开发自检：改完代码跑 `npm test`（回归护栏，覆盖回合超时、进程树清理、markdown 换行契约，不依赖 NPU/外部服务）。
 
 首次启动会建一个 SQLite 数据库（`data/agent-crowd.db`）、一个示例房间「开发小队」，以及三个角色库模板：
 

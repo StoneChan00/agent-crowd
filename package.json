@@ -11,7 +11,7 @@
     "build": "vite build",
     "start": "tsx server/index.ts",
     "serve": "npm run build && npm start",
-    "test": "node scripts/test-timeout.mjs && node scripts/killtree-check.mjs",
+    "test": "node scripts/test-timeout.mjs && node scripts/killtree-check.mjs && node scripts/markdown-breaks-check.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "smoke": "node scripts/smoke.mjs",
     "docs:check": "node scripts/devlog-draft.mjs --check"
@@ -21,6 +21,7 @@
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",
+    "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "yaml": "^2.8.1"
   },
@@ -36,6 +37,8 @@
     "vite": "^7.1.3"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

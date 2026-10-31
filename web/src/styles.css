@@ -655,6 +655,12 @@ select {
   line-height: 1.65;
   text-align: left;
   max-width: 78%;
+  /* Plain-text surface: harness stderr tails land here verbatim
+     (orchestrator truncates to 800 chars, multi-line stacks included).
+     Without pre-wrap they collapse onto one line — same class of bug as
+     the missing remarkBreaks, guarded by markdown-breaks-check.mjs. */
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .system-pill.is-error {
   color: #f3b0b0;

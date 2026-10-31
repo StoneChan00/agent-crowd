@@ -19,7 +19,8 @@
 # See docs/devlog/0001-restart-lockout.md for why each phase exists.
 param(
   [switch]$VerifyOnly,
-  [int]$Port = 8787
+  [int]$Port = 8787,
+  [int]$DrainSeconds = 1500
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -51,8 +52,10 @@ if (-not $VerifyOnly) {
   Start-Sleep -Seconds 40
 
   # Phase 1: drain - do not kill any in-flight turn. Abort (leave the old
-  # server running) if rooms stay busy for 240s; restart can be retried.
-  $drainDeadline = (Get-Date).AddSeconds(240)
+  # server running) if rooms stay busy past -DrainSeconds. Default 1500s
+  # because the server's AC_TURN_TIMEOUT_MS is 30m; restart is retryable
+  # (rerun this script or the scheduled task manually).
+  $drainDeadline = (Get-Date).AddSeconds($DrainSeconds)
   $drained = $false
   while ((Get-Date) -lt $drainDeadline) {
     try {
@@ -72,7 +75,7 @@ if (-not $VerifyOnly) {
     Start-Sleep -Seconds 5
   }
   if (-not $drained) {
-    Log "phase1 FAIL: rooms still busy after 240s, aborting (old server left running)"
+    Log ("phase1 FAIL: rooms still busy after {0}s, aborting (old server left running)" -f $DrainSeconds)
     Log "RESULT: ABORT - busy rooms"
     exit 1
   }
@@ -136,7 +139,10 @@ Log ("phase5 harnesses: claude.available={0} codex.available={1}" -f $claudeOk, 
 if (-not ($claudeOk -and $codexOk)) { Log "RESULT: FAIL - claude/codex not available"; exit 1 }
 
 # Phase 6: one real claude round in a temp room (auto-deleted in finally).
+# Exit code: 0 only on a full PASS; every FAIL/ABORT/catch path exits 1 so
+# Task Scheduler's LastTaskResult is a trustworthy machine-readable signal.
 $roomId = $null
+$rc = 0
 try {
   $stamp = Get-Date -Format 'HHmmss'
   $roomBody = @{ name = "restart-verify-$stamp"; topic = 'restart verification, auto-cleaned' } | ConvertTo-Json
@@ -191,10 +197,12 @@ try {
     Log "RESULT: PASS - restart + health + claude round all verified"
   } else {
     Log ("RESULT: FAIL - exitOk={0} noErr={1} hasText={2}" -f $exitOk, $noErr, $hasText)
+    $rc = 1
   }
 } catch {
   Log ("phase6 ERROR: {0}" -f $_.Exception.Message)
   Log "RESULT: FAIL - claude round errored"
+  $rc = 1
 } finally {
   if ($roomId) {
     try {
@@ -204,3 +212,4 @@ try {
   }
 }
 Log "END"
+exit $rc

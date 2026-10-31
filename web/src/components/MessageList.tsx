@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { markdownRemarkPlugins } from '../lib/markdown'
 import type { Character, Message } from '../types'
 import { Avatar } from './Avatar'
 import { HARNESS_META, clock, formatDuration, modelShort, tokenSummary } from '../lib/format'
@@ -217,7 +217,7 @@ function MessageRow({
 
         <div className="markdown">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
+            remarkPlugins={markdownRemarkPlugins}
             components={{
               a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
             }}
