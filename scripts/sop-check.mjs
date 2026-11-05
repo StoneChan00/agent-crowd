@@ -7,23 +7,24 @@
  * Layers:
  *   S1  verdict parser  — standalone REVIEW: lines, multi-block markdown
  *                         (blank-line splits, bold paragraphs, lists),
- *                         quoting, variants, whole-line code spans (19)
+ *                         quoted verdicts (blockquote/table/heading are
+ *                         invisible), variants, whole-line code spans (25)
  *   S2  gate table      — all 7 decision rows of gateDecision (7)
  *   S3  worktree snap   — repo-root resolution: a cwd INSIDE a subdirectory
  *                         still sees sibling-directory changes; non-git
  *                         working dirs report available:false; untracked
- *                         fingerprints + dirty-file re-edit fallback (14)
+ *                         fingerprints + dirty-file re-edit fallback (15)
  *   S4  green path      — write + REVIEW: PASS + verify exit 0 → verify runs
- *                         exactly once, round-end summary appears (7)
+ *                         exactly once, round-end summary appears (6)
  *   S5  verify fails     — exit 1 with a LONG output (marker beyond the
  *                         1500-char prefix) → no summary, gate notice whose
- *                         output TAIL (not head) carries the marker (4)
+ *                         output TAIL (not head) carries the marker (3)
  *   S6  no verdict      — changed round, no REVIEW line → blocked before any
  *                         verify runs (3)
  *   S7  chat-only round  — no changes → gate never runs, summary normal (3)
  *   S8  no verify config — changed + PASS closes directly; no verdict blocks (4)
  *   S9  restart race     — while the verify command runs, POST /api/restart
- *                         must NOT fire the restart (gateActive drains) (3)
+ *                         must NOT fire the restart (gateActive drains) (4)
  *   S9b stale idle       — a new turn started while the gate's verify was
  *                         running must never see a busy:false (SSE watch) (3)
  *
@@ -320,6 +321,22 @@ function scenarioParser() {
     ['`REVIEW: PASS`', 'pass', '整行仅一个 code span 仍识别（规则 9 示例被照抄）'],
   ]
   for (const [content, expected, label] of casesBlocks) {
+    const actual = parseReviewVerdict(content)
+    check(`S1 ${label}`, actual === expected, `实际 ${JSON.stringify(actual)}`)
+  }
+
+  // Quoted verdicts are not the author's conclusion (review round 3): the
+  // extractor reads only top-level / list-item paragraph lines, so a verdict
+  // inside a blockquote, a table cell or a heading is invisible — and it
+  // doesn't eat into the tail-lines budget either.
+  const casesQuoted = [
+    ['> REVIEW: PASS', null, '引用块里的结论不算门禁信号'],
+    ['| 项 | 值 |\n|---|---|\n| 门禁 | REVIEW: PASS |', null, '表格单元格里的结论不算门禁信号'],
+    ['## REVIEW: PASS', null, '标题行不算结论'],
+    ['- 列表里的结论有效：\n- REVIEW: PASS', 'pass', 'listItem 段落里的结论仍然生效'],
+    ['> 引用：别人说通过了。\n\nREVIEW: PASS', 'pass', '引用块后的正文结论不受引用影响'],
+  ]
+  for (const [content, expected, label] of casesQuoted) {
     const actual = parseReviewVerdict(content)
     check(`S1 ${label}`, actual === expected, `实际 ${JSON.stringify(actual)}`)
   }

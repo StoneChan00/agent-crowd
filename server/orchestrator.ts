@@ -120,12 +120,19 @@ const active = new Map<string, ActiveTurn>()
 const chains = new Map<string, ChainState>()
 const rounds = new Map<string, RoundState>()
 
-/** Rooms whose verification command is currently running (SOP gate, P0-3). */
-const verifyRuns = new Set<string>()
+/**
+ * Verification runs in flight (SOP gate, P0-3), reference counted per room:
+ * a human message arriving mid-verify can open a new round whose OWN verify
+ * overlaps the first one — with a Set, the FIRST run's finally would drop
+ * the room's flag while the second is still running (review round 3), and
+ * a pending restart would slip through mid-verify. The counter only clears
+ * when the last overlapping run settles.
+ */
+const verifyRuns = new Map<string, number>()
 
-/** True while the room's verification command runs — the restart drain must wait for it. */
+/** True while the room has a verification command running — the restart drain must wait for it. */
 export function gateActive(roomId: string): boolean {
-  return verifyRuns.has(roomId)
+  return (verifyRuns.get(roomId) ?? 0) > 0
 }
 
 /** Fresh round state for a new human message / manual run (SOP gate fields included). */
@@ -523,14 +530,14 @@ function budgetExceeded(room: Room, hop: number): boolean {
 /**
  * Run the room's verification command (SOP gate 3c, P0-3). Shell semantics,
  * the room's workingDir, a hard 300s budget, output tail 1_500 for the
- * notice. The room id sits in `verifyRuns` for the whole run — that flag is
- * what keeps the restart drain (restart.ts) and /state's `gate` honest while
- * a verify is in flight.
+ * notice. The room id sits in `verifyRuns` (reference counted) for the
+ * whole run — that flag is what keeps the restart drain (restart.ts) and
+ * /state's `gate` honest while a verify is in flight.
  */
 async function runVerifyCommand(
   room: Room,
 ): Promise<{ ok: boolean; exitCode: number | null; output: string; timedOut: boolean }> {
-  verifyRuns.add(room.id)
+  verifyRuns.set(room.id, (verifyRuns.get(room.id) ?? 0) + 1)
   try {
     return await new Promise((resolve) => {
       const child = spawn(room.verifyCommand.trim(), {
@@ -572,7 +579,11 @@ async function runVerifyCommand(
       child.on('close', (code) => finish(code))
     })
   } finally {
-    verifyRuns.delete(room.id)
+    // Reference-counted release: overlapping verifies for one room only
+    // clear the flag when the LAST one settles (see verifyRuns above).
+    const remaining = (verifyRuns.get(room.id) ?? 1) - 1
+    if (remaining > 0) verifyRuns.set(room.id, remaining)
+    else verifyRuns.delete(room.id)
   }
 }
 
@@ -665,8 +676,6 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
         roundId: round.roundId,
         kind: 'verify',
         verdict: result.ok ? 'pass' : 'fail',
-        // exit line always survives; the output part keeps its TRUE tail —
-        // a head-keeping cap drops exactly the lines that explain the death.
         // exit line always survives; the output part keeps its TRUE tail —
         // a head-keeping cap drops exactly the lines that explain the death.
         detail: `${result.timedOut ? '（超时被终止）' : ''}exit ${result.exitCode ?? 'spawn-error'}\n${tail(result.output.trim(), VERIFY_DETAIL_CHARS)}`,

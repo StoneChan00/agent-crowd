@@ -8,8 +8,11 @@
  * tolerated, case-insensitive). `REVIEW: PASSED` and friends are NOT
  * verdicts — the line must contain verdict and nothing else, otherwise a
  * sentence like "I don't think REVIEW: PASSED is right here" would gate a
- * round shut. Verdicts inside code fences are invisible on purpose: they
- * are quoted text, same rule as @mentions.
+ * round shut. Verdicts must also be the author's OWN prose: only top-level
+ * paragraphs and paragraphs inside list items count, so a verdict that
+ * arrives quoted (blockquote `> REVIEW: PASS`, a table cell) or as a
+ * heading is not a gate signal — same rule as code fences and link labels:
+ * quoted text, never a gate signal.
  */
 import { fromMarkdown } from 'mdast-util-from-markdown'
 import { gfm } from 'micromark-extension-gfm'
@@ -32,33 +35,15 @@ interface MdNode {
 }
 
 /**
- * Block-level nodes: a boundary between two of them is a REAL line break in
- * the rendered output. The list mirrors the mdast block set the web pipeline
- * renders as separate blocks.
+ * The visible text of ONE paragraph with soft line breaks preserved (they
+ * live inside text values; `break` nodes map to `\n`). Code spans are the
+ * deliberate exception to the opaque set: their content flows into the
+ * line, so a whole line that is just `` `REVIEW: PASS` `` still reads as a
+ * verdict — agents copy rule 9's example text into backticks — while
+ * `先看 `REVIEW: PASS` 这行` keeps its framing text and matches nothing.
+ * Link labels, images and inline html stay invisible exactly like mentions.
  */
-const BLOCK_NODES = new Set([
-  'paragraph', 'heading', 'code', 'html', 'list', 'listItem', 'blockquote',
-  'table', 'tableRow', 'tableCell', 'thematicBreak', 'definition',
-])
-
-/**
- * The visible text of a message with BLOCK BOUNDARIES PRESERVED — the one
- * thing `visibleText` (mentions.ts) cannot offer: it joins every fragment
- * with spaces so a `@name` boundary can never be created or eaten, which
- * flattens `结论。\n\nREVIEW: PASS` into a single glued line the whole-line
- * verdict anchor then can never match. Real review messages arrive as
- * multi-block markdown (paragraph → list → conclusion), so the extraction
- * walks the same mdast tree but emits `\n` around block nodes and keeps
- * soft line breaks (they live inside text values).
- *
- * Code spans are the deliberate exception to the opaque set: their content
- * flows into the line. A whole line that is just `` `REVIEW: PASS` `` still
- * reads as a verdict — agents copy rule 9's example text into backticks —
- * while `先看 `REVIEW: PASS` 这行` keeps its framing text and matches
- * nothing. Fenced code, html and link labels stay invisible exactly like
- * mentions: quoted text, never a gate signal.
- */
-function blockwiseText(content: string): string {
+function paragraphLines(paragraph: MdNode): string[] {
   const parts: string[] = []
   const walk = (node: MdNode): void => {
     if (node.type === 'break') {
@@ -73,18 +58,42 @@ function blockwiseText(content: string): string {
       if (node.value) parts.push(node.value)
       return
     }
-    const block = BLOCK_NODES.has(node.type)
-    if (block) parts.push('\n')
     for (const child of node.children ?? []) walk(child)
-    if (block) parts.push('\n')
   }
-  walk(
-    fromMarkdown(content, {
-      extensions: [gfm()],
-      mdastExtensions: [gfmFromMarkdown()],
-    }) as unknown as MdNode,
-  )
-  return parts.join('')
+  for (const child of paragraph.children ?? []) walk(child)
+  return parts.join('').split('\n')
+}
+
+/**
+ * The lines a verdict may live on, in document order: the author's own
+ * prose. Top-level paragraphs contribute their lines; list items contribute
+ * their (possibly nested) paragraphs' lines. Quoted shapes — blockquotes,
+ * table cells, headings, fenced code, html — contribute NOTHING, not even
+ * an empty line: a quote near the end must neither carry a verdict nor eat
+ * into the tail-lines budget (review round 3: `> REVIEW: PASS` and
+ * `| 门禁 | REVIEW: PASS |` both parsed as live verdicts when the extractor
+ * only preserved block boundaries and dropped the quoting marks).
+ */
+function verdictSourceLines(content: string): string[] {
+  const lines: string[] = []
+  const collect = (node: MdNode): void => {
+    if (node.type === 'paragraph') {
+      lines.push(...paragraphLines(node))
+      return
+    }
+    if (node.type === 'list' || node.type === 'listItem') {
+      for (const child of node.children ?? []) collect(child)
+      return
+    }
+    // Everything else (blockquote, table, heading, code, html, ...) is
+    // quoted or structural text — invisible to the verdict scan.
+  }
+  const root = fromMarkdown(content, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as unknown as MdNode
+  for (const child of root.children ?? []) collect(child)
+  return lines
 }
 
 /**
@@ -92,9 +101,7 @@ function blockwiseText(content: string): string {
  * verdict the LAST one wins — "CHANGES → PASS after the fix" is a pass.
  */
 export function parseReviewVerdict(content: string): ReviewVerdict | null {
-  const plain = blockwiseText(content)
-  const lines = plain
-    .split('\n')
+  const lines = verdictSourceLines(content)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
   let verdict: ReviewVerdict | null = null
