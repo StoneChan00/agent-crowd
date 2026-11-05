@@ -115,6 +115,13 @@ interface RoundState {
   verifyState: 'none' | 'running' | 'pass' | 'fail'
   /** The gate notice fires at most once per round — repeat blocks stay silent. */
   gateNoticeSent: boolean
+  /**
+   * Terminal state of this round's last NON-SUMMARY turn (B03 review 2):
+   * 'ok' | 'error' | 'stopped'. A round that ended in error/stopped must not
+   * settle its task card as done — 'done' would read as "the work finished"
+   * when the run actually died; the card stays running for a re-dispatch.
+   */
+  lastTurnOutcome: 'ok' | 'error' | 'stopped'
   /** Task card this round executes (B03); undefined on ordinary chat rounds. */
   taskId?: string
 }
@@ -150,6 +157,7 @@ function newRoundState(taskId?: string): RoundState {
     verdict: 'none',
     verifyState: 'none',
     gateNoticeSent: false,
+    lastTurnOutcome: 'ok',
     taskId,
   }
 }
@@ -647,10 +655,20 @@ function sendGateNotice(roomId: string, content: string): void {
  * human message, re-dispatch) never writes, so a displaced card keeps
  * `running` for its re-dispatch instead of being falsely closed.
  */
-function settleTaskForRound(roomId: string, round: RoundState, outcome: 'done' | 'blocked'): void {
+function settleTaskForRound(roomId: string, round: RoundState, outcome: 'done' | 'blocked' | 'error'): void {
   if (!round.taskId) return
   if (rounds.get(roomId) !== round) return
   db.settleTaskByRound(round.roundId, outcome)
+}
+
+/**
+ * Normal-close settlement (B03 review 2): a round whose last real turn ended
+ * in error or was stopped never closes its card as done — the card keeps
+ * `running` with `result='error'` so the panel offers a re-dispatch instead
+ * of a false "已完成".
+ */
+function settleTaskClosed(roomId: string, round: RoundState): void {
+  settleTaskForRound(roomId, round, round.lastTurnOutcome === 'ok' ? 'done' : 'error')
 }
 
 /**
@@ -686,7 +704,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
     // loop — the card's round finished normally (B03). A round that never
     // ran anything (assignee vanished before the turn started) leaves its
     // card `running` for a re-dispatch instead of falsely closing it.
-    if (round.summarizing) settleTaskForRound(roomId, round, 'done')
+    if (round.summarizing) settleTaskClosed(roomId, round)
     rounds.delete(roomId)
     return false
   }
@@ -765,9 +783,9 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
 
   const summarizers = db.listCharacters(roomId).filter((character) => character.enabled && character.triggers.onRoundEnd)
   if (summarizers.length === 0) {
-    // No summarizer configured: the round still closed normally — the card
-    // settles done (B03).
-    settleTaskForRound(roomId, round, 'done')
+    // No summarizer configured: the round still closed — settle by its last
+    // turn's outcome (B03 review 2: an errored round is NOT a done card).
+    settleTaskClosed(roomId, round)
     rounds.delete(roomId)
     return false
   }
@@ -790,7 +808,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   }
   if (!queued) {
     // Every summarizer vanished mid-flight (deleted/disabled): close the round.
-    settleTaskForRound(roomId, round, 'done')
+    settleTaskClosed(roomId, round)
     rounds.delete(roomId)
     return false
   }
@@ -872,9 +890,6 @@ async function pump(roomId: string): Promise<void> {
       void pump(roomId)
       return
     }
-    // The card's first turn is starting: flip approved → running (B03). A
-    // compare-and-set, so re-dispatches of an already-running card no-op.
-    if (item.taskId) db.markTaskRunning(item.taskId)
     const turnId = item.turnId
     activeTurnId = turnId
     const controller = new AbortController()
@@ -1010,6 +1025,9 @@ async function pump(roomId: string): Promise<void> {
     })
 
     if (controller.signal.aborted) {
+      // The round's last real turn was stopped (B03 review 2): never settles
+      // its card as done. A steer re-run overwrites this with its own outcome.
+      if (round && round.roundId === item.roundId && !item.isRoundSummary) round.lastTurnOutcome = 'stopped'
       db.updateTurn(turnId, { status: 'stopped', output: output.text, endedAt: Date.now() })
       broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'stopped' })
       // Keep whatever streamed before the stop: without this the text vanished
@@ -1040,6 +1058,8 @@ async function pump(roomId: string): Promise<void> {
     }
 
     if (output.error && !output.text.trim()) {
+      // The round's last real turn errored (B03 review 2).
+      if (round && round.roundId === item.roundId && !item.isRoundSummary) round.lastTurnOutcome = 'error'
       db.updateTurn(turnId, {
         status: 'error',
         error: output.error,
@@ -1065,6 +1085,10 @@ async function pump(roomId: string): Promise<void> {
           retry: true,
           isRoundSummary: item.isRoundSummary,
           roundId: item.roundId ?? null,
+          // The retry re-runs THIS turn's work — it keeps the card link
+          // (B03 review 2: a restart between error and retry must not
+          // orphan the association).
+          taskId: item.taskId ?? null,
         })
       if (fallbackRetry && retryQueued) return
       const message = db.addMessage({
@@ -1169,6 +1193,12 @@ async function pump(roomId: string): Promise<void> {
       endedAt: Date.now(),
       changed: changedPaths,
     })
+    // The round's last real turn settled (B03 review 2): a reply that landed
+    // with meta.error counts as an errored outcome — the card must not close
+    // as done on a possibly-incomplete run.
+    if (round && round.roundId === item.roundId && !item.isRoundSummary) {
+      round.lastTurnOutcome = output.error ? 'error' : 'ok'
+    }
     broadcast(roomId, 'turn', {
       roomId,
       turnId,

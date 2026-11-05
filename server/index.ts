@@ -868,7 +868,11 @@ app.patch('/api/tasks/:id', (req, res) => {
     // One synchronous section: state flip → card message → assignee turn.
     // Rejection and dispatch never reach here twice (409 above), so exactly
     // one round and one assignee turn per approval — idempotence by state.
-    const approved = db.updateTask(task.id, { status: 'approved', approvedAt: Date.now(), result: null, doneAt: null })
+    // The card goes straight to `running` (B03 review 1): the old fleeting
+    // `approved` state had NO exit — a queued turn swept by a stop (or an
+    // assignee disabled mid-queue) left the card neither terminal nor
+    // actionable. `running` always keeps the re-dispatch door open.
+    const approved = db.updateTask(task.id, { status: 'running', approvedAt: Date.now(), result: null, doneAt: null })
     const message = db.addMessage({
       roomId: room.id,
       authorType: 'system',
@@ -896,8 +900,19 @@ app.patch('/api/tasks/:id', (req, res) => {
     return fail(res, 409, '状态只能通过批准（approved）或驳回（rejected）变更；进行中的卡片用重新派发')
   }
 
-  // Plain field edit — only while proposed.
-  if (task.status !== 'proposed') return fail(res, 409, '只有待批准的卡片才能编辑字段')
+  // Plain field edit — content fields only while proposed (they already
+  // shipped to the prompt; editing them retroactively would desync the
+  // transcript). The ASSIGNEE may be re-pointed on any non-terminal card:
+  // that is the exit for a disabled/deleted assignee mid-run (B03 review 1
+  // — a stuck card must always keep at least one usable action).
+  if (task.status === 'done' || task.status === 'rejected') {
+    return fail(res, 409, '已完结的卡片不能修改')
+  }
+  const contentEdit =
+    body.title !== undefined || body.what !== undefined || body.why !== undefined || body.acceptance !== undefined
+  if (contentEdit && task.status !== 'proposed') {
+    return fail(res, 409, '内容字段只有待批准的卡片才能修改；进行中的卡片可换负责人后重新派发')
+  }
   const title = body.title !== undefined ? normalizeTaskField(body.title, 120) : task.title
   const what = body.what !== undefined ? normalizeTaskField(body.what, 4_000) : task.what
   if (!title) return fail(res, 400, '任务标题不能为空')

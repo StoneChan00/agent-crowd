@@ -1238,30 +1238,22 @@ export function updateTask(
 }
 
 /**
- * The approval/dispatch turn is starting: flip `approved` → `running`
- * (compare-and-set — a re-dispatch of an already-running card is a no-op
- * here, and a done card is never resurrected).
- */
-export function markTaskRunning(id: string): void {
-  db.prepare("update tasks set status = 'running' where id = ? and status = 'approved'").run(id)
-}
-
-/**
  * Round settlement write-back (B03): the round a card opened has closed.
- * `done` closes the card; `blocked` keeps it `running` with the gate's
- * verdict as `result` so the panel offers a re-dispatch. The round_id match
- * is the identity check: a re-dispatched card points at a NEWER round, and
- * the old round's late settlement must not overwrite it.
+ * `done` closes the card; `blocked` (SOP gate refused) and `error` (the
+ * round's last turn errored/was stopped, B03 review 2) keep it `running`
+ * with the verdict as `result` so the panel offers a re-dispatch. The
+ * round_id match is the identity check: a re-dispatched card points at a
+ * NEWER round, and the old round's late settlement must not overwrite it.
  */
-export function settleTaskByRound(roundId: string, outcome: 'done' | 'blocked'): void {
+export function settleTaskByRound(roundId: string, outcome: 'done' | 'blocked' | 'error'): void {
   if (outcome === 'done') {
     db.prepare(
       "update tasks set status = 'done', result = null, done_at = ? where round_id = ? and status in ('approved', 'running')",
     ).run(now(), roundId)
   } else {
     db.prepare(
-      "update tasks set status = 'running', result = 'blocked', done_at = null where round_id = ? and status in ('approved', 'running')",
-    ).run(roundId)
+      "update tasks set status = 'running', result = ?, done_at = null where round_id = ? and status in ('approved', 'running')",
+    ).run(outcome, roundId)
   }
 }
 

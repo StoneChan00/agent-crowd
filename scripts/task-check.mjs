@@ -21,6 +21,13 @@
  *   T10 re-dispatch: second round, turn count 2, running → done (4)
  *   T11 validation: empty title/what, cross-room assignee, unknown task,
  *       bogus status, field edit on approved (6)
+ *   T12 busy-approve + stop: approval writes running synchronously; a swept
+ *       queued turn leaves the card running (no fake done) and re-
+ *       dispatchable (5)
+ *   T13 assignee disabled mid-queue: card stays running, the assignee can
+ *       be re-pointed (content fields stay locked), re-dispatch finishes (5)
+ *   T14 errored round: card settles running + result=error (never done),
+ *       the auto-retry turns keep the task_id link, re-dispatch works (3)
  *
  * Server scenarios boot one real server (AC_DATA_DIR on a temp dir, mock
  * harness only); T9 uses a real git repo as the room's working dir so the
@@ -145,6 +152,21 @@ async function waitIdle(port, roomId, timeoutMs = 30_000) {
   return false
 }
 
+/** Wait until the room has a running turn (T12/T13's busy-approval window). */
+async function waitBusy(port, roomId, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const state = await req(port, `/api/rooms/${roomId}/state`)
+      if (state.busy) return true
+    } catch {
+      /* transient poll gap */
+    }
+    await sleep(100)
+  }
+  return false
+}
+
 /* ------------------------------------------------------------------ sqlite */
 
 function withDb(dataDir, fn) {
@@ -229,7 +251,7 @@ try {
     method: 'PATCH',
     body: JSON.stringify({ status: 'approved' }),
   })
-  check('T2 批准后状态离开 proposed', approvedA.status === 'approved' || approvedA.status === 'running', approvedA.status)
+  check('T2 批准同步段即 running（瞬态 approved 已收进同步段）', approvedA.status === 'running', approvedA.status)
   const drainedA = await waitIdle(port, roomA.id)
   const settledA = await getTask(port, taskA.id)
   const turnsA = turnRows(dir, 'room_id = ?', roomA.id)
@@ -454,6 +476,114 @@ try {
     body: JSON.stringify({ title: '改标题' }),
   })
   check('T11 已批准卡编辑字段 → 409', editApproved.status === 409, `status=${editApproved.status}`)
+
+  /* T12 — approve while busy + stop: the card must stay actionable.
+     (B03 review blocking 1: the old fleeting `approved` state had no exit —
+     a queued turn swept by a stop locked the card out of every action.) */
+  const roomK = await makeRoom(port, 't12-忙时批准', plainWork)
+  await makeCharacter(port, roomK.id, '慢甲', '普通角色')
+  const workerK = await makeCharacter(port, roomK.id, '快乙', 'MOCK-任务')
+  await postMessage(port, roomK.id, '模拟慢速，先占住房间')
+  check('T12 房间已忙（慢速回合在跑）', await waitBusy(port, roomK.id))
+  const taskK = await createTask(port, roomK.id, {
+    title: 'T12-忙时批准的卡',
+    what: '排队中被 stop 扫掉也不丢出路，WHAT-K。',
+    why: '',
+    acceptance: 'ACC-K：卡片必须可重派',
+    assigneeId: workerK.id,
+  })
+  const approveK = await req(port, `/api/tasks/${taskK.id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status: 'approved' }),
+  })
+  check('T12 忙时批准同步段即 running', approveK.status === 'running', approveK.status)
+  await req(port, `/api/rooms/${roomK.id}/stop`, { method: 'POST' })
+  await waitIdle(port, roomK.id, 40_000)
+  const stoppedK = await getTask(port, taskK.id)
+  check(
+    'T12 stop 扫掉排队回合后卡片仍 running（无假 done、可重派）',
+    stoppedK.status === 'running' && stoppedK.doneAt === null,
+    JSON.stringify({ status: stoppedK.status, doneAt: stoppedK.doneAt }),
+  )
+  await req(port, `/api/tasks/${taskK.id}/dispatch`, { method: 'POST' })
+  await waitIdle(port, roomK.id, 40_000)
+  const finalK = await getTask(port, taskK.id)
+  const turnsK = turnRows(dir, 'room_id = ?', roomK.id)
+  check(
+    'T12 重派后跑完 done',
+    finalK.status === 'done' && finalK.doneAt !== null,
+    JSON.stringify({ status: finalK.status, doneAt: finalK.doneAt }),
+  )
+  check('T12 turn 序列（慢速 stopped + 排队 swept + 重派 done）', turnsK.length === 3, `turns=${turnsK.length}`)
+
+  /* T13 — assignee disabled mid-queue: re-assign keeps the card actionable. */
+  const roomL = await makeRoom(port, 't13-换人重派', plainWork)
+  await makeCharacter(port, roomL.id, '慢甲', '普通角色')
+  const workerL = await makeCharacter(port, roomL.id, '乙', 'MOCK-任务')
+  const spareL = await makeCharacter(port, roomL.id, '丙', 'MOCK-任务')
+  await postMessage(port, roomL.id, '模拟慢速，先占住房间')
+  check('T13 房间已忙', await waitBusy(port, roomL.id))
+  const taskL = await createTask(port, roomL.id, {
+    title: 'T13-负责人失效的卡',
+    what: '排队期间负责人被停用，WHAT-L。',
+    why: '',
+    acceptance: 'ACC-L：换人后可重派',
+    assigneeId: workerL.id,
+  })
+  await req(port, `/api/tasks/${taskL.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'approved' }) })
+  await req(port, `/api/characters/${workerL.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: false }) })
+  await waitIdle(port, roomL.id, 40_000)
+  const stuckL = await getTask(port, taskL.id)
+  check(
+    'T13 排队中负责人被停用 → 卡片保持 running（不假 done）',
+    stuckL.status === 'running' && stuckL.doneAt === null,
+    JSON.stringify({ status: stuckL.status }),
+  )
+  const reassignL = await req(port, `/api/tasks/${taskL.id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ assigneeId: spareL.id }),
+  })
+  check('T13 进行中卡片可换负责人（200）', reassignL.assigneeId === spareL.id, JSON.stringify(reassignL.assigneeId))
+  const titleEditL = await attempt(port, `/api/tasks/${taskL.id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title: '偷改标题' }),
+  })
+  check('T13 进行中卡片改内容字段仍 409', titleEditL.status === 409, `status=${titleEditL.status}`)
+  await req(port, `/api/tasks/${taskL.id}/dispatch`, { method: 'POST' })
+  await waitIdle(port, roomL.id, 40_000)
+  const finalL = await getTask(port, taskL.id)
+  check('T13 换人重派后 done', finalL.status === 'done', finalL.status)
+
+  /* T14 — an errored round must not settle the card as done. The failing
+     context is a prior 模拟失败 user message: the mock's lastUser seam picks
+     it up, so the card turn (and its auto-retry) error out too. */
+  const roomM = await makeRoom(port, 't14-回合出错', plainWork)
+  const workerM = await makeCharacter(port, roomM.id, '丁', 'MOCK-任务')
+  await postMessage(port, roomM.id, '模拟失败：先制造一个会报错的上下文')
+  await waitIdle(port, roomM.id, 40_000)
+  const taskM = await createTask(port, roomM.id, {
+    title: 'T14-会出错的卡',
+    what: '这一轮的 prompt 里最后一条用户消息是模拟失败，注定报错。',
+    why: '',
+    acceptance: 'ACC-M：出错不假 done',
+    assigneeId: workerM.id,
+  })
+  await req(port, `/api/tasks/${taskM.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'approved' }) })
+  await waitIdle(port, roomM.id, 40_000)
+  const erroredM = await getTask(port, taskM.id)
+  const turnsM = turnRows(dir, 'room_id = ?', roomM.id)
+  check(
+    'T14 回合报错 → 卡片不 done（running + result=error）',
+    erroredM.status === 'running' && erroredM.result === 'error' && erroredM.doneAt === null,
+    JSON.stringify({ status: erroredM.status, result: erroredM.result, doneAt: erroredM.doneAt }),
+  )
+  check(
+    'T14 重试链的 turn 也带 task_id（重启不丢关联）',
+    turnsM.length === 4 && turnsM.slice(2).every((turn) => turn.task_id === taskM.id),
+    JSON.stringify(turnsM.map((turn) => [turn.status, turn.task_id])),
+  )
+  const dispatchM = await req(port, `/api/tasks/${taskM.id}/dispatch`, { method: 'POST' })
+  check('T14 出错卡片可重新派发', dispatchM.status === 'running', dispatchM.status)
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

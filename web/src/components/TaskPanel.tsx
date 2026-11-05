@@ -84,6 +84,21 @@ export function TaskPanel({ roomId, roomName, characters, tasks, onClose, onRefr
     }
   }
 
+  /** Re-point a running card's assignee — the exit when the assignee was
+   * disabled or deleted mid-run (the card itself stays actionable). */
+  const reassign = async (task: Task, assigneeId: string) => {
+    setBusy(true)
+    setError('')
+    try {
+      await api.updateTask(task.id, { assigneeId: assigneeId || null })
+      onRefresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <Modal
       wide
@@ -169,6 +184,11 @@ export function TaskPanel({ roomId, roomName, characters, tasks, onClose, onRefr
                     门禁拦截
                   </span>
                 )}
+                {task.result === 'error' && (
+                  <span className="pill pill-task-blocked" title="上一轮回合出错或被中断，未收尾">
+                    回合出错
+                  </span>
+                )}
               </div>
               <p className="task-meta">
                 负责人：{assigneeName(task)} · 创建 {formatTime(task.createdAt)}
@@ -207,9 +227,25 @@ export function TaskPanel({ roomId, roomName, characters, tasks, onClose, onRefr
                   </>
                 )}
                 {task.status === 'running' && (
-                  <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => act(task, 'dispatch')}>
-                    重新派发
-                  </button>
+                  <>
+                    <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => act(task, 'dispatch')}>
+                      重新派发
+                    </button>
+                    <select
+                      className="task-reassign"
+                      value={task.assigneeId ?? ''}
+                      disabled={busy}
+                      title="换负责人（负责人失效时可换人后重新派发）"
+                      onChange={(event) => reassign(task, event.target.value)}
+                    >
+                      <option value="">（未指定）</option>
+                      {enabled.map((character) => (
+                        <option key={character.id} value={character.id}>
+                          {character.name}
+                        </option>
+                      ))}
+                    </select>
+                  </>
                 )}
               </div>
             </div>

@@ -128,9 +128,9 @@ prompt 走 argv 或临时文件、**不经过 shell**（spawn 无 shell，多行
 
 组织层的第一块：需求不再只是一条群消息，而是一张有状态、有验收、有负责人的卡。
 
-1. **状态机**：`proposed ──批准──> approved ──首个回合开始──> running ──正常收尾──> done`；`proposed ──驳回──> rejected`（0 回合、0 消息）；SOP 门禁 block（有改动无 PASS / verify fail）→ 保持 `running` 且 `result='blocked'`（可重新派发）。只有 `proposed` 可批准/驳回，重复批准一律 409 且不产生第二个回合（幂等靠状态，不靠去重）。回合被真人消息顶掉或被 stop：卡片保持 `running` 不误判 done，`round_id` 留痕供重新派发。
+1. **状态机**：`proposed ──批准（同步段内即 running，不再产生瞬态 approved）──> running ──正常收尾──> done`；`proposed ──驳回──> rejected`（0 回合、0 消息）。只有 `proposed` 可批准/驳回，重复批准一律 409 且不产生第二个回合（幂等靠状态，不靠去重）。**异常出口（B03 review）**：SOP 门禁 block → 保持 `running` 且 `result='blocked'`；回合 error/被中断 → 保持 `running` 且 `result='error'`（`RoundState.lastTurnOutcome` 记录末个非总结 turn 的终态，error/stopped 一律不结算 done）；回合被真人消息顶掉或被 stop（含排队回合被 sweep、排队中 assignee 被停用/删除）→ 卡片保持 `running`。**非终态卡永远有出口**：`running` 可重新派发，也可换负责人（assignee 是运营字段，非终态可改；内容字段仍只在 `proposed` 可改——它们已随批准消息进了 transcript）。
 2. **批准 = 一条系统消息 + 一个回合**：卡片字段（标题/what/why/验收/负责人）作为一条 `authorType:'system'` 消息发进房间（`meta.taskId` 可反查），`startTaskRound` 只 `enqueue` 指定 assignee（`allowActive`，忙则排队）——负责人是数据字段，不走 @ 文本解析。批准消息本身就在 transcript 里，what/why/验收随消息进入 prompt（含续传增量），**不新增任务序列化层**；任务消息的单条上限放宽到 9000 字符（字段上限之和），否则 4k 聊天上限会把验收标准截掉。驳回不触发任何回合。
-3. **回合关联与回写**：`turns.task_id` 在批准/派发时落库，接力 hand-off 同 round 共享；回合收尾（`maybeStartRoundSummary` 的每个 `rounds.delete` 前）经 `settleTaskByRound` 回写——done（正常收尾含轮末总结）或 blocked（门禁拦截），且先做 round 身份校验（只有当前注册的 round 能结算自己的卡；`round_id` 不匹配的旧轮迟到结算自然落空）。删房间级联删卡；删 assignee 只清指针、卡片保留（重新指定后仍可批准）。
+3. **回合关联与回写**：`turns.task_id` 在批准/派发时落库，接力 hand-off 与**自动重试**同 round 共享；回合收尾（`maybeStartRoundSummary` 的每个 `rounds.delete` 前）经 `settleTaskByRound` 回写——done（正常收尾且末回合无错）、blocked（门禁拦截）或 error（末回合 error/stopped），且先做 round 身份校验（只有当前注册的 round 能结算自己的卡；`round_id` 不匹配的旧轮迟到结算自然落空）。删房间级联删卡；删 assignee 只清指针、卡片保留（换人后仍可批准/重派）。
 4. **重新派发**：`POST /api/tasks/:id/dispatch`（仅 `running`）重发一张「【任务卡·重新派发】」消息并开新 round——续传会话的增量里必须重新拿到完整卡片。前端 `TaskPanel`（Modal）+ 头部「任务」按钮（未完成数 badge）+ SSE `task` 事件跨标签页同步。
 
-契约由 `scripts/task-check.mjs` 锁定（T1 建卡不跑 / T2 恰一回合一消息 / T3 字段送达含大卡与续传 / T4 驳回零副作用 / T5 幂等 / T6-T7 级联 / T8 时间戳 / T9 门禁拦截 / T10 重派 / T11 校验）。不做：模型自动拆卡、一卡一房间/线程（B18）、跨房间看板、自动验收判定。
+契约由 `scripts/task-check.mjs` 锁定（T1 建卡不跑 / T2 恰一回合一消息 / T3 字段送达含大卡与续传 / T4 驳回零副作用 / T5 幂等 / T6-T7 级联 / T8 时间戳 / T9 门禁拦截 / T10 重派 / T11 校验 / T12 忙时批准+stop 仍可重派 / T13 排队中换人 / T14 出错不假 done）。不做：模型自动拆卡、一卡一房间/线程（B18）、跨房间看板、自动验收判定。
