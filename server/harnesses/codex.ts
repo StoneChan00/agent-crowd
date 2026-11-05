@@ -53,9 +53,22 @@ interface CodexEvent {
  * missing traces rather than a broken turn. The final reply is the
  * concatenation of all completed agent_message items.
  */
+
+/**
+ * Session-continuity resume fragment (P0-1): `codex exec resume <id>`
+ * continues a recorded conversation. Verified by live probe (bogus id):
+ * the session id may sit right after the subcommand (clap accepts
+ * positionals before options) and the run then fails fast on the SESSION
+ * lookup — exactly the shape the orchestrator's clear-and-rerun-full
+ * fallback exists for. Note `exec resume` does NOT accept `--sandbox`
+ * (rejected at argv parse, only the bypass flag exists), so a resumed
+ * non-autoApprove turn rides codex's own default sandbox.
+ */
+const codexResumeArgs = (id: string): string[] => ['exec', 'resume', id]
 export const codexAdapter: HarnessAdapter = {
   id: 'codex',
   label: 'Codex',
+  resumeArgs: codexResumeArgs,
 
   async run(input: RunInput): Promise<RunOutput> {
     const spec = resolveCodex()
@@ -68,12 +81,17 @@ export const codexAdapter: HarnessAdapter = {
     const started = Date.now()
     const args = [
       ...spec.argsPrefix,
-      'exec',
+      // Resume rides the `exec resume` subcommand (P0-1); see the probe
+      // notes on codexResumeArgs — `--sandbox` is not accepted there, so a
+      // resumed non-autoApprove run rides codex's default sandbox instead.
+      ...(input.resume ? codexResumeArgs(input.resume.id) : ['exec']),
       '--json',
       '--skip-git-repo-check',
       ...(input.character.autoApprove
         ? ['--dangerously-bypass-approvals-and-sandbox']
-        : ['--sandbox', 'read-only']),
+        : input.resume
+          ? []
+          : ['--sandbox', 'read-only']),
     ]
     const model = input.character.model.trim()
     if (model) args.push('--model', model)

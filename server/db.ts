@@ -15,6 +15,7 @@ import { DEFAULT_TRIGGERS,
   type MessageMeta,
   type Room,
   type RoundCheck,
+  type Session,
   type Triggers,
   type Turn,
   type TurnStatus,
@@ -102,6 +103,19 @@ db.exec(`
     created_at integer not null
   );
   create index if not exists idx_round_checks_round on round_checks(room_id, round_id, kind);
+
+  create table if not exists sessions (
+    room_id text not null,
+    character_id text not null,
+    harness text not null,
+    model text not null default '',
+    session_id text not null,
+    consumed_at integer not null,
+    turns integer not null default 0,
+    created_at integer not null,
+    updated_at integer not null,
+    primary key (room_id, character_id)
+  );
 
   create table if not exists character_presets (
     id text primary key,
@@ -264,6 +278,8 @@ export function deleteRoom(id: string): void {
   db.prepare('delete from round_checks where room_id = ?').run(id)
   db.prepare('delete from characters where room_id = ?').run(id)
   db.prepare("delete from memories where scope = 'room' and owner_id = ?").run(id)
+  // Session rows belong to this room's transcript; the room is going away.
+  db.prepare('delete from sessions where room_id = ?').run(id)
   db.prepare('delete from rooms where id = ?').run(id)
 }
 
@@ -545,6 +561,15 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
     id,
   )
 
+  // Session continuity (P0-1): a harness or model change means the stored
+  // CLI session belongs to a different agent — drop the row so the next
+  // turn replays the full transcript instead of resuming across a persona
+  // break. syncCharacterFromPreset routes through updateCharacter, so the
+  // library "↻ 对齐" refresh is swept by the same hook.
+  if (next.harness !== current.harness || next.model !== current.model) {
+    clearSession(current.roomId, id)
+  }
+
   // Name-based trigger rules are portable, so a rename has to follow through.
   if (renamed) {
     for (const other of listCharacters(current.roomId)) {
@@ -565,6 +590,9 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
 
 export function deleteCharacter(id: string): void {
   db.prepare('delete from characters where id = ?').run(id)
+  // Session continuity (P0-1): the character is gone, its CLI session row
+  // must not outlive it (a re-created same-name character is a new agent).
+  db.prepare('delete from sessions where character_id = ?').run(id)
 }
 
 /* --------------------------------------------------------------- messages */
@@ -651,6 +679,10 @@ export function clearMessages(roomId: string): void {
   db.prepare('delete from messages where room_id = ?').run(roomId)
   db.prepare('delete from turns where room_id = ?').run(roomId)
   db.prepare('delete from round_checks where room_id = ?').run(roomId)
+  // Session continuity (P0-1): the transcript the cursor points into is
+  // gone — keep the row and the next turn would "resume" past messages the
+  // CLI has never seen (they were just deleted).
+  db.prepare('delete from sessions where room_id = ?').run(roomId)
 }
 
 /* ------------------------------------------------------------------ turns */
@@ -940,6 +972,79 @@ export function listRoundChecks(roomId: string): RoundCheck[] {
     .prepare('select * from round_checks where room_id = ? order by created_at asc')
     .all(roomId)
     .map(mapRoundCheck)
+}
+
+/* ---------------------------------------------------------------- sessions */
+
+function mapSession(row: Record<string, unknown>): Session {
+  return {
+    roomId: String(row.room_id),
+    characterId: String(row.character_id),
+    harness: String(row.harness) as HarnessKind,
+    model: String(row.model ?? ''),
+    sessionId: String(row.session_id),
+    consumedAt: Number(row.consumed_at),
+    turns: Number(row.turns ?? 0),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  }
+}
+
+/** The CLI session one character rides in one room, if a clean turn left one. */
+export function getSession(roomId: string, characterId: string): Session | undefined {
+  const row = db.prepare('select * from sessions where room_id = ? and character_id = ?').get(roomId, characterId)
+  return row ? mapSession(row) : undefined
+}
+
+/**
+ * Persist (or replace) a character's CLI session row (session continuity,
+ * P0-1). Upsert keyed on (room, character): `turns` counts up on replace, so
+ * session-check can assert two rode turns end-to-end. The caller passes the
+ * cursor the successful prompt actually consumed — never Date.now() (a
+ * message arriving mid-turn must stay NEWER than the cursor or the next
+ * turn would silently skip it).
+ */
+export function setSession(input: {
+  roomId: string
+  characterId: string
+  harness: HarnessKind
+  model: string
+  sessionId: string
+  consumedAt: number
+}): Session {
+  const at = now()
+  db.prepare(
+    `insert into sessions (room_id, character_id, harness, model, session_id, consumed_at, turns, created_at, updated_at)
+     values (?, ?, ?, ?, ?, ?, 1, ?, ?)
+     on conflict(room_id, character_id) do update set
+       harness = excluded.harness,
+       model = excluded.model,
+       session_id = excluded.session_id,
+       consumed_at = excluded.consumed_at,
+       turns = sessions.turns + 1,
+       updated_at = excluded.updated_at`,
+  ).run(
+    input.roomId,
+    input.characterId,
+    input.harness,
+    input.model,
+    input.sessionId,
+    input.consumedAt,
+    at,
+    at,
+  )
+  const stored = getSession(input.roomId, input.characterId)
+  if (!stored) throw new Error('session row missing after upsert')
+  return stored
+}
+
+/**
+ * Drop one character's session row. Called when a resumed run fails (the
+ * fallback re-runs on the full transcript and the stale row must not poison
+ * it) and on harness/model drift (see updateCharacter).
+ */
+export function clearSession(roomId: string, characterId: string): void {
+  db.prepare('delete from sessions where room_id = ? and character_id = ?').run(roomId, characterId)
 }
 
 /* -------------------------------------------------------------- identities */

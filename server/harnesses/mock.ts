@@ -5,12 +5,24 @@ import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
+ * Deterministic session id per character (session continuity, P0-1): every
+ * clean mock turn reports one, so the sessions table and the resume path can
+ * be exercised end-to-end offline (session-check P4-P6).
+ */
+const mockSessionId = (characterId: string): string => `mock-${characterId.slice(0, 8)}`
+
+/**
  * Mock adapter: no API key, no subprocess. It streams a canned reply so the
  * chat room and the hand-off chain can be exercised offline.
  */
 export const mockAdapter: HarnessAdapter = {
   id: 'mock',
   label: 'Mock',
+  // Symbolic only — mock runs in-process, nothing is ever spawned. The
+  // fragment exists so the orchestrator's resume capability gate (and
+  // session-check P3) treat mock as resume-capable; the seam itself reads
+  // input.resume directly.
+  resumeArgs: (id: string): string[] => ['--session', id],
 
   async run(input: RunInput): Promise<RunOutput> {
     const started = Date.now()
@@ -44,7 +56,7 @@ export const mockAdapter: HarnessAdapter = {
         input.emit({ kind: 'text', text: chunk })
         await sleep(400)
       }
-      return { text: slowText, exitCode: 0, durationMs: Date.now() - started }
+      return { text: slowText, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started }
     }
     if (lastUser.includes('模拟记忆')) {
       // Echoes how many long-term memory entries the prompt carried, so smoke
@@ -67,7 +79,7 @@ export const mockAdapter: HarnessAdapter = {
         input.emit({ kind: 'text', text: chunk })
         await sleep(25)
       }
-      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
     // Test seam for queue-check: the 【现在轮到你】 instruction carries the
     // override a steer persisted on the turn row. When it carries the marker,
@@ -84,7 +96,47 @@ export const mockAdapter: HarnessAdapter = {
         input.emit({ kind: 'text', text: chunk })
         await sleep(25)
       }
-      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
+    // Test seams for session-check (P0-1): persona is the behavior switch,
+    // same convention as the SOP seams below — other personas resume just
+    // fine (their normal replies simply ride the incremental prompt).
+    //   MOCK-续传    → a resumed turn replies RESUME-OK with the transcript
+    //                  line count + the newest user line, so the check can
+    //                  prove the prompt carried ONLY post-cursor messages
+    //                  (a full replay would count more lines)
+    //   MOCK-会话失效 → a resumed turn dies with "session not found" (zero
+    //                  text, fast exit), exercising the orchestrator's
+    //                  clear-and-rerun-full fallback
+    if (input.resume && input.character.persona.includes('MOCK-会话失效')) {
+      return { text: '', exitCode: 8, durationMs: Date.now() - started, error: 'session not found（模拟会话失效）' }
+    }
+    if (input.resume && input.character.persona.includes('MOCK-续传')) {
+      const section = input.prompt.slice(
+        input.prompt.indexOf('【最近的群聊记录】'),
+        input.prompt.indexOf('\n【现在轮到你】'),
+      )
+      const newLines = section
+        .split('\n')
+        .filter((line) => line.trim() && !line.startsWith('【')).length
+      const reply = `（mock 模式）RESUME-OK：续传会话 ${input.resume.id}，本轮新消息 ${newLines} 条，最新用户消息：${lastUser.slice(0, 80)}`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: input.resume.id, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
+    // Round 1 of the 续传 scenario: a SINGLE-LINE reply, so the next turn's
+    // line count is unambiguous (incremental 2 vs full replay 3 — the
+    // default multi-line reply would make both counts shift by its own
+    // line count and hide the difference).
+    if (!input.resume && input.character.persona.includes('MOCK-续传')) {
+      const reply = `（mock 模式）${input.character.name} 已建立会话，本轮全量收到：${lastUser.slice(0, 80)}`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
     // Test seams for sop-check (SOP gate, P0-3): the character's PERSONA is
     // the behavior switch — one character per role in the fixture, no
@@ -100,7 +152,7 @@ export const mockAdapter: HarnessAdapter = {
         input.emit({ kind: 'text', text: chunk })
         await sleep(10)
       }
-      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
     if (input.character.persona.includes('MOCK-评审')) {
       const verdict = input.character.persona.includes('MOCK-评审返修') ? 'REVIEW: CHANGES' : 'REVIEW: PASS'
@@ -109,7 +161,7 @@ export const mockAdapter: HarnessAdapter = {
         input.emit({ kind: 'text', text: chunk })
         await sleep(10)
       }
-      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
     const reply = [
       `（mock 模式）我是 **${input.character.name}**，收到任务：${lastUser.slice(0, 120) || '（群聊上下文）'}`,
@@ -135,6 +187,7 @@ export const mockAdapter: HarnessAdapter = {
 
     return {
       text: reply,
+      sessionId: mockSessionId(input.character.id),
       exitCode: 0,
       durationMs: Date.now() - started,
       tokens: { input: 0, output: reply.length, total: reply.length },

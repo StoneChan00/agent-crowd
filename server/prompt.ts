@@ -65,14 +65,29 @@ export function buildTurnPrompt(input: {
   override?: string
   /** Long-term memory: the character's cross-room identity notes + this room's shared notes. */
   memories?: { identity: Memory[]; room: Memory[] }
+  /**
+   * Session cursor (P0-1): with `resumed`, only messages strictly newer
+   * than this land in the transcript — the CLI's own session already
+   * carries the older context. 0 / undefined = everything.
+   */
+  since?: number
+  /** True when this turn rides the character's persisted CLI session (P0-1). */
+  resumed?: boolean
 }): string {
-  const { room, character, messages, cwd } = input
+  const { room, character, cwd } = input
   const others = input.characters.filter((member) => member.id !== character.id)
+
+  // Session continuity (P0-1): a resumed turn ships ONLY what arrived after
+  // the cursor. The budget still fills newest-first, so the cursor computed
+  // by `nextSessionCursor` over the same list always points at a message
+  // the prompt actually carries.
+  const since = input.since ?? 0
+  const visible = input.resumed ? input.messages.filter((message) => message.createdAt > since) : input.messages
 
   const recent: string[] = []
   let used = 0
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const line = transcriptLine(messages[index])
+  for (let index = visible.length - 1; index >= 0; index -= 1) {
+    const line = transcriptLine(visible[index])
     if (used + line.length > TRANSCRIPT_CHAR_BUDGET) break
     recent.unshift(line)
     used += line.length + 1
@@ -136,8 +151,13 @@ export function buildTurnPrompt(input: {
         ]
       : []),
     '',
-    '【最近的群聊记录】',
-    recent.join('\n') || '（空）',
+    // Session continuity (P0-1): a resumed turn tells the agent why the
+    // transcript starts where it does — the older messages are not lost,
+    // they live in the CLI's own session context this run continues.
+    input.resumed
+      ? '【最近的群聊记录】（以下是你上次发言之后的新消息；更早内容已在同一会话上下文中）'
+      : '【最近的群聊记录】',
+    recent.join('\n') || (input.resumed ? '（无新消息）' : '（空）'),
     '',
   ].join('\n')
 
@@ -158,4 +178,20 @@ export function buildTurnPrompt(input: {
   // never the tail. The "now it's your turn" instruction is the one part the
   // agent cannot act without, so it must survive even the overflow path.
   return header.slice(0, Math.max(0, MAX_TOTAL_PROMPT - tail.length)) + '\n…（上下文过长已截断）' + tail
+}
+
+/**
+ * The cursor a resumed prompt built from `messages` + `since` leaves behind:
+ * the createdAt of the NEWEST message the prompt actually carries. Newest
+ * messages always survive the budget (it fills newest-first), so this never
+ * points past something the prompt dropped. Messages that arrive DURING the
+ * run stay newer than the cursor and re-ship on the next turn — computing
+ * the cursor from `Date.now()` instead would silently swallow them forever.
+ */
+export function nextSessionCursor(messages: Message[], since: number): number {
+  let cursor = since
+  for (const message of messages) {
+    if (message.createdAt > cursor) cursor = message.createdAt
+  }
+  return cursor
 }

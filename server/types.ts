@@ -206,6 +206,12 @@ export interface MessageMeta {
    * (not a git repo) simply never sets it.
    */
   changed?: string[]
+  /**
+   * True when this turn rode the character's persisted CLI session
+   * (P0-1): the prompt carried only post-cursor messages and the adapter
+   * got a resume argument. Absent on full-replay turns.
+   */
+  resume?: boolean
 }
 
 export type AuthorType = 'user' | 'character' | 'system'
@@ -287,4 +293,30 @@ export interface RoundCheck {
   /** Verify runs keep the output tail here; review rows leave it null. */
   detail: string | null
   createdAt: number
+}
+
+/**
+ * The CLI session one character rides in one room (session continuity,
+ * P0-1): the adapter-reported session id plus the message cursor already
+ * delivered into that session. One row per (room, character) — the next
+ * turn resumes the CLI session and ships only post-cursor messages, so
+ * "the character remembers the last round" without replaying the whole
+ * transcript. Swept on character deletion, message clearing, room deletion
+ * and harness/model drift.
+ */
+export interface Session {
+  roomId: string
+  characterId: string
+  /** Harness that produced the session id — drift invalidates the row. */
+  harness: HarnessKind
+  /** Model the session ran with — drift invalidates the row. */
+  model: string
+  /** The CLI's own session/thread identifier. */
+  sessionId: string
+  /** createdAt of the newest message already delivered into the session. */
+  consumedAt: number
+  /** How many successful turns have ridden (re)written this row. */
+  turns: number
+  createdAt: number
+  updatedAt: number
 }

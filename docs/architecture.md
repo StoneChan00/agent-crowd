@@ -90,7 +90,7 @@ prompt 走 argv 或临时文件、**不经过 shell**（spawn 无 shell，多行
 ## 设计不变量
 
 - **串行回合**：同房间同一时刻只有一个角色在跑，避免多 agent 同时改同一批文件。
-- **无状态调用**：每回合全新 CLI 进程，上下文靠重放（记忆是唯一的跨回合携带）。
+- **会话可续传**（P0-1）：每回合仍是全新 CLI 进程，但同一角色在同一房间优先 resume 上次的 CLI session、只补发游标之后的新消息；无 session 行、适配器不支持或续传失败都回退全量重放（`AC_SESSION_RESUME=0` 一键关闭）。记忆是另一条跨回合携带通道。
 - **接力预算**：hop 深度计费而非次数，@all 直达全员不占预算。
 - **失败不接龙**：带 error 的回合不触发下游。
 - **快照式模板**：角色库改模板不回写已加入房间的角色，反之亦然。
@@ -109,3 +109,13 @@ prompt 走 argv 或临时文件、**不经过 shell**（spawn 无 shell，多行
    - 门禁阻断的轮**不自动重排队**（防自锁），继续干活由人/角色的下一条消息发起新一轮。
 
 验证命令运行期间 `gateActive(roomId)` 为真：`/api/rooms/:id/state` 报 `gate: 'running'`，重启排空判定（restart.ts）也把它算作忙，避免重启在验证跑到一半时掀掉进程、静默丢失门禁结果。这个 await 是悬空的：期间新的人类消息可以正常开新回合，验证结算后老 pump 会重新核对 `active`/队列再决定是否广播 idle（不给运行中的回合闪 `busy:false`）。契约由 `scripts/sop-check.mjs` 锁定（S1 解析器 / S2 真值表 / S3 快照 / S4-S8 端到端 / S9 重启竞态 / S9b 陈旧 idle）。
+
+## 会话连续性（P0-1：sessions 表 + 增量 prompt + resume 回退）
+
+「同一角色记得上一轮」由三件东西拼成，每一层失败都回退到上一层的现状：
+
+1. **sessions 表**（`db.ts`，主键 `(room_id, character_id)`）：`session_id`（CLI 自己上报的）+ `consumed_at`（已送进该 session 的最新一条消息的 createdAt）+ `harness`/`model`（漂移即失效）。失效点四处置：删角色、清空消息、删房间、harness/model 变化——最后一处挂在 `updateCharacter` 里，`syncCharacterFromPreset`（「↻ 对齐」）走同一条路，自动覆盖。
+2. **增量 prompt**（`prompt.ts` 的 `since`/`resumed` 入参）：续传轮只收 `createdAt > since` 的消息，标题注明「以下是你上次发言之后的新消息；更早内容已在同一会话上下文中」，无新消息写「（无新消息）」；预算逻辑不变。游标取**本次 prompt 实际包含的最新一条消息**（`nextSessionCursor`——预算从最新往回填，最新消息必然在 prompt 里；绝不能用 `Date.now()`：回合期间到达的消息必须比游标新，否则会被永久跳过）。角色自己的旧回复照常补发——它在 CLI 会话里是模型输出，重发一次是安全方向的冗余。
+3. **resume 参数**（`HarnessAdapter.resumeArgs`，声明即能力）：只有 **--help / live 探针证实过**的 CLI 才声明——claude `--resume <id>`；codex `exec resume <id>`（探针结论：session id 可前置于旗标，假 id 快速失败于 session 查找——正是回退路径要处理的形态；注意 resume 子命令不接受 `--sandbox`，非 autoApprove 的续传轮走 codex 默认沙箱）；opencode/cannbot `run --session <id>`（两个 CLI 分别验证）。dsh/hermes/custom 一律不声明 → 自动全量重放。`pump` 依 `adapter.resumeArgs` 判定能力，`RunInput.resume` 携带 id。
+
+回退与开关：续传失败（零文本）→ 清 session 行 + 全量重跑一次（同一 `item.retry` 环路保护，不叠加二次重试；**不发失败播报**——重跑的回复就是用户要的答案）。出错/停止的回合**不推进游标**（宁可重发，不可漏发）。`AC_SESSION_RESUME=0` 只关「乘坐」不关记账（行照常更新，开关回拨即无缝续传）。成功回合把 `meta.resume` 写进消息。契约由 `scripts/session-check.mjs` 锁定（P1 增量纯函数 / P2 隔离与失效 / P3 argv / P4 两轮端到端 / P5 回退 / P6 开关）；真实 CLI 冒烟（P7，claude 两轮）是人工步骤，结果只进交付汇报。

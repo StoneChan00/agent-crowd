@@ -36,6 +36,14 @@ interface ClaudeEvent {
 const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku']
 
 /**
+ * Session-continuity resume fragment (P0-1): `claude --resume <id>`
+ * continues a stored conversation by session id. Flag verified against
+ * `claude --help` (`-r, --resume [value]`) and proven live in P7 smoke —
+ * coexists with `-p` and `--output-format stream-json`.
+ */
+const claudeResumeArgs = (id: string): string[] => ['--resume', id]
+
+/**
  * Claude Code adapter: `claude -p <prompt> --output-format stream-json --verbose`.
  * Same stream-json lineage Hermes speaks (system/assistant/user/result), so the
  * parsing mirrors hermes.ts with Claude-specific fields: reply text arrives as
@@ -47,6 +55,7 @@ const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku']
 export const claudeAdapter: HarnessAdapter = {
   id: 'claude',
   label: 'Claude Code',
+  resumeArgs: claudeResumeArgs,
 
   async run(input: RunInput): Promise<RunOutput> {
     const spec = resolveClaude()
@@ -58,6 +67,7 @@ export const claudeAdapter: HarnessAdapter = {
 
     const started = Date.now()
     const args = [...spec.argsPrefix, '-p', input.prompt, '--output-format', 'stream-json', '--verbose']
+    if (input.resume) args.push(...claudeResumeArgs(input.resume.id))
     const model = input.character.model.trim()
     if (model) args.push('--model', model)
     // Mirror codex's read-only fallback: without an explicit mode the global

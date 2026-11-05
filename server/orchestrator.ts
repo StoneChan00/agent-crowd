@@ -7,7 +7,7 @@ import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure } from './harnesses/process.ts'
 import { changedPathsBetween, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
-import { buildTurnPrompt } from './prompt.ts'
+import { buildTurnPrompt, nextSessionCursor } from './prompt.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
@@ -840,15 +840,48 @@ async function pump(roomId: string): Promise<void> {
     // they never crowd out the transcript (see docs/memory-plan.md).
     const identity = db.ensureIdentityForCharacter(character)
     const memories = db.pickMemoriesForPrompt(identity.id, room.id)
-    const prompt = buildTurnPrompt({ room, character, characters, messages, cwd, override: item.override, memories })
-    db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))
+    // Session continuity (P0-1): the same character in the same room rides
+    // the CLI's own session when a stored row still matches its harness and
+    // model AND the adapter declared a resume fragment (flags verified
+    // against each CLI's --help before being declared — never guessed).
+    // Anything off — no row, harness/model drift, unsupported adapter, or
+    // the AC_SESSION_RESUME=0 kill switch — replays the full transcript with
+    // zero behavior change.
     const adapter = getAdapter(character.harness)
+    const session = db.getSession(room.id, character.id)
+    const useResume =
+      session !== undefined &&
+      adapter.resumeArgs !== undefined &&
+      process.env.AC_SESSION_RESUME !== '0' &&
+      session.harness === character.harness &&
+      session.model === character.model
+    const since = useResume && session ? session.consumedAt : 0
+    // The cursor the NEXT turn resumes from: the newest message this prompt
+    // actually carries (newest always survives the budget). Never Date.now()
+    // — messages arriving mid-turn must stay newer than the cursor or they
+    // would be skipped forever. The cursor FILTER itself lives in
+    // buildTurnPrompt (single source: prompt.ts owns what a resumed prompt
+    // renders, this only computes where it leaves off).
+    const consumedAt = nextSessionCursor(messages, since)
+    const prompt = buildTurnPrompt({
+      room,
+      character,
+      characters,
+      messages,
+      cwd,
+      override: item.override,
+      memories,
+      since,
+      resumed: useResume,
+    })
+    db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))
 
     const output = await adapter.run({
       character,
       room,
       prompt,
       cwd,
+      resume: useResume && session ? { id: session.sessionId } : undefined,
       signal: controller.signal,
       // Surface the CLI pid the moment it spawns: stored on the active turn
       // (for /state and reconnect snapshots) and broadcast so open clients
@@ -925,20 +958,17 @@ async function pump(roomId: string): Promise<void> {
         endedAt: Date.now(),
       })
       broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'error' })
-      // A turn that died without a single character of text is worth ONE
-      // automatic retry only when it also died FAST (isTransientFailure):
-      // a transient CLI hiccup / upstream API error surfaces within
-      // seconds, while a timeout by definition ran at least the idle limit
-      // — re-running a hung upstream would just double the wait for the
-      // same death. `item.retry` is the loop guard: a retry that fails
-      // again falls through for good. User-stopped turns return earlier
-      // and never reach this; a character deleted mid-run is not
-      // re-summoned. The retry can still be dropped by enqueue() when this
-      // character is already queued (the user's own @ then serves as the
-      // rerun), so the promise below is only made when the retry truly
-      // entered the queue.
+      // Session-continuity fallback (P0-1): a turn that died resuming its
+      // CLI session clears the row first, so the rerun (and every later
+      // turn) replays the FULL transcript. A resume rejection is plumbing,
+      // not the model — it is always worth one fallback rerun, transient or
+      // not, still under the same `item.retry` loop guard (never two).
+      // And the rerun's reply IS the answer the user asked for, so no
+      // failure notice goes out when the fallback is queued.
+      if (useResume) db.clearSession(roomId, character.id)
+      const fallbackRetry = useResume && !item.retry
       const retryQueued =
-        isTransientFailure(output) &&
+        (fallbackRetry || isTransientFailure(output)) &&
         !item.retry &&
         db.getCharacter(character.id) !== undefined &&
         enqueue(roomId, character.id, item.triggerMessageId, item.hop, item.override, {
@@ -947,6 +977,7 @@ async function pump(roomId: string): Promise<void> {
           isRoundSummary: item.isRoundSummary,
           roundId: item.roundId ?? null,
         })
+      if (fallbackRetry && retryQueued) return
       const message = db.addMessage({
         roomId,
         authorType: 'system',
@@ -1034,6 +1065,9 @@ async function pump(roomId: string): Promise<void> {
         tools: output.toolTraces as ToolTrace[] | undefined,
         error: output.error,
         relayTo: followers.length > 0 ? followers.map((member) => member.name) : undefined,
+        // Session continuity (P0-1): flags whether this reply came from a
+        // resumed CLI session (incremental prompt) or a full replay.
+        resume: useResume || undefined,
         generated: true,
         ...(changedPaths && changedPaths.length > 0 ? { changed: changedPaths } : {}),
       },
@@ -1080,6 +1114,23 @@ async function pump(roomId: string): Promise<void> {
       for (const path of changedPaths) {
         if (!round.changedPaths.includes(path)) round.changedPaths.push(path)
       }
+    }
+    // Session continuity (P0-1): a clean turn that surfaced a CLI session id
+    // (re)writes the row; consumedAt is what this prompt actually consumed.
+    // Errored and stopped turns never advance the cursor — the next run
+    // re-sends rather than silently skipping (duplication is recoverable, a
+    // skip is not). Rows are written even under AC_SESSION_RESUME=0: the
+    // switch disables the RIDE, not the bookkeeping, so flipping it back on
+    // resumes seamlessly.
+    if (!output.error && output.sessionId) {
+      db.setSession({
+        roomId,
+        characterId: character.id,
+        harness: character.harness,
+        model: character.model,
+        sessionId: output.sessionId,
+        consumedAt,
+      })
     }
     enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null)
   } catch (error) {

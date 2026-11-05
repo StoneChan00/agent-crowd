@@ -46,11 +46,18 @@ export interface OpencodeLikeOptions {
  * opencode and cannbot are the same CLI lineage: `run --format json` emits one
  * JSON event per line, with whole text parts, tool parts, and token totals.
  * One adapter drives both; only the binary and the auto-approve flag differ.
+ *
+ * Session continuity (P0-1): both CLIs expose `run -s/--session <id>` to
+ * continue a session (verified via `run --help` on opencode AND cannbot
+ * separately — same flag, same semantics).
  */
+const sessionArgs = (id: string): string[] => ['--session', id]
+
 export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): HarnessAdapter {
   return {
     id: options.id,
     label: options.label,
+    resumeArgs: sessionArgs,
 
     async run(input: RunInput): Promise<RunOutput> {
       const spec = options.resolve()
@@ -58,6 +65,7 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
 
       const started = Date.now()
       const args = [...spec.argsPrefix, 'run', '--format', 'json']
+      if (input.resume) args.push(...sessionArgs(input.resume.id))
       if (input.character.model.trim()) args.push('--model', input.character.model.trim())
       if (input.character.autoApprove) args.push(options.autoApproveFlag)
       args.push('--dir', input.cwd, input.prompt)

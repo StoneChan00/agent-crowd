@@ -12,6 +12,12 @@ export interface RunInput {
   prompt: string
   /** Absolute working directory the harness should run in. */
   cwd: string
+  /**
+   * Session continuity (P0-1): present when this turn rides the character's
+   * persisted CLI session — the adapter passes `resumeArgs(id)` to its CLI
+   * so the run continues where the last one ended. Absent = full replay.
+   */
+  resume?: { id: string }
   signal: AbortSignal
   emit: (event: AdapterEvent) => void
   /** Receives the spawned CLI's pid, so the room can display it live. */
@@ -48,6 +54,14 @@ export interface HarnessAdapter {
   id: HarnessKind
   label: string
   run(input: RunInput): Promise<RunOutput>
+  /**
+   * Session continuity (P0-1): the argv fragment that resumes a prior CLI
+   * session. DECLARING it is the capability marker — the orchestrator only
+   * rides a stored session when this exists, and it must only exist for
+   * flags actually verified against the CLI's own --help (never guessed).
+   * Returns null when the adapter cannot resume this id after all.
+   */
+  resumeArgs?: (id: string) => string[] | null
   /** Models this harness can offer in the character editor. */
   listModels?(): Promise<string[]>
 }
