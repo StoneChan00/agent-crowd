@@ -792,6 +792,26 @@ async function scenarioEndToEnd() {
         JSON.stringify(episodes.map((row) => row.content)),
       )
     }
+
+    // S10g-b (B04 review 3): the whole-line code span — rule 9's example
+    // copied verbatim into backticks — is equally gate protocol. It must not
+    // become the delivery either, or the next same-facts round dedupes
+    // against a verdict-text episode and swallows its real delivery.
+    {
+      const room = await makeSopRoom(port, repo, 's10g-反引号结论', {
+        verifyCommand: 'exit 0',
+        reviewerPersona: 'MOCK-反引号结论',
+      })
+      await runRoundAndDrain(port, room.id)
+      const episodes = memoriesWhere(room.id)
+      check(
+        'S10g-b 反引号整行 code span 也不成为交付（episode 仍是开发者文本）',
+        episodes.length === 1 &&
+          episodes[0].content.includes('已在工作目录写入') &&
+          !episodes[0].content.includes('REVIEW'),
+        JSON.stringify(episodes.map((row) => row.content)),
+      )
+    }
   }
 }
 

@@ -36,6 +36,7 @@ import {
   TRANSCRIPT_CHAR_BUDGET,
 } from '../server/prompt.ts'
 import { DEFAULT_TRIGGERS } from '../server/types.ts'
+import * as sop from '../server/sop.ts'
 
 let failed = 0
 
@@ -289,16 +290,47 @@ const mark = (tag) => `⟪${tag}⟫`
         ]) === '最后一条' &&
         mem.memoryQueryFromMessages([]) === '',
     )
+    // Table-driven cross-check against the gate itself (B04 review 3): for
+    // every verdict shape, the gate seeing a verdict must coincide with the
+    // stripper removing exactly that line — expectations derive from
+    // parseReviewVerdict, not from a hand-listed subset that can drift.
+    {
+      const verdictShapes = [
+        'REVIEW: PASS',
+        '**REVIEW: PASS**',
+        'REVIEW：PASS',
+        'review: changes',
+        '`REVIEW: PASS`',
+        '`**REVIEW：CHANGES**`',
+        '``REVIEW: PASS``',
+        '  REVIEW: PASS  ',
+        '> REVIEW: PASS',
+        '| 门禁 | REVIEW: PASS |',
+        'REVIEW: PASSED',
+        '我认为 REVIEW: PASS 不合适',
+        '```\nREVIEW: PASS\n```',
+        '\n    REVIEW: PASS',
+      ]
+      let shapesAligned = true
+      let shapeDetail = ''
+      for (const sample of verdictShapes) {
+        const text = `交付内容一行\n${sample}`
+        const gateSees = sop.parseReviewVerdict(text) !== null
+        const strippedSomething = sop.stripVerdictLines(text) !== text
+        if (gateSees !== strippedSomething) {
+          shapesAligned = false
+          shapeDetail += `[${JSON.stringify(sample)} gate=${gateSees} strip=${strippedSomething}] `
+        }
+      }
+      check('R-pure verdict 形态表驱动对拍（gate 判定与剥离同源一致）', shapesAligned, shapeDetail)
+    }
     check(
-      'R-pure verdict 行判定与 gate 对齐（全角冒号/加粗/大小写）',
-      mem.episodeDelivery('完成\nREVIEW：PASS') === '完成' &&
-        mem.episodeDelivery('完成\n**REVIEW: PASS**') === '完成' &&
-        mem.episodeDelivery('完成\nreview: changes') === '完成',
-      mem.episodeDelivery('完成\nREVIEW：PASS'),
+      'R-pure 剥离覆盖反引号整行 code span（交付保留正文）',
+      mem.episodeDelivery('完成\n`REVIEW: PASS`') === '完成' && mem.episodeDelivery('完成\n``REVIEW: PASS``') === '完成',
     )
     check(
-      'R-pure 纯结论消息的交付为空串（不覆盖语义的判据）',
-      mem.episodeDelivery('REVIEW: PASS') === '' && mem.episodeDelivery('**REVIEW：CHANGES**') === '',
+      'R-pure 纯结论消息的交付为空串（含反引号形态）',
+      mem.episodeDelivery('REVIEW: PASS') === '' && mem.episodeDelivery('`REVIEW: PASS`') === '' && mem.episodeDelivery('**REVIEW：CHANGES**') === '',
     )
     const epOther = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['c.ts'], verify: 'pass', delivery: '另一种交付' })
     const epOtherDelivery = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['a.ts', 'b.ts'], verify: 'pass', delivery: '不同的交付' })

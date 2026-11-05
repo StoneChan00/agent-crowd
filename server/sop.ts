@@ -27,6 +27,60 @@ export type ReviewVerdict = 'pass' | 'changes'
 /** How many trailing non-empty lines of a message are scanned for the verdict. */
 export const REVIEW_TAIL_LINES = 5
 
+/**
+ * Line-level verdict-protocol classification (B04 review 3): is this single
+ * line, judged OUTSIDE any code block, a whole-line verdict in a shape the
+ * gate accepts? Covers the plain form REVIEW_LINE already describes, plus
+ * the whole-line CODE SPAN (`` `REVIEW: PASS` `` — agents copy rule 9's
+ * example text into backticks; the span's inner text is what the gate
+ * reads). PURE line logic, no mdast — memory.ts reuses it so the episode
+ * delivery stripper can never drift from the parser a third time.
+ */
+export function isVerdictProtocolLine(line: string): boolean {
+  const trimmed = line.trim()
+  if (REVIEW_LINE.test(trimmed)) return true
+  const codeSpan = /^(`+)([^`]*)\1$/.exec(trimmed)
+  return Boolean(codeSpan && REVIEW_LINE.test(codeSpan[2].trim()))
+}
+
+/**
+ * Strip gate-protocol verdict lines from raw message text (B04: the episode
+ * memory's delivery). Whole-line verdicts in every shape the gate accepts
+ * are removed; lines inside FENCED (```/~~~) or INDENTED (4+ spaces after a
+ * blank line) code blocks are KEPT — quoted code is content the gate never
+ * reads as a verdict, so it must not vanish from the delivery either.
+ * Shares isVerdictProtocolLine with the parser; blockquotes and tables never
+ * match the line shape and pass through untouched.
+ */
+export function stripVerdictLines(text: string): string {
+  const kept: string[] = []
+  let fence: { marker: string; length: number } | null = null
+  let inIndentedCode = false
+  let prevBlank = true
+  for (const raw of text.split('\n')) {
+    const fenceHit = /^ {0,3}(`{3,}|~{3,})/.exec(raw)
+    if (fence) {
+      kept.push(raw)
+      if (fenceHit && fenceHit[1][0] === fence.marker && fenceHit[1].length >= fence.length && raw.trim() === fenceHit[1].trim()) {
+        fence = null
+      }
+    } else if (fenceHit) {
+      fence = { marker: fenceHit[1][0], length: fenceHit[1].length }
+      kept.push(raw)
+    } else if (inIndentedCode) {
+      kept.push(raw)
+      if (raw.trim() !== '' && !/^[ \t]{4,}/.test(raw)) inIndentedCode = false
+    } else if (prevBlank && /^[ \t]{4,}\S/.test(raw)) {
+      inIndentedCode = true
+      kept.push(raw)
+    } else if (!isVerdictProtocolLine(raw)) {
+      kept.push(raw)
+    }
+    prevBlank = raw.trim() === ''
+  }
+  return kept.join('\n')
+}
+
 /** Minimal mdast shape — enough for the extraction pass (same trick as mentions.ts). */
 interface MdNode {
   type: string

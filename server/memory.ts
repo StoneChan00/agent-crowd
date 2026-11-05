@@ -1,36 +1,29 @@
 import { createHash } from 'node:crypto'
 import type { Message } from './types.ts'
+import { stripVerdictLines } from './sop.ts'
 
 /**
- * B04 round-end memory: pure helpers only — no db, no orchestrator imports.
- * The zero-model episode is assembled from structured facts the round
- * already carries (changed paths, review verdict, verify outcome, the last
- * delivery line); retrieval planning splits the raw query into FTS-able
- * (≥3 code points, trigram-substring capable) and LIKE-only (short CJK)
- * terms. Everything here is deterministic and unit-testable in isolation.
+ * B04 round-end memory: pure helpers only — no db, no orchestrator imports
+ * (sop.ts's verdict-line stripper is pure line logic and is imported so the
+ * "what is gate protocol" judgment has exactly ONE home). The zero-model
+ * episode is assembled from structured facts the round already carries
+ * (changed paths, review verdict, verify outcome, the last delivery line);
+ * retrieval planning splits the raw query into FTS-able (≥3 code points,
+ * trigram-substring capable) and LIKE-only (short CJK) terms. Everything
+ * here is deterministic and unit-testable in isolation.
  */
 
 /**
- * A standalone REVIEW: verdict line is gate protocol, not delivery content.
- * Mirrors the gate's own line shape in sop.ts (optional `**` framing,
- * fullwidth colon, case-insensitive) — keep the two in sync; the R-pure
- * checks lock the alignment.
- */
-const REVIEW_LINE = /^\s*\**\s*review\s*[:：]\s*\**\s*(?:pass|changes)\s*\**\s*$/i
-
-/**
- * The round's delivery line: verdict lines stripped, whitespace collapsed,
- * first 160 chars. Applied both when the round records its last delivery and
- * again inside buildRoundEpisode (idempotent — the two layers must agree
- * even if one changes). A verdict-ONLY message ("REVIEW: PASS" alone)
- * strips to the empty string — callers use that to decide NOT to overwrite
- * the round's real delivery.
+ * The round's delivery line: gate-protocol verdict lines stripped (every
+ * shape the parser accepts, including whole-line code spans — B04 review 3),
+ * whitespace collapsed, first 160 chars. Applied both when the round records
+ * its last delivery and again inside buildRoundEpisode (idempotent — the two
+ * layers must agree even if one changes). A verdict-ONLY message ("REVIEW:
+ * PASS" alone, backticked or not) strips to the empty string — callers use
+ * that to decide NOT to overwrite the round's real delivery.
  */
 export function episodeDelivery(text: string): string {
-  return text
-    .split('\n')
-    .filter((line) => !REVIEW_LINE.test(line))
-    .join('\n')
+  return stripVerdictLines(text)
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 160)

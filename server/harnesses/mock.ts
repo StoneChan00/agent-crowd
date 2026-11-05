@@ -207,6 +207,16 @@ export const mockAdapter: HarnessAdapter = {
     // Test seam (B04 review 2, S10g): a reviewer that replies with the
     // verdict line ONLY — the gate convention's minimal reviewer. Its
     // stripped delivery is empty and must not wipe the round's real one.
+    // The backtick variant (S10g-b) copies rule 9's example text verbatim —
+    // a whole-line code span the gate accepts as a verdict.
+    if (input.character.persona.includes('MOCK-反引号结论')) {
+      const reply = '`REVIEW: PASS`'
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
     if (input.character.persona.includes('MOCK-只回结论')) {
       const reply = 'REVIEW: PASS'
       for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
