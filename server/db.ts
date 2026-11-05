@@ -278,12 +278,33 @@ function initMemorySearch(): void {
     memoryFts = true
   } catch (error) {
     memoryFts = false
+    // A half-initialized index must not intercept writes (B04 review 1):
+    // leftover triggers would re-route every memories INSERT into the broken
+    // vtable and throw — turning "FTS degraded" into "cannot save memories".
+    // Drop them best-effort; if even this fails the index stays inert.
+    try {
+      db.exec(
+        'drop trigger if exists memories_ai; drop trigger if exists memories_ad; drop trigger if exists memories_au;',
+      )
+    } catch {
+      /* nothing further to do — writes may fail loudly, which is visible */
+    }
     console.warn(
       `[agent-crowd] memory FTS unavailable, retrieval degrades to LIKE: ${error instanceof Error ? error.message : error}`,
     )
   }
 }
 initMemorySearch()
+
+/**
+ * TEST-ONLY (prompt-check R9): force the FTS availability flag so the
+ * degradation path — long terms fall back to LIKE instead of vanishing —
+ * can be regression-locked without sabotaging a real index. Never call
+ * this from server code.
+ */
+export function __setMemoryFtsForTests(enabled: boolean): void {
+  memoryFts = enabled
+}
 
 const now = () => Date.now()
 
@@ -1515,6 +1536,7 @@ export function searchMemoryIds(
   if (!plan) return []
   const ids: string[] = []
   const seen = new Set<string>()
+  let ftsRan = false
   if (memoryFts && plan.ftsTerms.length > 0) {
     try {
       const match = plan.ftsTerms.map(ftsQuote).join(' ')
@@ -1531,6 +1553,7 @@ export function searchMemoryIds(
           ids.push(row.id)
         }
       }
+      ftsRan = true
     } catch (error) {
       // A broken index must not take retrieval down with it — LIKE still runs.
       console.warn(
@@ -1538,14 +1561,19 @@ export function searchMemoryIds(
       )
     }
   }
-  if (plan.likeTerms.length > 0) {
-    const clauses = plan.likeTerms.map(() => "content like ? escape '\\'").join(' or ')
+  // B04 review 1: when the FTS leg never ran (index off at startup, or its
+  // query just threw), the long terms DEGRADE to LIKE — silently dropping
+  // them is how "续传游标" became unfindable with FTS disabled. When FTS did
+  // run, its terms had their chance and stay out of the LIKE leg.
+  const likeTerms = ftsRan ? plan.likeTerms : [...new Set([...plan.likeTerms, ...plan.ftsTerms])]
+  if (likeTerms.length > 0) {
+    const clauses = likeTerms.map(() => "content like ? escape '\\'").join(' or ')
     const rows = db
       .prepare(
         `select id from memories where scope = ? and owner_id = ? and (${clauses})
          order by pinned desc, created_at desc limit ?`,
       )
-      .all(scope, ownerId, ...plan.likeTerms.map((term) => `%${escapeLike(term)}%`), limit) as { id: string }[]
+      .all(scope, ownerId, ...likeTerms.map((term) => `%${escapeLike(term)}%`), limit) as { id: string }[]
     for (const row of rows) {
       if (!seen.has(row.id)) {
         seen.add(row.id)
@@ -1563,7 +1591,6 @@ export function updateMemory(
   const raw = db.prepare('select * from memories where id = ?').get(id) as Record<string, unknown> | undefined
   const current = raw ? mapMemory(raw) : undefined
   if (!current || !raw) return undefined
-  const contentChanged = patch.content !== undefined && truncateText(patch.content.trim(), 500) !== current.content
   const next: Memory = {
     ...current,
     content: patch.content !== undefined ? truncateText(patch.content.trim(), 500) || current.content : current.content,
@@ -1573,7 +1600,10 @@ export function updateMemory(
   // Editing the content means a human took over this memory (B04): its hash
   // stops matching the automatic episode, so future rounds with the same
   // facts write their own entry instead of silently no-oping against the
-  // edited row. Pinned/kind edits keep the hash.
+  // edited row. Pinned/kind edits keep the hash. The comparison runs on the
+  // FINAL content: a whitespace-only patch falls back to the old value and
+  // must not null the hash (B04 review, non-blocking 4).
+  const contentChanged = next.content !== current.content
   const keptHash = typeof raw.content_hash === 'string' ? raw.content_hash : null
   db.prepare(`update memories set content = ?, kind = ?, pinned = ?, content_hash = ? where id = ?`).run(
     next.content,

@@ -289,6 +289,23 @@ const mark = (tag) => `⟪${tag}⟫`
         ]) === '最后一条' &&
         mem.memoryQueryFromMessages([]) === '',
     )
+    check(
+      'R-pure verdict 行判定与 gate 对齐（全角冒号/加粗/大小写）',
+      mem.episodeDelivery('完成\nREVIEW：PASS') === '完成' &&
+        mem.episodeDelivery('完成\n**REVIEW: PASS**') === '完成' &&
+        mem.episodeDelivery('完成\nreview: changes') === '完成',
+      mem.episodeDelivery('完成\nREVIEW：PASS'),
+    )
+    check(
+      'R-pure 纯结论消息的交付为空串（不覆盖语义的判据）',
+      mem.episodeDelivery('REVIEW: PASS') === '' && mem.episodeDelivery('**REVIEW：CHANGES**') === '',
+    )
+    const epOther = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['c.ts'], verify: 'pass', delivery: '另一种交付' })
+    const epOtherDelivery = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['a.ts', 'b.ts'], verify: 'pass', delivery: '不同的交付' })
+    check(
+      'R-pure 不同事实 → 不同 hash（路径或交付任一变化）',
+      epA.hash !== epOther.hash && epA.hash !== epOtherDelivery.hash,
+    )
   }
 
   // --- DB-backed retrieval -------------------------------------------------
@@ -353,6 +370,34 @@ const mark = (tag) => `⟪${tag}⟫`
     idsOf(memDb.pickMemoriesForPrompt(null, ROOM, undefined, '量子纠缠')).includes(target.id),
   )
   memDb.updateMemory(target.id, { pinned: false })
+
+  // R9 (B04 review 1): with the FTS index unavailable, long terms must
+  // DEGRADE to LIKE — not vanish. (The flag is test-injected; the real
+  // unavailable path — a broken pre-existing vtable — is locked by sop-check
+  // S10f end-to-end.)
+  memDb.__setMemoryFtsForTests(false)
+  check(
+    'R9 FTS 不可用：长词降级 LIKE 仍命中',
+    memDb.searchMemoryIds('room', ROOM, '续传游标').includes(target.id),
+  )
+  const degradedMixed = memDb.searchMemoryIds('room', ROOM, '游标 lost')
+  check(
+    'R9 FTS 不可用：混排里长词也被承接（短+长都命中）',
+    degradedMixed.includes(target.id) && degradedMixed.includes(lostEntry.id),
+    JSON.stringify(degradedMixed),
+  )
+  memDb.__setMemoryFtsForTests(true)
+
+  // Distinct facts must coexist as two episodes (a fixed-hash regression
+  // would collapse the second into `existed: true`).
+  const ROOM2 = 'room-mem-episodes'
+  const ep1 = memDb.addRoundEpisode({ roomId: ROOM2, changedPaths: ['a.ts'], verify: 'pass', delivery: '第一轮交付内容' })
+  const ep2 = memDb.addRoundEpisode({ roomId: ROOM2, changedPaths: ['b.ts'], verify: 'pass', delivery: '第二轮交付内容' })
+  check(
+    'R-DB 不同事实的两条 episode 共存（hash 区分，不误去重）',
+    !ep1.existed && !ep2.existed && ep1.memory.id !== ep2.memory.id,
+    JSON.stringify([ep1.existed, ep2.existed]),
+  )
 
   try {
     rmSync(memDir, { recursive: true, force: true })

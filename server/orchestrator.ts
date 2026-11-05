@@ -689,8 +689,10 @@ function settleTaskClosed(roomId: string, round: RoundState): void {
  * The episode only fires on a CLEAN, CHANGED, APPROVED round: work happened
  * (hadTurn), it left code evidence (changedPaths), the review verdict is
  * PASS, verify (when configured) passed, and the last real turn ended ok.
- * Everything else — blocked, errored, stopped, hop-limited, pure chat — is
- * not "finished work" and writes nothing.
+ * Everything else — blocked, errored, stopped, pure chat — is not "finished
+ * work" and writes nothing. (A hop-limited round whose last turn still ended
+ * ok with a PASS verdict DOES write: the work happened and was approved —
+ * only the relay chain was cut short.)
  */
 function closeRoundNormally(roomId: string, round: RoundState): void {
   settleTaskClosed(roomId, round)
@@ -1255,10 +1257,15 @@ async function pump(roomId: string): Promise<void> {
     // The round's last real turn settled (B03 review 2): a reply that landed
     // with meta.error counts as an errored outcome — the card must not close
     // as done on a possibly-incomplete run. The same spot records the round's
-    // delivery line for the episode memory (B04).
+    // delivery line for the episode memory (B04) — but a verdict-ONLY reply
+    // ("REVIEW: PASS" alone, the gate convention's minimal reviewer) strips
+    // to an empty string and must NOT wipe the real delivery above it
+    // (B04 review 2), or the next same-facts round would dedupe against a
+    // blanked episode.
     if (round && round.roundId === item.roundId && !item.isRoundSummary) {
       round.lastTurnOutcome = output.error ? 'error' : 'ok'
-      round.lastDelivery = episodeDelivery(content)
+      const delivery = episodeDelivery(content)
+      if (delivery) round.lastDelivery = delivery
     }
     broadcast(roomId, 'turn', {
       roomId,

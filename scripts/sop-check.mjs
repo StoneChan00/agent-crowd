@@ -732,6 +732,66 @@ async function scenarioEndToEnd() {
         hitReply?.content,
       )
     }
+
+    // S10f (B04 review 1, init-failure leg): a pre-existing BROKEN memories_fts
+    // (name conflict → trigger creation succeeds, rebuild fails) must not
+    // take startup, memory writes, or degraded retrieval down. Leftover
+    // triggers would re-route every write into the broken vtable and throw.
+    {
+      const dir2 = mkdtempSync(join(tmpdir(), 'ac-sop-s10f-'))
+      tempDirs.push(dir2)
+      const poison = new DatabaseSync(join(dir2, 'agent-crowd.db'))
+      poison.exec('create table memories_fts (x)')
+      poison.close()
+      const server2 = await bootServer(dir2)
+      const room = await makeRoom(server2.port, 's10f-降级', repo, '')
+      await makeCharacter(server2.port, room.id, '降级丁', ON_USER_ONLY, '普通角色')
+      const added = await req(server2.port, `/api/rooms/${room.id}/memories`, {
+        method: 'POST',
+        body: JSON.stringify({ scope: 'room', content: `降级事实：续传游标修复记录。${'备'.repeat(240)}` }),
+      })
+      for (let i = 0; i < 12; i += 1) {
+        await req(server2.port, `/api/rooms/${room.id}/memories`, {
+          method: 'POST',
+          body: JSON.stringify({ scope: 'room', content: `填充${String(i).padStart(2, '0')}：${'水'.repeat(92)}` }),
+        })
+        await sleep(2)
+      }
+      check(
+        'S10f FTS 初始化失败不挡写记忆（触发器已清理）',
+        added.memory?.content?.includes('续传游标'),
+        JSON.stringify(added).slice(0, 120),
+      )
+      await postMessage(server2.port, room.id, '模拟记忆 续传游标')
+      const okIdle = await waitIdle(server2.port, room.id, 40_000)
+      if (!okIdle) throw new Error('s10f room never went idle')
+      await sleep(300)
+      const degradedReply = (await req(server2.port, `/api/rooms/${room.id}/messages?limit=200`)).messages
+        .filter((message) => message.authorType === 'character')
+        .at(-1)
+      check(
+        'S10f 降级后检索仍命中（LIKE 承接长词，窗口外旧条目被注入）',
+        degradedReply?.content.includes('探针「续传游标」命中'),
+        degradedReply?.content,
+      )
+    }
+
+    // S10g (B04 review 2): a verdict-only reviewer ("REVIEW: PASS" alone)
+    // strips to an empty delivery and must not wipe the assignee's real one —
+    // the episode's 交付 stays the dev's text, not a blank.
+    {
+      const room = await makeSopRoom(port, repo, 's10g-只回结论', {
+        verifyCommand: 'exit 0',
+        reviewerPersona: 'MOCK-只回结论',
+      })
+      await runRoundAndDrain(port, room.id)
+      const episodes = memoriesWhere(room.id)
+      check(
+        'S10g 只回结论的 reviewer 不清空交付（episode 仍是开发者的文本）',
+        episodes.length === 1 && episodes[0].content.includes('已在工作目录写入') && episodes[0].content.includes('交付：'),
+        JSON.stringify(episodes.map((row) => row.content)),
+      )
+    }
   }
 }
 

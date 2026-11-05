@@ -10,14 +10,21 @@ import type { Message } from './types.ts'
  * terms. Everything here is deterministic and unit-testable in isolation.
  */
 
-/** A standalone REVIEW: verdict line is gate protocol, not delivery content. */
-const REVIEW_LINE = /^\s*REVIEW:\s*(?:PASS|CHANGES)\s*$/i
+/**
+ * A standalone REVIEW: verdict line is gate protocol, not delivery content.
+ * Mirrors the gate's own line shape in sop.ts (optional `**` framing,
+ * fullwidth colon, case-insensitive) — keep the two in sync; the R-pure
+ * checks lock the alignment.
+ */
+const REVIEW_LINE = /^\s*\**\s*review\s*[:：]\s*\**\s*(?:pass|changes)\s*\**\s*$/i
 
 /**
  * The round's delivery line: verdict lines stripped, whitespace collapsed,
  * first 160 chars. Applied both when the round records its last delivery and
  * again inside buildRoundEpisode (idempotent — the two layers must agree
- * even if one changes).
+ * even if one changes). A verdict-ONLY message ("REVIEW: PASS" alone)
+ * strips to the empty string — callers use that to decide NOT to overwrite
+ * the round's real delivery.
  */
 export function episodeDelivery(text: string): string {
   return text
