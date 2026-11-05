@@ -23,6 +23,27 @@ export interface HarnessInfo {
 
 export type HarnessMap = Record<string, HarnessInfo>
 
+/** One MCP server entry, read from a harness CLI's own config file. */
+export interface McpServerInfo {
+  name: string
+  type: string
+  enabled: boolean
+  detail: string
+  source?: string
+  timeoutMs?: number
+}
+
+export interface McpHarnessInfo {
+  label: string
+  available: boolean
+  sources: string[]
+  servers: McpServerInfo[]
+  error?: string
+  note?: string
+}
+
+export type McpMap = Record<string, McpHarnessInfo>
+
 export interface Bootstrap {
   rooms: import('../../server/types.ts').Room[]
   characters: import('../../server/types.ts').Character[]

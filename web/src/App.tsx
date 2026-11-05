@@ -10,6 +10,7 @@ import { CharacterEditor, type CharacterDraft } from './components/CharacterEdit
 import { RoomSettings } from './components/RoomSettings'
 import { LibraryView } from './components/LibraryView'
 import { PresetPicker } from './components/PresetPicker'
+import { McpPanel } from './components/McpPanel'
 
 export default function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -23,6 +24,13 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [notice, setNotice] = useState('')
   const [panelOpen, setPanelOpen] = useState(false)
+  // Mobile sidebar drawer (≤820px the sidebar is an overlay instead of a column).
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [showMcps, setShowMcps] = useState(false)
+  // Bumped after a successful send/steer: MessageList force-scrolls to the
+  // bottom once per bump, so "I sent it but I'm reading history" ends with the
+  // view at my message instead of wherever I was scrolled.
+  const [scrollSignal, setScrollSignal] = useState(0)
 
   const [editingCharacter, setEditingCharacter] = useState<Character | null | undefined>(undefined)
   const [editingPreset, setEditingPreset] = useState<CharacterPreset | null | undefined>(undefined)
@@ -219,6 +227,7 @@ export default function App() {
     try {
       const message = await api.sendMessage(roomId, content)
       setMessages((current) => (current.some((item) => item.id === message.id) ? current : [...current, message]))
+      setScrollSignal((signal) => signal + 1)
     } catch (error) {
       setNotice(`发送失败：${error instanceof Error ? error.message : error}`)
     }
@@ -231,6 +240,7 @@ export default function App() {
     try {
       const message = await api.steer(roomId, targetId, content)
       setMessages((current) => (current.some((item) => item.id === message.id) ? current : [...current, message]))
+      setScrollSignal((signal) => signal + 1)
     } catch (error) {
       setNotice(`补充失败：${error instanceof Error ? error.message : error}`)
     }
@@ -253,6 +263,7 @@ export default function App() {
   const selectRoom = (id: string) => {
     setRoomId(id)
     setView('chat')
+    setSidebarOpen(false)
   }
 
   /* ---------------------------------------------------------- characters */
@@ -378,7 +389,10 @@ export default function App() {
   const libraryMode = view === 'library'
 
   return (
-    <div className={`app${panelOpen ? ' panel-open' : ''}${libraryMode ? ' app-library' : ''}`}>
+    <div
+      className={`app${panelOpen ? ' panel-open' : ''}${libraryMode ? ' app-library' : ''}${sidebarOpen ? ' sidebar-open' : ''}`}
+    >
+      {sidebarOpen && <div className="drawer-backdrop" onClick={() => setSidebarOpen(false)} />}
       <Sidebar
         rooms={rooms}
         characters={allCharacters}
@@ -389,7 +403,14 @@ export default function App() {
         presetCount={presets.length}
         onSelect={selectRoom}
         onNewRoom={() => setRoomForm('create')}
-        onViewChange={setView}
+        onViewChange={(next) => {
+          setView(next)
+          setSidebarOpen(false)
+        }}
+        onShowMcps={() => {
+          setShowMcps(true)
+          setSidebarOpen(false)
+        }}
       />
 
       <main className={`main${libraryMode ? ' main-library' : ''}`}>
@@ -406,6 +427,7 @@ export default function App() {
                 .then(refresh)
                 .catch((error) => setNotice(`删除失败：${error instanceof Error ? error.message : error}`))
             }}
+            onToggleSidebar={() => setSidebarOpen((open) => !open)}
           />
         ) : (
           <>
@@ -419,14 +441,17 @@ export default function App() {
               onClear={clear}
               onEditRoom={() => setRoomForm('edit')}
               onTogglePanel={() => setPanelOpen((open) => !open)}
+              onToggleSidebar={() => setSidebarOpen((open) => !open)}
             />
 
             <MessageList
+              key={roomId ?? 'no-room'}
               messages={messages}
               characters={characters}
               live={live}
               activeCharacterId={activeCharacterId}
               roomId={roomId}
+              forceScrollKey={scrollSignal}
               onRemember={rememberMessage}
             />
 
@@ -461,6 +486,8 @@ export default function App() {
       )}
 
       {notice && <div className="toast">{notice}</div>}
+
+      {showMcps && <McpPanel onClose={() => setShowMcps(false)} />}
 
       {editingCharacter !== undefined && room && (
         <CharacterEditor

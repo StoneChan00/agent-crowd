@@ -12,6 +12,8 @@ interface ChatHeaderProps {
   onClear: () => void
   onEditRoom: () => void
   onTogglePanel: () => void
+  /** Mobile only: open the sidebar drawer (room list / library nav). */
+  onToggleSidebar: () => void
 }
 
 export function ChatHeader({
@@ -24,6 +26,7 @@ export function ChatHeader({
   onClear,
   onEditRoom,
   onTogglePanel,
+  onToggleSidebar,
 }: ChatHeaderProps) {
   const active = characters.find((character) => character.id === activeCharacterId)
   const enabled = characters.filter((character) => character.enabled)
@@ -44,7 +47,9 @@ export function ChatHeader({
           )}
         </div>
         <p className="chat-subtitle">
-          {room?.topic || '还没有设置主题'}
+          <span className="topic" title={room?.topic || undefined}>
+            {room?.topic || '还没有设置主题'}
+          </span>
           {room && (
             <>
               <span className="sep">·</span>
@@ -64,6 +69,14 @@ export function ChatHeader({
       </div>
 
       <div className="header-actions">
+        <button
+          className="btn btn-icon btn-ghost sidebar-toggle"
+          onClick={onToggleSidebar}
+          title="房间与导航"
+          aria-label="打开侧栏"
+        >
+          ☰
+        </button>
         {busy && (
           <button className="btn btn-danger-ghost" onClick={onStop}>
             停止
@@ -76,7 +89,7 @@ export function ChatHeader({
           房间设置
         </button>
         <button className="btn btn-icon btn-ghost panel-toggle" onClick={onTogglePanel} title="角色面板">
-          ☰
+          ◫
         </button>
       </div>
     </header>

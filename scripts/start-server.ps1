@@ -32,7 +32,7 @@ foreach ($dir in @($NodeDir, "$env:APPDATA\npm")) {
   if ($dir -and (Test-Path $dir)) { $env:Path = "$dir;$env:Path" }
 }
 $env:AC_PORT = "$Port"
-if (-not $env:AC_TURN_TIMEOUT_MS) { $env:AC_TURN_TIMEOUT_MS = '30m' }
+if (-not $env:AC_TURN_TIMEOUT_MS) { $env:AC_TURN_TIMEOUT_MS = '60m' }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $dataDir = Join-Path $root 'data'

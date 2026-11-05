@@ -123,7 +123,7 @@ for (const [name, value, expected] of idleCases) {
 
 // ---------------------------------------------------------------- retry gate
 // The orchestrator auto-retries a zero-text failure only when it died fast;
-// a timeout (idle ≥ 10 min, hard ≥ 30 min) must NOT be retried — rerunning
+// a timeout (idle ≥ 10 min, hard ≥ 60 min) must NOT be retried — rerunning
 // a hung upstream would just double the wait for the same death.
 const transientCases = [
   ['retry gate: fast zero-text error is transient', { error: 'boom', text: '', durationMs: 11_000 }, true],

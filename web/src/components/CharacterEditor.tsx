@@ -77,6 +77,7 @@ function toDraft(character: Character | CharacterPreset | null): CharacterDraft 
       onCharacterNames: character?.triggers.onCharacterNames ?? [],
       keyword: character?.triggers.keyword ?? '',
       mention: character?.triggers.mention ?? true,
+      onRoundEnd: character?.triggers.onRoundEnd ?? false,
     },
   }
 }
@@ -607,7 +608,18 @@ export function CharacterEditor({
             />
             <span>被 @ 时</span>
           </label>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={draft.triggers.onRoundEnd}
+              onChange={(event) => setTrigger('onRoundEnd', event.target.checked)}
+            />
+            <span>每轮结束后总结</span>
+          </label>
         </div>
+        <p className="field-hint">
+          「每轮结束后总结」：一轮对话结束时（各方发言完毕，或接力达到上限被自动停止），这个角色会自动发一条本轮总结（做了什么、遗留了什么）。手动停止的轮次不总结。
+        </p>
 
         <div className="field">
           <label>指定角色发言后接过话（按名字匹配）</label>

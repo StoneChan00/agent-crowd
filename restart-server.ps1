@@ -2,7 +2,7 @@
 #
 # 什么时候用：改了 server 端代码或环境变量之后，让新代码生效。
 # 做什么：    停掉正在监听 8787 的旧 server（连同子进程树），然后以
-#             AC_TURN_TIMEOUT_MS=30m 启动新 server（终端里已设置过则沿用）。
+#             AC_TURN_TIMEOUT_MS=60m 启动新 server（终端里已设置过则沿用）。
 # 用法：      在项目根目录运行  .\restart-server.ps1    （可加 -Port 8790 指定端口）
 # 注意：      本脚本是交互式用途（日志留在当前终端）。headless / 计划任务场景用
 #             scripts\restart-and-verify.ps1（独立时间戳日志 + 六阶段自动验证）。
@@ -33,7 +33,7 @@ if ($still) {
 }
 
 # 2) 启动新 server。
-if (-not $env:AC_TURN_TIMEOUT_MS) { $env:AC_TURN_TIMEOUT_MS = '30m' }
+if (-not $env:AC_TURN_TIMEOUT_MS) { $env:AC_TURN_TIMEOUT_MS = '60m' }
 $env:AC_PORT = "$Port"
 Write-Host "AC_TURN_TIMEOUT_MS=$env:AC_TURN_TIMEOUT_MS  AC_PORT=$env:AC_PORT"
 Write-Host "启动中：http://127.0.0.1:$Port （Ctrl+C 停止，日志就在这个终端；启动后浏览器 Ctrl+F5 刷新页面即可）"

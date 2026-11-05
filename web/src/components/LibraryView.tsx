@@ -8,9 +8,11 @@ interface LibraryViewProps {
   onCreate: () => void
   onEdit: (preset: CharacterPreset) => void
   onDelete: (preset: CharacterPreset) => void
+  /** Mobile only: open the sidebar drawer (room list / chat nav). */
+  onToggleSidebar: () => void
 }
 
-export function LibraryView({ presets, harnesses, onCreate, onEdit, onDelete }: LibraryViewProps) {
+export function LibraryView({ presets, harnesses, onCreate, onEdit, onDelete, onToggleSidebar }: LibraryViewProps) {
   return (
     <div className="library">
       <header className="library-head">
@@ -18,9 +20,19 @@ export function LibraryView({ presets, harnesses, onCreate, onEdit, onDelete }: 
           <h2>角色库</h2>
           <p>全局维护角色模板：harness、模型、人设、默认触发规则。房间里的「从角色库添加」可以直接勾选多个加入。</p>
         </div>
-        <button className="btn btn-primary" onClick={onCreate}>
-          + 新建角色
-        </button>
+        <div className="library-head-actions">
+          <button
+            className="btn btn-icon btn-ghost sidebar-toggle"
+            onClick={onToggleSidebar}
+            title="房间与导航"
+            aria-label="打开侧栏"
+          >
+            ☰
+          </button>
+          <button className="btn btn-primary" onClick={onCreate}>
+            + 新建角色
+          </button>
+        </div>
       </header>
 
       <div className="library-grid">

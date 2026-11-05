@@ -86,6 +86,14 @@ select {
   display: grid;
   grid-template-columns: 258px minmax(0, 1fr) 344px;
   height: 100vh;
+  /* Mobile browsers: the URL bar eats into 100vh; dvh tracks the real visual
+     viewport so the composer never falls off screen. Older browsers keep the
+     100vh line above. */
+  height: 100dvh;
+  /* iOS Safari's soft keyboard shrinks neither vh nor dvh (the
+     interactive-widget meta only resizes in Chromium), so main.tsx mirrors
+     visualViewport.height into --app-h; browsers without that hook keep dvh. */
+  height: var(--app-h, 100dvh);
   overflow: hidden;
 }
 
@@ -367,6 +375,12 @@ select {
   gap: 6px;
   min-width: 0;
 }
+.chat-subtitle .topic {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .chat-subtitle .path {
   font-family: var(--mono);
   font-size: 11px;
@@ -481,6 +495,10 @@ select {
 .panel-toggle {
   display: none;
 }
+/* Mobile-only sidebar drawer toggle (≤820px). Same pattern as panel-toggle. */
+.sidebar-toggle {
+  display: none;
+}
 
 /* -------------------------------------------------------- chat scroll */
 
@@ -548,6 +566,26 @@ select {
   white-space: pre-wrap;
   word-break: break-word;
   color: #f7f5ff;
+}
+
+/* Per-role character bubbles: tinted with the character's own colour (--c is
+   set inline from the message/character colour). The translucent fallback
+   covers browsers without color-mix; the @supports layer upgrades it. */
+.bubble-character {
+  width: fit-content;
+  max-width: 100%;
+  border-radius: 16px 16px 16px 4px;
+  padding: 10px 14px;
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.14);
+}
+@supports (background: color-mix(in srgb, red 10%, transparent)) {
+  .bubble-character {
+    background: color-mix(in srgb, var(--c, #8b76f6) 8%, transparent);
+    border-color: color-mix(in srgb, var(--c, #8b76f6) 26%, transparent);
+  }
 }
 /* Steer note: same bubble shape, teal accent so a mid-turn supplement reads
    differently from a normal send. */
@@ -639,6 +677,40 @@ select {
   color: #7fe3c4;
   border-color: rgba(16, 163, 127, 0.35);
   background: rgba(16, 163, 127, 0.09);
+}
+
+/* 「接力 → @X」: who this reply actually queued next (message meta.relayTo,
+   written by the orchestrator's own shouldWake verdict — not re-derived here). */
+.relay-chip {
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(139, 118, 246, 0.38);
+  background: rgba(139, 118, 246, 0.12);
+  color: #c3b3ff;
+  white-space: nowrap;
+}
+
+/* 「@点名」inside a reply body: tinted in the target's own colour so a wall of
+   text can't hide who was called. A bare @name wakes that character; the
+   quoted form `@name` keeps the code style (that is the "mention without
+   waking" form, see server/mentions.ts). */
+.mention-at {
+  color: var(--c, #a89bff);
+  background: rgba(168, 155, 255, 0.14);
+  border: 1px solid rgba(168, 155, 255, 0.3);
+  border-radius: 6px;
+  padding: 0 4px;
+  font-weight: 600;
+}
+@supports (background: color-mix(in srgb, var(--c) 14%, transparent)) {
+  .mention-at {
+    background: color-mix(in srgb, var(--c, #a89bff) 15%, transparent);
+    border-color: color-mix(in srgb, var(--c, #a89bff) 36%, transparent);
+  }
+}
+.mention-at-all {
+  --c: #8a8f98;
 }
 
 .msg-system {
@@ -825,8 +897,6 @@ select {
   color: #d8dce5;
   font-size: 13.5px;
   line-height: 1.72;
-  border-left: 2px solid rgba(139, 118, 246, 0.35);
-  padding-left: 12px;
 }
 .live-tools {
   display: flex;
@@ -1839,6 +1909,136 @@ select {
   }
 }
 
+/* ------------------------------------------------------------- mcp panel */
+
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mcp-harness {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.mcp-harness-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mcp-count {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.mcp-sources {
+  margin: 6px 0 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  word-break: break-all;
+  line-height: 1.6;
+}
+.mcp-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--text-faint);
+}
+.mcp-servers {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.mcp-server {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+  flex-wrap: wrap;
+}
+.mcp-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #4b5563;
+  flex: none;
+}
+.mcp-dot.is-on {
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.4);
+}
+.mcp-name {
+  font-weight: 600;
+}
+.mcp-type {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.mcp-type.is-local {
+  color: #8ec5ff;
+  border-color: rgba(79, 156, 249, 0.35);
+  background: rgba(79, 156, 249, 0.08);
+}
+.mcp-type.is-remote {
+  color: #8ff0dd;
+  border-color: rgba(45, 212, 191, 0.32);
+  background: rgba(45, 212, 191, 0.07);
+}
+.mcp-off {
+  font-size: 10px;
+  color: var(--amber);
+}
+.mcp-detail {
+  flex: 1 1 100%;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.mcp-timeout {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+.mcp-loading {
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+.mcp-foot-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.sidebar-mcp-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  transition: 0.15s ease;
+  text-align: left;
+}
+.sidebar-mcp-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
 /* --------------------------------------------------------- responsive */
 
 @media (max-width: 1220px) {
@@ -1855,6 +2055,8 @@ select {
     transform: translateX(102%);
     transition: transform 0.22s ease;
     box-shadow: -20px 0 60px rgba(0, 0, 0, 0.45);
+    /* Drawer bottom sits on the home-indicator bar on notch phones. */
+    padding-bottom: env(safe-area-inset-bottom);
   }
   .app.panel-open .character-panel {
     transform: none;
@@ -1868,23 +2070,99 @@ select {
   .app {
     grid-template-columns: minmax(0, 1fr);
   }
+  /* Sidebar becomes an overlay drawer: on a phone the room list and the
+     聊天/角色库 nav must stay reachable. Backdrop click closes it; picking
+     a room or switching view closes it in App. */
   .sidebar {
-    display: none;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(300px, 84vw);
+    z-index: 60;
+    transform: translateX(-103%);
+    transition: transform 0.22s ease;
+    box-shadow: 20px 0 60px rgba(0, 0, 0, 0.5);
+    /* Drawer bottom sits on the home-indicator bar on notch phones. */
+    padding-bottom: calc(14px + env(safe-area-inset-bottom));
+  }
+  .app.sidebar-open .sidebar {
+    transform: none;
+  }
+  .drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(4, 5, 8, 0.62);
+    backdrop-filter: blur(3px);
+    animation: fade 0.16s ease both;
+  }
+  .sidebar-toggle {
+    display: grid;
   }
   .chat-header {
-    padding: 12px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    min-height: 0;
+    row-gap: 6px;
+  }
+  .member-stack {
+    display: none;
   }
   .chat-scroll {
-    padding: 18px 14px 8px;
+    padding: 18px 12px 8px;
   }
   .composer-wrap {
-    padding: 8px 14px 12px;
+    /* viewport-fit=cover: keep the input clear of the iPhone home bar. */
+    padding: 8px 12px calc(12px + env(safe-area-inset-bottom));
+  }
+  /* iOS Safari zooms the whole page when an input < 16px gets focused. */
+  .composer textarea {
+    font-size: 16px;
   }
   .bubble-user {
     max-width: 90%;
   }
-  .chat-subtitle .path {
-    max-width: 180px;
+  /* Phones: the topic/workingDir line eats vertical space without being
+     actionable — the full topic stays visible in room settings. */
+  .chat-subtitle {
+    display: none;
+  }
+  .modal-backdrop {
+    padding: 10px;
+  }
+  .modal {
+    max-height: 92dvh;
+  }
+  .library {
+    padding: 18px 14px 34px;
+  }
+  .library-head {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .library-grid {
+    grid-template-columns: 1fr;
+  }
+  .picker-list {
+    max-height: 46dvh;
+  }
+}
+
+@media (max-width: 700px) {
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+  .identity-row {
+    flex-wrap: wrap;
+  }
+  .msg {
+    gap: 9px;
+  }
+  .header-actions .btn {
+    padding: 5px 8px;
+    font-size: 12px;
   }
 }
 

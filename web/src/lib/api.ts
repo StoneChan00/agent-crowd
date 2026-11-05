@@ -1,4 +1,4 @@
-import type { Bootstrap, Character, CharacterPreset, HarnessMap, Memory, Message, Room } from '../types'
+import type { Bootstrap, Character, CharacterPreset, HarnessMap, McpMap, Memory, Message, Room } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -90,6 +90,9 @@ export const api = {
     }),
 
   models: () => request<{ models: Record<string, string[]>; harnesses: HarnessMap }>('/api/models'),
+
+  /** Which MCP servers each harness CLI loads (read from its own config). */
+  mcps: () => request<{ mcps: McpMap }>('/api/mcps'),
 
   /* Long-term memory (docs/memory-plan.md): room-scope = shared, identity-scope = per character. */
   memories: (roomId: string) =>

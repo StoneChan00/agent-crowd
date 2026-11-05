@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { markdownRemarkPlugins } from '../lib/markdown'
+import { MENTION_HREF_PREFIX, markdownRemarkPlugins, mentionTokenFromHref } from '../lib/markdown'
+import { resolveMention } from '../lib/mentions'
 import type { Character, Message } from '../types'
 import { Avatar } from './Avatar'
 import { HARNESS_META, clock, formatDuration, modelShort, tokenSummary } from '../lib/format'
@@ -22,11 +23,28 @@ interface MessageListProps {
   live: LiveTurn | null
   activeCharacterId: string | null
   roomId: string | null
+  /**
+   * Force-scroll signal: App bumps the number after the user sends/steers, so
+   * the view jumps to the newest message even if the user was scrolled up
+   * reading history (the pin alone wouldn't do that).
+   */
+  forceScrollKey?: number
   /** "记住" on a message: files it into long-term memory (private for a character reply, shared for a user note). */
   onRemember?: (message: Message) => void
 }
 
-export function MessageList({ messages, characters, live, activeCharacterId, roomId, onRemember }: MessageListProps) {
+/** Inline style carrying the per-role bubble colour as a CSS custom property. */
+const bubbleStyle = (color: string): CSSProperties => ({ '--c': color }) as CSSProperties
+
+export function MessageList({
+  messages,
+  characters,
+  live,
+  activeCharacterId,
+  roomId,
+  forceScrollKey,
+  onRemember,
+}: MessageListProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const pinnedRef = useRef(true)
   const [showThinking, setShowThinking] = useState<Record<string, boolean>>({})
@@ -38,6 +56,14 @@ export function MessageList({ messages, characters, live, activeCharacterId, roo
       node.scrollTop = node.scrollHeight
     }
   }, [messages, live?.text, live?.thinking.length, live?.tools.length, roomId])
+
+  // User just sent something: re-pin and jump to the bottom unconditionally.
+  useEffect(() => {
+    if (!forceScrollKey) return
+    pinnedRef.current = true
+    const node = scrollRef.current
+    if (node) node.scrollTop = node.scrollHeight
+  }, [forceScrollKey])
 
   const onScroll = () => {
     const node = scrollRef.current
@@ -62,6 +88,7 @@ export function MessageList({ messages, characters, live, activeCharacterId, roo
           <MessageRow
             key={message.id}
             message={message}
+            characters={characters}
             character={message.characterId ? characters.find((item) => item.id === message.characterId) : undefined}
             showThinking={Boolean(showThinking[message.id])}
             onToggleThinking={() =>
@@ -117,7 +144,9 @@ export function MessageList({ messages, characters, live, activeCharacterId, roo
               )}
 
               {live.text ? (
-                <div className="live-text">{live.text}</div>
+                <div className="bubble-character live-text" style={bubbleStyle(liveCharacter?.color ?? '#8b76f6')}>
+                  {live.text}
+                </div>
               ) : (
                 <div className="typing">
                   <span />
@@ -149,12 +178,14 @@ export function MessageList({ messages, characters, live, activeCharacterId, roo
 
 function MessageRow({
   message,
+  characters,
   character,
   showThinking,
   onToggleThinking,
   onRemember,
 }: {
   message: Message
+  characters: Character[]
   character?: Character
   showThinking: boolean
   onToggleThinking: () => void
@@ -212,18 +243,35 @@ function MessageRow({
             <span className={`harness-chip harness-${harness}`}>{harnessMeta?.label ?? harness}</span>
           )}
           {meta?.model && <span className="msg-model">{modelShort(meta.model)}</span>}
+          {meta?.relayTo && meta.relayTo.length > 0 && (
+            <span
+              className="relay-chip"
+              title="这条回复的接力对象：它们已被排队，会接着发言（服务端 shouldWake 的实际判定）"
+            >
+              接力 → {meta.relayTo.map((name) => `@${name}`).join('、')}
+            </span>
+          )}
           <span className="msg-time">{clock(message.createdAt)}</span>
         </div>
 
-        <div className="markdown">
-          <ReactMarkdown
-            remarkPlugins={markdownRemarkPlugins}
-            components={{
-              a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
-            }}
-          >
-            {message.content}
-          </ReactMarkdown>
+        <div className="bubble-character" style={bubbleStyle(color)}>
+          <div className="markdown">
+            <ReactMarkdown
+              remarkPlugins={markdownRemarkPlugins}
+              components={{
+                a: ({ node: _node, href, children, ...props }) =>
+                  href?.startsWith(MENTION_HREF_PREFIX) ? (
+                    <MentionAt token={mentionTokenFromHref(href)} characters={characters} />
+                  ) : (
+                    <a {...props} href={href} target="_blank" rel="noreferrer">
+                      {children}
+                    </a>
+                  ),
+              }}
+            >
+              {message.content}
+            </ReactMarkdown>
+          </div>
         </div>
 
         {meta?.error && (
@@ -276,5 +324,32 @@ function MessageRow({
         )}
       </div>
     </div>
+  )
+}
+
+/**
+ * One `@name` inside a reply body, so a wall of text can't hide who was
+ * called. A room member's call-name becomes a chip tinted in its own colour;
+ * anything else (`@all`, a name that isn't in this room) stays plain text —
+ * the highlight must never promise a wake-up the router won't do.
+ */
+function MentionAt({ token, characters }: { token: string; characters: Character[] }) {
+  const target = resolveMention(token, characters)
+  if (target.kind === 'plain') return <>@{token}</>
+  if (target.kind === 'all') {
+    return (
+      <span className="mention-at mention-at-all" title="@all：唤醒本房间全部启用角色">
+        @{token}
+      </span>
+    )
+  }
+  return (
+    <span
+      className="mention-at"
+      style={{ '--c': target.color } as CSSProperties}
+      title={`@${target.name}：会唤醒它接着发言（只想提到、不想唤醒时写成 \`@${target.name}\`）`}
+    >
+      @{token}
+    </span>
   )
 }

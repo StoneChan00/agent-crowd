@@ -70,6 +70,7 @@ export function triggerSummary(character: Character | CharacterPreset, members: 
 
   if (triggers.keyword.trim()) out.push(`含「${triggers.keyword.trim()}」`)
   if (triggers.mention) out.push('@我')
+  if (triggers.onRoundEnd) out.push('轮末总结')
   return out.length ? out : ['不自动触发']
 }
 

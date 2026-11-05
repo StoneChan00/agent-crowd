@@ -12,6 +12,8 @@ interface SidebarProps {
   onSelect: (roomId: string) => void
   onNewRoom: () => void
   onViewChange: (view: 'chat' | 'library') => void
+  /** Open the "loaded MCP servers" panel (reads every CLI's config). */
+  onShowMcps: () => void
 }
 
 export function Sidebar({
@@ -25,6 +27,7 @@ export function Sidebar({
   onSelect,
   onNewRoom,
   onViewChange,
+  onShowMcps,
 }: SidebarProps) {
   const harnessKinds = ['cannbot', 'opencode', 'dsh', 'hermes', 'claude', 'codex'] as const
 
@@ -83,6 +86,10 @@ export function Sidebar({
       </div>
 
       <div className="sidebar-footer">
+        <button className="sidebar-mcp-btn" onClick={onShowMcps} title="查看各角色 CLI 当前加载的 MCP 服务器">
+          <span className="nav-glyph">⌁</span>
+          MCP 服务器
+        </button>
         <div className="status-row">
           <span className={`dot${connected ? ' dot-ok' : ' dot-off'}`} />
           {connected ? '实时连接正常' : '连接断开，正在重连'}

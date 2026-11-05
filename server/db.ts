@@ -19,6 +19,7 @@ import { DEFAULT_TRIGGERS,
   type TurnStatus,
 } from './types.ts'
 import { pickDefined } from './util.ts'
+import { CALL_NAME_SOURCE } from './mentions.ts'
 
 const DB_FILE = join(DATA_DIR, 'agent-crowd.db')
 
@@ -239,6 +240,7 @@ function parseTriggers(raw: unknown): Triggers {
       onCharacterNames: Array.isArray(parsed.onCharacterNames) ? parsed.onCharacterNames.map(String) : [],
       keyword: typeof parsed.keyword === 'string' ? parsed.keyword : '',
       mention: parsed.mention ?? DEFAULT_TRIGGERS.mention,
+      onRoundEnd: parsed.onRoundEnd ?? false,
     }
   } catch {
     return { ...DEFAULT_TRIGGERS }
@@ -264,6 +266,12 @@ const RESERVED_ALIASES = new Set(['all', '所有人'])
  * cap at 32 chars / 8 entries; drop empties, duplicates, the name itself and
  * reserved words. Case is preserved — conflicts are checked
  * case-insensitively in assertCallNamesFree, matching the /i matcher.
+ *
+ * A call-name must also fit CALL_NAME_SOURCE (one chip token): an alias with
+ * a space or a dot is matched literally by the router, but the web highlight
+ * tokenizes at the first outside character — the character would be woken
+ * with no chip to show for it. Dropped here like the other invalid entries
+ * (reserved words, duplicates), not an error: the editor shows what stuck.
  */
 function sanitizeAliases(input: unknown, name: string): string[] {
   if (!Array.isArray(input)) return []
@@ -273,11 +281,35 @@ function sanitizeAliases(input: unknown, name: string): string[] {
     const item = String(entry).trim().replace(/^@+/, '').replace(/\s+/g, ' ').trim().slice(0, 32)
     if (!item || item === name || seen.has(item)) continue
     if (RESERVED_ALIASES.has(item.toLowerCase())) continue
+    if (!CALL_NAME_SOURCE.test(item)) continue
     seen.add(item)
     out.push(item)
     if (out.length >= 8) break
   }
   return out
+}
+
+/** Raised when a character is about to be stored under a call-name the chip grammar can't highlight. */
+export class InvalidCallNameError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'InvalidCallNameError'
+  }
+}
+
+/**
+ * A character name is the primary call-name, so it has to be one chip token
+ * too (same CALL_NAME_SOURCE as aliases): `@名字` with a space in it wakes
+ * the character on the server but can never light up in the bubble. The API
+ * layer turns this into a 400 the editor can show inline, exactly like
+ * CallNameConflictError.
+ */
+function assertCallNameShape(name: string): void {
+  if (!CALL_NAME_SOURCE.test(name)) {
+    throw new InvalidCallNameError(
+      `名字「${name}」不能用作 @点名：只能包含中英文、数字、下划线和连字符（不能带空格或符号），否则气泡里无法高亮`,
+    )
+  }
 }
 
 /** Raised when a name/alias would shadow another character's call-name in the same room. */
@@ -367,6 +399,7 @@ export interface CharacterInput {
 
 export function createCharacter(input: CharacterInput): Character {
   const name = input.name.trim() || '新角色'
+  assertCallNameShape(name)
   const character: Character = {
     id: randomUUID(),
     roomId: input.roomId,
@@ -440,10 +473,14 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
   }
   // Only police call-names when they actually change: rooms with legacy
   // duplicate names (created before the check existed) stay editable for
-  // unrelated fields instead of failing every PATCH.
+  // unrelated fields instead of failing every PATCH. Same for the shape
+  // check — a legacy spaced name only blocks renames, not avatar edits.
   const callNamesChanged =
     next.name !== current.name || JSON.stringify(next.aliases) !== JSON.stringify(current.aliases)
-  if (callNamesChanged) assertCallNamesFree(current.roomId, id, next.name, next.aliases)
+  if (callNamesChanged) {
+    assertCallNameShape(next.name)
+    assertCallNamesFree(current.roomId, id, next.name, next.aliases)
+  }
   db.prepare(
     `update characters set name = ?, aliases = ?, avatar = ?, color = ?, harness = ?, model = ?, persona = ?,
        cwd = ?, triggers = ?, command_template = ?, auto_approve = ?, enabled = ? where id = ?`,
@@ -1071,8 +1108,9 @@ export function addPresetsToRoom(
     try {
       character = createCharacterFromPreset(preset, roomId)
     } catch (error) {
-      // One conflicting template shouldn't sink the whole batch import.
-      if (error instanceof CallNameConflictError) {
+      // One conflicting (or unhighlightable) template shouldn't sink the
+      // whole batch import.
+      if (error instanceof CallNameConflictError || error instanceof InvalidCallNameError) {
         skipped.push(`${preset.name}（${error.message}）`)
         continue
       }

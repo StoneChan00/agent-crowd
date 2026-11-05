@@ -23,6 +23,8 @@ import {
   type LaunchMatch,
 } from './harnesses/process.ts'
 import * as orchestrator from './orchestrator.ts'
+import { listMcps } from './mcps.ts'
+import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, WEB_DIST } from './paths.ts'
 import type { Character, HarnessKind, Room } from './types.ts'
 import { HARNESS_LABELS } from './types.ts'
@@ -256,6 +258,12 @@ app.get('/api/models', asyncRoute(async (_req, res) => {
   res.json({ models: await listModels(), harnesses: harnessInfo() })
 }))
 
+/* MCP visibility: which MCP servers each harness CLI loads from its own
+   config (opencode.jsonc / dsh profiles / claude.json / codex toml). */
+app.get('/api/mcps', (_req, res) => {
+  res.json({ mcps: listMcps() })
+})
+
 /* ------------------------------------------------------------------- rooms */
 
 /** Shared room-input normalization so create and PATCH behave identically. */
@@ -484,6 +492,66 @@ app.delete('/api/memories/:id', (req, res) => {
   res.json({ ok: true })
 })
 
+/* ---------------------------------------------------------------- restart */
+
+// System-message channel for tooling: the restart script's start notice and
+// RESULT line land here (authorType system, never wakes the orchestrator).
+// Human messages stay on POST /api/rooms/:id/messages.
+app.post('/api/rooms/:id/system', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : ''
+  if (!content) return fail(res, 400, '消息不能为空')
+  const message = db.addMessage({
+    roomId: room.id,
+    authorType: 'system',
+    authorName: '系统',
+    content: truncate(content, 20_000),
+    meta: { generated: true },
+  })
+  res.status(201).json(message)
+  broadcast(room.id, 'message', { roomId: room.id, message })
+})
+
+// Queue a restart for the next all-idle moment (server/restart.ts): an
+// external script's drain self-locks on this group's review loop, so the
+// server itself fires the restart script from pump()'s finally and exits.
+app.post('/api/restart', (req, res) => {
+  const body = req.body ?? {}
+  const result = restart.requestRestart(
+    {
+      excludeRoom: typeof body.excludeRoom === 'string' ? body.excludeRoom : undefined,
+      notifyRoom: typeof body.notifyRoom === 'string' ? body.notifyRoom : undefined,
+      drainSeconds: Number.isFinite(Number(body.drainSeconds)) ? Number(body.drainSeconds) : undefined,
+    },
+    // force lifts ONLY the 60min soft window (script ABORTed - the server
+    // cannot see that, WMI is fire-and-forget); pending/launching still 409.
+    body.force === true,
+  )
+  if (!result.ok) {
+    // Truthful refusal reasons (P1, review round 5): the in-flight window is
+    // the one an operator CAN act on after a script ABORT - say exactly what
+    // unlocks it instead of a blanket "already pending" lie.
+    if (result.reason === 'invalid-room-name') {
+      return res.status(400).json({ ok: false, error: 'excludeRoom/notifyRoom 不得包含引号' })
+    }
+    if (result.reason === 'launching') {
+      return res.status(409).json({ ok: false, error: '重启脚本正在启动（launcher 在途），请稍候重试' })
+    }
+    if (result.reason === 'in-flight-window') {
+      return res.status(409).json({
+        ok: false,
+        error: '距上次重启脚本启动不足 60 分钟（软窗口）；若脚本已中止，可带 force:true 重新排队',
+      })
+    }
+    return res.status(409).json({ ok: false, error: '已有待执行的重启请求' })
+  }
+  res.json({ ok: true, scheduled: 'next-idle' })
+  // Response is written; if every room is already idle the restart fires
+  // right here, otherwise the last turn's pump() finally picks it up.
+  restart.maybeRestartNow()
+})
+
 /* ------------------------------------------------------------------- sse */
 
 app.get('/api/rooms/:id/events', (req, res) => {
@@ -592,9 +660,12 @@ app.post('/api/rooms/:id/characters', (req, res) => {
     })
     res.status(201).json(character)
   } catch (error) {
-    // Ambiguous call-name (name/alias shadows a sibling) is a user-input
-    // problem, not a server error — surface it as a 400 the editor shows.
-    if (error instanceof db.CallNameConflictError) return fail(res, 400, error.message)
+    // Ambiguous call-name (name/alias shadows a sibling) or a name the chip
+    // grammar can't highlight is a user-input problem, not a server error —
+    // surface it as a 400 the editor shows.
+    if (error instanceof db.CallNameConflictError || error instanceof db.InvalidCallNameError) {
+      return fail(res, 400, error.message)
+    }
     throw error
   }
 })
@@ -627,7 +698,9 @@ app.post('/api/characters/:id/sync-preset', (req, res) => {
   try {
     res.json(db.syncCharacterFromPreset(character, preset))
   } catch (error) {
-    if (error instanceof db.CallNameConflictError) return fail(res, 400, error.message)
+    if (error instanceof db.CallNameConflictError || error instanceof db.InvalidCallNameError) {
+      return fail(res, 400, error.message)
+    }
     throw error
   }
 })
@@ -653,7 +726,9 @@ app.patch('/api/characters/:id', (req, res) => {
     })
     res.json(character)
   } catch (error) {
-    if (error instanceof db.CallNameConflictError) return fail(res, 400, error.message)
+    if (error instanceof db.CallNameConflictError || error instanceof db.InvalidCallNameError) {
+      return fail(res, 400, error.message)
+    }
     throw error
   }
 })

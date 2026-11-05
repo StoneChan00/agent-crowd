@@ -11,7 +11,7 @@
 | 关注点 | 现状 | 缺口 |
 | --- | --- | --- |
 | 角色身份 | `characters` 表按房间隔离（`room_id` 外键）；`character_presets` 是全局模板 | 模板只是「出厂设置」：两个房间里的 cannbot 是两个互不相干的实例 |
-| 上下文 | `buildTurnPrompt`（`server/prompt.ts`）只注入当前房间最近 80 条消息（约 9k 字符预算） | 跨房间、跨会话完全失忆；清空房间 = 彻底遗忘 |
+| 上下文 | `buildTurnPrompt`（`server/prompt.ts`）只注入当前房间最近 80 条消息（约 18k 字符预算） | 跨房间、跨会话完全失忆；清空房间 = 彻底遗忘 |
 | 会话 | 每个 turn 是一次 CLI 一击式运行，`sessionId` 仅回填展示 | 没有「同一角色」的连续经历概念 |
 | 存储 | `node:sqlite` 单库（WAL），`meta` 表已有 KV 用法 | 无记忆相关表 |
 

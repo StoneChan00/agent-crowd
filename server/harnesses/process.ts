@@ -5,10 +5,10 @@ import { stripAnsi } from '../util.ts'
 /**
  * Default hard cap for one agent turn; override with `AC_TURN_TIMEOUT_MS`.
  * The idle watchdog below now catches silent hangs, so the wall-clock cap is
- * the backstop for genuinely endless turns — 30 minutes, up from 15, because
- * a turn that was still producing output at 15 minutes got killed mid-reply.
+ * the backstop for genuinely endless turns — 60 minutes, up from 30, because
+ * a turn that was still producing output at 30 minutes got killed mid-reply.
  */
-export const DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000
+export const DEFAULT_TURN_TIMEOUT_MS = 60 * 60_000
 
 /**
  * Smallest accepted `AC_TURN_TIMEOUT_MS`: a real agent turn never finishes in
@@ -89,7 +89,7 @@ export function describeTimeout(result: { timedOut: boolean; timeoutKind?: 'idle
 /**
  * A zero-text failure is auto-retried only when it died FAST: a transient
  * CLI hiccup or upstream API error surfaces within seconds, while anything
- * that ran past this mark hit a timeout (idle ≥ 10 min, hard ≥ 30 min) —
+ * that ran past this mark hit a timeout (idle ≥ 10 min, hard ≥ 60 min) —
  * re-running a hung upstream would just make the user wait twice for the
  * same death. Orchestrator-level policy, kept here so tests can import it
  * without dragging in the database.

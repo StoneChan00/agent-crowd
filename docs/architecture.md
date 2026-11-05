@@ -34,7 +34,7 @@
    - 特殊入口：手动「▶ 发言」（`runCharacter`）、中途补充 steer（打断在飞回合、保留半截文本，`steer`）。
 2. **入队**（`enqueue`）：同房间串行（同一时刻只有一个角色在跑）；接力对「正在跑的同角色」去重防死循环，显式用户意图（@、▶）则允许排队追加。
 3. **消费**（`pump`）：`createTurn` → `active.set`（AbortController + 流式 replay 缓冲）→ 广播 `turn running`。接力预算 `maxHops` 超限时清队列并发一次系统提示（`budgetExceeded`，按 hop 计深度，@all 全员都是 hop 1）。
-4. **组 prompt**（`prompt.ts buildTurnPrompt`）：最近 80 条群聊消息按字符预算（9000 字符、单条截断 1200、总预算 24000）重放成时间戳对话 + 成员花名册（名字/别名/harness/模型）+ 人设 + 长期记忆（角色跨房间身份记忆 + 房间共享记忆，带预算防挤占）+ override（steer/手动指令）。
+4. **组 prompt**（`prompt.ts buildTurnPrompt`）：最近 80 条群聊消息按字符预算（18000 字符、单条截断 4000——完整 review/修复汇报必须整条到达；总预算 32000，溢出时只切头部、【现在轮到你】指令永不丢；override 超长同样按单条上限截断，防其借 tail 保护绕过总上限）重放成时间戳对话 + 成员花名册（名字/别名/harness/模型）+ 人设 + 长期记忆（角色跨房间身份记忆 + 房间共享记忆，带预算防挤占）+ override（steer/手动指令）。契约由 `scripts/prompt-check.mjs` 锁定。
 5. **调 CLI**（`harnesses/*`）：按适配器契约（见下）spawn 子进程；`onSpawn` 把 CLI pid 存进 `active` 和 turn 行（后者供宕机 sweep 收割孤儿）；流式 `emit` text/thinking/tool 增量，经 SSE `delta` 推给前端，同时进 replay 缓冲（中途加入的客户端可追）。
 6. **落库**：
    - 用户 abort → turn `stopped`，半截文本保留为角色消息，`meta.error='已停止'`。

@@ -3,7 +3,11 @@ import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure } from './harnesses/process.ts'
+import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPrompt } from './prompt.ts'
+// Circular with restart.ts (it imports isBusy): safe - both sides only call
+// functions at runtime, never at module top level.
+import { maybeRestartNow } from './restart.ts'
 import type { Character, HarnessKind, Message, Room, ToolTrace } from './types.ts'
 import { truncate } from './util.ts'
 
@@ -25,6 +29,12 @@ interface QueueItem {
    * output (loop guard: a failure is retried exactly once, never twice).
    */
   retry?: boolean
+  /**
+   * Marks a round-end summary turn. Summary turns are injected by the
+   * orchestrator itself (not by any message) and must never count as round
+   * activity, so they can't resurrect a round that is being closed out.
+   */
+  isRoundSummary?: boolean
 }
 
 /** Replay buffer for the running turn, so clients that join mid-turn can catch up. */
@@ -60,12 +70,31 @@ interface ChainState {
   limitNoticeSent: boolean
 }
 
+/**
+ * Lifecycle of one conversation round (the chain of turns a single human
+ * message / manual run kicks off, including every relay hand-off):
+ * - `hadTurn` flips true the moment a real (non-summary) turn starts, so
+ *   rounds that never ran anything (e.g. all mentioned characters disabled)
+ *   close out without a summary;
+ * - `summarizing` marks "the round-end summary is already scheduled/ran" —
+ *   it both prevents the summary's own relay echo from re-triggering the
+ *   summary and lets the round close cleanly on the next empty-queue visit;
+ * - `endReason` is fed into the summary instruction so the summarizer can
+ *   say why the round ended.
+ * A new human message or manual run replaces the entry (new round); a manual
+ * stop deletes it (deliberately silenced — the user asked for silence).
+ */
+interface RoundState {
+  hadTurn: boolean
+  summarizing: boolean
+  endReason: 'completed' | 'limit'
+}
+
 const queues = new Map<string, QueueItem[]>()
 const active = new Map<string, ActiveTurn>()
 const chains = new Map<string, ChainState>()
+const rounds = new Map<string, RoundState>()
 
-/** Matches `@all` (or `@所有人`) as a whole word on both sides, so `team@all.com` or `@all-hands` won't wake everyone. */
-const ALL_MENTION = /(?<![A-Za-z0-9_])@(?:all|所有人)(?![A-Za-z0-9_\u4e00-\u9fff])/i
 /** Bound the replay buffers so a chatty turn can't grow memory forever (mirrors the UI's tail-60). */
 const REPLAY_CAP = 60
 /** Upper bound for the replayed text tail. */
@@ -103,26 +132,6 @@ export function liveTurn(roomId: string): LiveTurnSnapshot | null {
   }
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-/**
- * Case-insensitive `@name` mention with word boundaries on both sides:
- * `@fish` won't match `@fisher` or `boss@fish`, and the CJK-aware trailing
- * boundary keeps `@鱼` from matching `@鱼头`.
- */
-function isMentioned(content: string, name: string): boolean {
-  if (!name) return false
-  return new RegExp(`(?<![A-Za-z0-9_])@${escapeRegExp(name)}(?![A-Za-z0-9_\\u4e00-\\u9fff])`, 'i').test(content)
-}
-
-/** Any of the character's call-names (name + aliases) is @'d. */
-function matchNames(character: Character, content: string): boolean {
-  if (isMentioned(content, character.name)) return true
-  return character.aliases.some((alias) => isMentioned(content, alias))
-}
-
 /**
  * A human message routes strictly by mention (name or alias):
  * - `@all` / `@所有人` wakes every enabled character;
@@ -131,17 +140,23 @@ function matchNames(character: Character, content: string): boolean {
  *   explains why — instead of falling through to a bystander;
  * - no mention (or a name that matches nobody) falls back to the first
  *   enabled character.
+ * Mentions inside code spans/blocks/link labels are quoted text, not calls
+ * (`visibleText`), so `` `@GLM` `` in a message asking the user to decide
+ * wakes nobody.
  * The relay budget resets on every human message.
  */
 export function handleUserMessage(room: Room, message: Message): void {
   chains.set(room.id, { limitNoticeSent: false })
+  rounds.set(room.id, { hadTurn: false, summarizing: false, endReason: 'completed' })
   const everyone = db.listCharacters(room.id)
   const enabled = everyone.filter((character) => character.enabled)
+  // Extract once, match per member: the same text is scanned for every character.
+  const plain = visibleText(message.content)
   let targets: Character[]
-  if (ALL_MENTION.test(message.content)) {
+  if (ALL_MENTION.test(plain)) {
     targets = enabled
   } else {
-    const mentionedAny = everyone.filter((character) => matchNames(character, message.content))
+    const mentionedAny = everyone.filter((character) => matchNames(character, plain))
     const mentioned = mentionedAny.filter((character) => character.enabled)
     if (mentioned.length > 0) {
       targets = mentioned
@@ -171,6 +186,7 @@ export function handleUserMessage(room: Room, message: Message): void {
 /** Queue one character manually (the "让它发言" action). */
 export function runCharacter(room: Room, character: Character, override?: string): void {
   chains.set(room.id, { limitNoticeSent: false })
+  rounds.set(room.id, { hadTurn: false, summarizing: false, endReason: 'completed' })
   enqueue(room.id, character.id, null, 1, override, { allowActive: true })
   void pump(room.id)
 }
@@ -221,12 +237,18 @@ export function stopRoom(roomId: string): void {
   if (current) current.controller.abort()
   queues.set(roomId, [])
   chains.delete(roomId)
+  // Manual stop = the user asked for silence: close the round without a
+  // summary (the aborted turn's settlement re-pumps into an empty queue).
+  rounds.delete(roomId)
   broadcast(roomId, 'queue', { roomId, characters: [] })
 }
 
-function shouldWake(character: Character, message: Message): boolean {
+/** The part of a message the wake rules actually read (a real row or a not-yet-saved reply). */
+type WakeSubject = Pick<Message, 'authorType' | 'characterId' | 'authorName' | 'content'>
+
+function shouldWake(character: Character, message: WakeSubject, plain: string): boolean {
   if (!character.enabled) return false
-  const mention = mentions(character, message.content)
+  const mention = mentions(character, plain)
   if (message.authorType === 'user') return character.triggers.onUser || mention
   if (message.authorType !== 'character') return false
 
@@ -239,9 +261,12 @@ function shouldWake(character: Character, message: Message): boolean {
   return fromListed || byKeyword || mention
 }
 
-function mentions(character: Character, content: string): boolean {
+/** Mentions in `plain` — the message's visible text, extracted once by the caller. */
+function mentions(character: Character, plain: string): boolean {
   if (!character.triggers.mention) return false
-  return matchNames(character, content)
+  // Quoted `@name` (code span, fenced block, link label) is a mention in
+  // prose, not a call.
+  return matchNames(character, plain)
 }
 
 function enqueue(
@@ -250,7 +275,7 @@ function enqueue(
   triggerMessageId: string | null,
   hop: number,
   override?: string,
-  options?: { allowActive?: boolean; retry?: boolean },
+  options?: { allowActive?: boolean; retry?: boolean; isRoundSummary?: boolean },
 ): boolean {
   const queue = queues.get(roomId) ?? []
   // Relay hand-offs dedupe against the running character (loop guard);
@@ -261,17 +286,27 @@ function enqueue(
   // item was already waiting and this call was a silent no-op.
   if (!options?.allowActive && active.get(roomId)?.characterId === characterId) return false
   if (queue.some((item) => item.characterId === characterId)) return false
-  queue.push({ characterId, triggerMessageId, hop, override, retry: options?.retry || undefined })
+  queue.push({
+    characterId,
+    triggerMessageId,
+    hop,
+    override,
+    retry: options?.retry || undefined,
+    isRoundSummary: options?.isRoundSummary || undefined,
+  })
   queues.set(roomId, queue)
   broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
   return true
 }
 
-function enqueueFollowers(room: Room, message: Message, nextHop: number): void {
-  for (const character of db.listCharacters(room.id)) {
-    if (character.id === message.characterId) continue
-    if (shouldWake(character, message)) enqueue(room.id, character.id, message.id, nextHop)
-  }
+/**
+ * Queue the members this reply hands off to, one relay level deeper. The list
+ * is computed before the message is stored (see `pump`) so the row can carry
+ * `meta.relayTo`, which is what the UI shows as "接力 → …": the browser
+ * displays the router's own verdict instead of re-deriving the trigger rules.
+ */
+function enqueueFollowers(roomId: string, messageId: string, followers: Character[], nextHop: number): void {
+  for (const character of followers) enqueue(roomId, character.id, messageId, nextHop)
 }
 
 /**
@@ -286,6 +321,8 @@ function budgetExceeded(room: Room, hop: number): boolean {
   const state = chains.get(room.id) ?? { limitNoticeSent: false }
   if (state.limitNoticeSent) return true
   chains.set(room.id, { limitNoticeSent: true })
+  const round = rounds.get(room.id)
+  if (round) round.endReason = 'limit'
   queues.set(room.id, [])
   const message = db.addMessage({
     roomId: room.id,
@@ -295,6 +332,62 @@ function budgetExceeded(room: Room, hop: number): boolean {
   })
   broadcast(room.id, 'message', { roomId: room.id, message })
   broadcast(room.id, 'queue', { roomId: room.id, characters: [] })
+  return true
+}
+
+/**
+ * Round-end summary: called from pump()'s empty-queue branch, i.e. the
+ * moment a round that ran at least one turn has nothing left to run. Every
+ * enabled character with `triggers.onRoundEnd` is queued with a
+ * summarization instruction (the hop budget doesn't apply — the summary is
+ * orchestrator bookkeeping, not part of the relay chain it closes).
+ *
+ * Idempotent per round: the `summarizing` flag makes the summary's own
+ * settlement (and any relay echo of the summary message) close the round
+ * instead of triggering a second summary. Returns whether summary items
+ * entered the queue, so the caller can keep pumping instead of flashing
+ * the room idle.
+ */
+function maybeStartRoundSummary(roomId: string): boolean {
+  const round = rounds.get(roomId)
+  if (!round) return false
+  if (!round.hadTurn || round.summarizing) {
+    // Nothing to summarize (or the summary already ran): close the round.
+    rounds.delete(roomId)
+    return false
+  }
+  const room = db.getRoom(roomId)
+  if (!room) {
+    rounds.delete(roomId)
+    return false
+  }
+  const summarizers = db.listCharacters(roomId).filter((character) => character.enabled && character.triggers.onRoundEnd)
+  if (summarizers.length === 0) {
+    rounds.delete(roomId)
+    return false
+  }
+  round.summarizing = true
+  const reason =
+    round.endReason === 'limit'
+      ? `本轮对话因接力达到上限（${room.maxHops} 层）被系统自动停止`
+      : '本轮对话已结束（各方发言完毕，没有角色再接力）'
+  const override = [
+    '系统轮末总结任务：请你作为本房间的轮值总结者发言。',
+    `${reason}。`,
+    '请回顾【最近的群聊记录】里本轮的内容（从最近一条用户消息开始，到上一条消息为止），发一条简短的轮末总结，必须包含两部分：',
+    '1. 这轮做了什么：关键需求、进展、决定与产出（如代码改动、验证结果）',
+    '2. 遗留了什么：未完成事项、风险与下一步建议',
+    '只输出总结正文，保持简洁；若本轮无实质内容，一两句话说明即可。不要使用工具，不要发起新任务，不要 @ 任何角色（避免把总结变成新一轮接力）。',
+  ].join('\n')
+  let queued = false
+  for (const character of summarizers) {
+    queued = enqueue(roomId, character.id, null, 1, override, { isRoundSummary: true }) || queued
+  }
+  if (!queued) {
+    // Every summarizer vanished mid-flight (deleted/disabled): close the round.
+    rounds.delete(roomId)
+    return false
+  }
   return true
 }
 
@@ -318,6 +411,11 @@ async function pump(roomId: string): Promise<void> {
     const item = queue.shift()
     queues.set(roomId, queue)
     if (!item) {
+      // Empty queue + no active turn: the round (if one was running) just
+      // ended — either drained naturally or cut by the hop budget. Fire the
+      // round-end summary before declaring the room idle, so the summary
+      // turn starts without a busy→idle→busy flicker.
+      if (maybeStartRoundSummary(roomId)) return void pump(roomId)
       broadcast(roomId, 'busy', { roomId, busy: false, characterId: null })
       return
     }
@@ -352,6 +450,12 @@ async function pump(roomId: string): Promise<void> {
       startedAt: Date.now(),
       replay,
     })
+    // A real turn is running: the round it belongs to has substance, so its
+    // end deserves a summary. Summary turns (and anything running while the
+    // summary is already scheduled) don't flip the flag — they are the
+    // round's closing act, not new activity.
+    const round = rounds.get(roomId)
+    if (round && !round.summarizing && !item.isRoundSummary) round.hadTurn = true
     db.updateTurn(turn.id, { status: 'running' })
     broadcast(roomId, 'turn', { roomId, turnId: turn.id, characterId: character.id, status: 'running' })
     broadcast(roomId, 'busy', { roomId, busy: true, characterId: character.id })
@@ -470,6 +574,7 @@ async function pump(roomId: string): Promise<void> {
         enqueue(roomId, character.id, item.triggerMessageId, item.hop, item.override, {
           allowActive: true,
           retry: true,
+          isRoundSummary: item.isRoundSummary,
         })
       const message = db.addMessage({
         roomId,
@@ -489,6 +594,39 @@ async function pump(roomId: string): Promise<void> {
     const content =
       output.text.trim() ||
       `（${character.name} 没有返回正文 · 耗时 ${Math.round((output.durationMs ?? 0) / 1000)} 秒 · exit ${output.exitCode} · 工具调用 ${output.toolTraces?.length ?? 0} 次）`
+    // Who this reply hands off to (developer → reviewer), one relay level
+    // deeper than the message that triggered this turn. Computed BEFORE the
+    // row is written so `meta.relayTo` can carry the truth — the UI shows
+    // "接力 → GLM" from it instead of re-implementing `shouldWake`.
+    // Errored/truncated turns don't relay: meta.error already flags the reply
+    // as possibly incomplete, so chaining the room on a half-finished message
+    // would be worse than staying quiet. Round-summary turns never relay
+    // either: the summary is a wrap-up, and relaying it would let a summary
+    // wake up followers (anyone listening on the summarizer), turning the
+    // "last word" into a new relay round.
+    const relays = !output.error && !item.isRoundSummary
+    // Extract once, match per member — the same shape as the user-message
+    // router above, so a room of ten members parses ten names, not ten
+    // markdown trees.
+    const plain = relays ? visibleText(content) : ''
+    const followers = relays
+      ? db
+          .listCharacters(room.id)
+          .filter(
+            (member) =>
+              member.id !== character.id &&
+              shouldWake(
+                member,
+                {
+                  authorType: 'character',
+                  characterId: character.id,
+                  authorName: character.name,
+                  content,
+                },
+                plain,
+              ),
+          )
+      : []
     const message = db.addMessage({
       roomId,
       authorType: 'character',
@@ -509,6 +647,7 @@ async function pump(roomId: string): Promise<void> {
         thinking: output.thinking ? truncate(output.thinking, 4000) : undefined,
         tools: output.toolTraces as ToolTrace[] | undefined,
         error: output.error,
+        relayTo: followers.length > 0 ? followers.map((member) => member.name) : undefined,
         generated: true,
       },
     })
@@ -526,13 +665,7 @@ async function pump(roomId: string): Promise<void> {
       status: output.error ? 'error' : 'done',
     })
     broadcast(roomId, 'message', { roomId, message })
-
-    // Hand off to whoever listens to this character (developer → reviewer),
-    // one relay level deeper than the message that triggered this turn.
-    // Errored/truncated turns don't relay: meta.error already flags the reply
-    // as possibly incomplete, so chaining the room on a half-finished message
-    // would be worse than staying quiet.
-    if (!output.error) enqueueFollowers(room, message, item.hop + 1)
+    enqueueFollowers(roomId, message.id, followers, item.hop + 1)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     console.error(`[agent-crowd] pump(${roomId}) failed:`, reason)
@@ -569,5 +702,8 @@ async function pump(roomId: string): Promise<void> {
     // consumed here: re-pumping the empty-queue path would schedule itself
     // forever (each no-op pump would queue the next).
     if (consumed) void pump(roomId)
+    // The relay chain reached its end and every queue is empty: this is the
+    // all-idle moment a pending POST /api/restart waits for (server/restart.ts).
+    maybeRestartNow()
   }
 }

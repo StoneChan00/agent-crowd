@@ -40,7 +40,7 @@ pnpm serve        # = vite build + tsx server/index.ts
 
 或者直接双击/运行 `start.ps1`，它会自动装依赖、构建、启动并打开浏览器。
 
-改了 server 端代码或环境变量之后，用 `.\restart-server.ps1` 一键重启后端：它会停掉 8787 上的旧进程并以 `AC_TURN_TIMEOUT_MS=30m` 启动新进程（终端里已设置过该变量则沿用）。
+改了 server 端代码或环境变量之后，用 `.\restart-server.ps1` 一键重启后端：它会停掉 8787 上的旧进程并以 `AC_TURN_TIMEOUT_MS=60m` 启动新进程（终端里已设置过该变量则沿用）。
 
 开发自检：改完代码跑 `npm test`（回归护栏，覆盖回合超时、进程树清理、markdown 换行契约，不依赖 NPU/外部服务）。
 
@@ -173,7 +173,7 @@ $env:AC_HERMES_BIN   = "C:\...\hermes.exe"
 | `AC_PORT` | `8787` | 后端端口 |
 | `AC_HOST` | `127.0.0.1` | 监听地址 |
 | `AC_DATA_DIR` | `./data` | SQLite 与运行时文件目录 |
-| `AC_TURN_TIMEOUT_MS` | `900000` | 单个角色回合超时，支持 `30m` / `45s` / `1.5m` 等写法，非法值回落默认 |
+| `AC_TURN_TIMEOUT_MS` | `3600000` | 单个角色回合超时，支持 `60m` / `45s` / `1.5m` 等写法，非法值回落默认 |
 | `AC_SEED_DEV_MODEL` | `cannbot/glm-5.3` | 示例房间开发者的模型 |
 | `AC_CANNBOT_BIN` / `AC_OPENCODE_BIN` / `AC_DSH_BIN` / `AC_HERMES_BIN` | 自动探测 | 覆盖可执行文件路径 |
 | `DSH_HOME` | `~/.dsh` | DSH 配置目录（读取 settings/凭据） |

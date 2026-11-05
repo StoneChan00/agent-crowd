@@ -35,6 +35,13 @@ export interface Triggers {
   keyword: string
   /** Wake when the message contains `@<name>`. */
   mention: boolean
+  /**
+   * Post an automatic round-end summary: when a round that ran at least one
+   * turn drains (relay chain ended on its own, or the hop budget cut it),
+   * this character is queued with a summarization instruction. Manual stops
+   * and rounds that never ran a turn never trigger it.
+   */
+  onRoundEnd: boolean
 }
 
 export const DEFAULT_TRIGGERS: Triggers = {
@@ -44,6 +51,7 @@ export const DEFAULT_TRIGGERS: Triggers = {
   onCharacterNames: [],
   keyword: '',
   mention: true,
+  onRoundEnd: false,
 }
 
 export interface Room {
@@ -176,6 +184,12 @@ export interface MessageMeta {
   tools?: ToolTrace[]
   /** True when the message was written by a character's harness run. */
   generated?: boolean
+  /**
+   * Names of the characters this reply hands off to, i.e. who the relay
+   * actually queues next. Written by the orchestrator's own `shouldWake`
+   * verdict, so the UI can show "接力 → …" without re-deriving the rules.
+   */
+  relayTo?: string[]
   /** Present when this user message is a steer note (「中途补充」). */
   steer?: SteerMeta
 }
