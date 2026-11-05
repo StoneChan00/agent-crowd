@@ -8,6 +8,7 @@ import { isTransientFailure } from './harnesses/process.ts'
 import { changedPathsBetween, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPromptDetailed } from './prompt.ts'
+import { episodeDelivery, memoryQueryFromMessages } from './memory.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
@@ -122,6 +123,13 @@ interface RoundState {
    * when the run actually died; the card stays running for a re-dispatch.
    */
   lastTurnOutcome: 'ok' | 'error' | 'stopped'
+  /**
+   * The round's delivery line for the episode memory (B04): the last real
+   * (non-summary) reply, verdict lines stripped, whitespace collapsed, 160
+   * chars. Summary turns never overwrite it — memories must not memorialize
+   * the summary of the round instead of the round itself.
+   */
+  lastDelivery?: string
   /** Task card this round executes (B03); undefined on ordinary chat rounds. */
   taskId?: string
 }
@@ -672,6 +680,44 @@ function settleTaskClosed(roomId: string, round: RoundState): void {
 }
 
 /**
+ * B04: the round's normal close — one funnel for all three clean-close
+ * sites. Order matters: settle the task card first (B03 semantics
+ * unchanged), then record the round as a room-scope episode (best-effort: a
+ * memory failure logs and moves on — it must never take the card settlement
+ * or the round's removal down with it), then drop the round.
+ *
+ * The episode only fires on a CLEAN, CHANGED, APPROVED round: work happened
+ * (hadTurn), it left code evidence (changedPaths), the review verdict is
+ * PASS, verify (when configured) passed, and the last real turn ended ok.
+ * Everything else — blocked, errored, stopped, hop-limited, pure chat — is
+ * not "finished work" and writes nothing.
+ */
+function closeRoundNormally(roomId: string, round: RoundState): void {
+  settleTaskClosed(roomId, round)
+  if (
+    round.hadTurn &&
+    round.changedPaths.length > 0 &&
+    round.verdict === 'pass' &&
+    round.verifyState !== 'fail' &&
+    round.lastTurnOutcome === 'ok'
+  ) {
+    try {
+      db.addRoundEpisode({
+        roomId,
+        changedPaths: round.changedPaths,
+        verify: round.verifyState === 'pass' ? 'pass' : 'none',
+        delivery: round.lastDelivery ?? '',
+      })
+    } catch (error) {
+      console.warn(
+        `[agent-crowd] round episode memory failed (${roomId}): ${error instanceof Error ? error.message : error}`,
+      )
+    }
+  }
+  rounds.delete(roomId)
+}
+
+/**
  * Round-end summary: called from pump()'s empty-queue branch, i.e. the
  * moment a round that ran at least one turn has nothing left to run —
  * with the SOP gate (P0-3 3c) in front of it: a round that changed the
@@ -701,11 +747,13 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   if (!round.hadTurn || round.summarizing) {
     // Nothing to summarize (or the summary already ran): close the round.
     // The summarizing branch is the summary's own settlement closing the
-    // loop — the card's round finished normally (B03). A round that never
-    // ran anything (assignee vanished before the turn started) leaves its
-    // card `running` for a re-dispatch instead of falsely closing it.
-    if (round.summarizing) settleTaskClosed(roomId, round)
-    rounds.delete(roomId)
+    // loop — the card's round finished normally, and a clean+changed+PASS
+    // round records its episode (B04). A round that never ran anything
+    // (assignee vanished before the turn started) leaves its card `running`
+    // for a re-dispatch instead of falsely closing it — and writes no
+    // memory (nothing happened).
+    if (round.summarizing) closeRoundNormally(roomId, round)
+    else rounds.delete(roomId)
     return false
   }
   const room = db.getRoom(roomId)
@@ -784,9 +832,9 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   const summarizers = db.listCharacters(roomId).filter((character) => character.enabled && character.triggers.onRoundEnd)
   if (summarizers.length === 0) {
     // No summarizer configured: the round still closed — settle by its last
-    // turn's outcome (B03 review 2: an errored round is NOT a done card).
-    settleTaskClosed(roomId, round)
-    rounds.delete(roomId)
+    // turn's outcome (B03 review 2: an errored round is NOT a done card),
+    // and record the episode on a clean+changed+PASS close (B04).
+    closeRoundNormally(roomId, round)
     return false
   }
   round.summarizing = true
@@ -808,8 +856,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   }
   if (!queued) {
     // Every summarizer vanished mid-flight (deleted/disabled): close the round.
-    settleTaskClosed(roomId, round)
-    rounds.delete(roomId)
+    closeRoundNormally(roomId, round)
     return false
   }
   return true
@@ -927,11 +974,6 @@ async function pump(roomId: string): Promise<void> {
     // Unjudgeable worktrees simply leave the turn's `changed` null.
     const before = await snapshotWorktree(cwd)
     const characters = db.listCharacters(roomId)
-    // Long-term memory rides along on every turn: the character's cross-room
-    // identity memories plus this room's shared notes, both hard-budgeted so
-    // they never crowd out the transcript (see docs/memory-plan.md).
-    const identity = db.ensureIdentityForCharacter(character)
-    const memories = db.pickMemoriesForPrompt(identity.id, room.id)
     // Session continuity (P0-1): the same character in the same room rides
     // the CLI's own session when a stored row still matches its harness and
     // model AND the adapter declared a resume fragment (flags verified
@@ -964,9 +1006,18 @@ async function pump(roomId: string): Promise<void> {
         : 0
     if (foldOverflow > 0) {
       console.warn(
-        `[agent-crowd] ${room.name}/${character.name}: 新消息超过取回窗口（${RESUME_FETCH_LIMIT} 条），${foldOverflow} 条仅以计数进入折叠摘要`,
+        `[agent-crowd] ${room.name}/${character.name}: 新消息超过取回窗口（${RESUME_FETCH_LIMIT}），${foldOverflow} 条仅以计数进入折叠摘要`,
       )
     }
+    // Long-term memory rides along on every turn: the character's cross-room
+    // identity memories plus this room's shared notes, both hard-budgeted so
+    // they never crowd out the transcript (see docs/memory-plan.md). B04:
+    // picked AFTER the fetch so retrieval can key on this round's own query —
+    // the last user message, or the task-card body on card rounds; a summary
+    // round keys on the round's trigger, never on the summary itself.
+    const identity = db.ensureIdentityForCharacter(character)
+    const memoryQuery = memoryQueryFromMessages(fetched)
+    const memories = db.pickMemoriesForPrompt(identity.id, room.id, undefined, memoryQuery)
     // The prompt layer owns both the text and what it represented (B01): the
     // cursor below is computed from the messages the prompt actually carries
     // (rendered or folded), never from what was merely fetched — a cursor
@@ -1203,9 +1254,11 @@ async function pump(roomId: string): Promise<void> {
     })
     // The round's last real turn settled (B03 review 2): a reply that landed
     // with meta.error counts as an errored outcome — the card must not close
-    // as done on a possibly-incomplete run.
+    // as done on a possibly-incomplete run. The same spot records the round's
+    // delivery line for the episode memory (B04).
     if (round && round.roundId === item.roundId && !item.isRoundSummary) {
       round.lastTurnOutcome = output.error ? 'error' : 'ok'
+      round.lastDelivery = episodeDelivery(content)
     }
     broadcast(roomId, 'turn', {
       roomId,

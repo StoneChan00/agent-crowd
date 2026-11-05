@@ -19,6 +19,10 @@
  *   5. override — a steer/manual override is capped like one message before
  *                 it rides the guard-protected tail: a 40k override must not
  *                 slip the ceiling and blow the CLI's 32_767-char argv limit.
+ *   6. memory   — (B04) retrieval: pure planning locks (term split, escaping,
+ *                 episode assembly) + DB-backed R1–R8 (FTS substring, LIKE
+ *                 fallback for short CJK, mixed union, escaping, pinned,
+ *                 budgets, empty-query parity).
  *
  * Constants are IMPORTED from the live module — never re-typed here.
  * Node ≥ 23.6 (type stripping) is required for the `.ts` imports.
@@ -230,9 +234,136 @@ const mark = (tag) => `⟪${tag}⟫`
   )
 }
 
+/* ------------------------------------------- memory retrieval (B04, R1–R8) */
+// DB-backed cases live in a dynamic-import section so the pure-function
+// layer above stays import-clean (AC_DATA_DIR must be set BEFORE db.ts
+// loads — paths.ts reads it at module scope). Pure helpers import statically.
+{
+  const mem = await import('../server/memory.ts')
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  // --- pure-function locks -------------------------------------------------
+  {
+    const planCjk = mem.planMemoryQuery('续传游标')
+    check('R-pure 3 码点分界：4 字中文进 FTS', planCjk?.ftsTerms.length === 1 && planCjk.likeTerms.length === 0)
+    const planShort = mem.planMemoryQuery('游标 lost')
+    check(
+      'R-pure 3 码点分界：2 字中文进 LIKE、英文进 FTS',
+      planShort?.likeTerms.length === 1 && planShort.ftsTerms.length === 1,
+    )
+    check(
+      'R-pure 空串/空白/null → null',
+      mem.planMemoryQuery('') === null && mem.planMemoryQuery('   ') === null && mem.planMemoryQuery(null) === null,
+    )
+    check('R-pure 词数上限 8（两类合计）', mem.planMemoryQuery('a1 a2 a3 a4 a5 a6 a7 a8 a9 a10')?.likeTerms.length === 8)
+    check(
+      'R-pure 引号转义（FTS 双写、LIKE 反斜杠）',
+      mem.ftsQuote('他说"游标"') === '"他说""游标"""' && mem.escapeLike('100%_\\') === '100\\%\\_\\\\',
+    )
+    const epA = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['b.ts', 'a.ts'], verify: 'pass', delivery: '修好了\nREVIEW: PASS' })
+    const epB = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['a.ts', 'b.ts'], verify: 'pass', delivery: '修好了' })
+    check(
+      'R-pure 路径排序无关 + REVIEW 行剥除 → 同 hash',
+      epA.content === epB.content && epA.hash === epB.hash && !epA.content.includes('REVIEW'),
+      epA.content,
+    )
+    const epLong = mem.buildRoundEpisode({
+      roomId: 'r',
+      changedPaths: Array.from({ length: 9 }, (_, i) => `file-${i}.ts`),
+      verify: 'none',
+      delivery: 'x'.repeat(400),
+    })
+    check('R-pure >6 路径写「等 N 个」+ 480 截断', epLong.content.includes('等 9 个') && epLong.content.length <= 480, `${epLong.content.length}`)
+    check(
+      'R-pure 查询取末条用户消息或任务卡消息',
+      mem.memoryQueryFromMessages([
+        { id: '1', roomId: 'r', authorType: 'user', characterId: null, authorName: '我', authorAvatar: '', color: '', content: '旧问题', meta: null, createdAt: 1, seq: 1 },
+        { id: '2', roomId: 'r', authorType: 'character', characterId: 'c', authorName: '甲', authorAvatar: '', color: '', content: '回复', meta: null, createdAt: 2, seq: 2 },
+        { id: '3', roomId: 'r', authorType: 'system', characterId: null, authorName: '系统', authorAvatar: '', color: '', content: '【任务卡】卡片正文', meta: { taskId: 't' }, createdAt: 3, seq: 3 },
+      ]) === '【任务卡】卡片正文' &&
+        mem.memoryQueryFromMessages([
+          { id: '1', roomId: 'r', authorType: 'character', characterId: 'c', authorName: '甲', authorAvatar: '', color: '', content: '最后一条', meta: null, createdAt: 2, seq: 2 },
+        ]) === '最后一条' &&
+        mem.memoryQueryFromMessages([]) === '',
+    )
+  }
+
+  // --- DB-backed retrieval -------------------------------------------------
+  const memDir = mkdtempSync(join(tmpdir(), 'ac-prompt-mem-'))
+  process.env.AC_DATA_DIR = memDir
+  const memDb = await import('../server/db.ts')
+  const ROOM = 'room-mem-check'
+
+  const target = memDb.addMemory({
+    scope: 'room',
+    ownerId: ROOM,
+    kind: 'fact',
+    content: '修复了续传游标丢失的问题：折叠摘要与按游标取回。',
+  }).memory
+  const lostEntry = memDb.addMemory({ scope: 'room', ownerId: ROOM, content: '环境记录：lost connection 后自动重试成功。' }).memory
+  const percentEntry = memDb.addMemory({ scope: 'room', ownerId: ROOM, content: '覆盖率说明：达到 100% 覆盖才算过。' }).memory
+  const quoteEntry = memDb.addMemory({ scope: 'room', ownerId: ROOM, content: '他说"游标"又丢了，已定位。' }).memory
+  // Push the target out of the 800-char recency window: ~12 × ~90 chars.
+  for (let i = 0; i < 12; i += 1) {
+    memDb.addMemory({ scope: 'room', ownerId: ROOM, content: `无关记忆${i}：${'水'.repeat(85)}` })
+    await sleep2(2)
+  }
+
+  const idsOf = (picked) => picked.room.map((memory) => memory.id)
+
+  check(
+    'R1 3 字以上中文子串命中（FTS）',
+    memDb.searchMemoryIds('room', ROOM, '续传游标').includes(target.id) &&
+      idsOf(memDb.pickMemoriesForPrompt(null, ROOM, undefined, '续传游标')).includes(target.id),
+  )
+  const miss = memDb.pickMemoriesForPrompt(null, ROOM, undefined, '量子纠缠')
+  check(
+    'R2 未命中不注入（recency 同旧行为，旧条目不在）',
+    memDb.searchMemoryIds('room', ROOM, '量子纠缠').length === 0 && !idsOf(miss).includes(target.id),
+  )
+  check(
+    'R3 预算不变（room 非钉选 ≤ 800）',
+    miss.room.filter((memory) => !memory.pinned).reduce((sum, memory) => sum + memory.content.length, 0) <= 800,
+    `${miss.room.reduce((sum, memory) => sum + memory.content.length, 0)}`,
+  )
+  check(
+    'R4 2 字中文走 LIKE 回退命中',
+    memDb.searchMemoryIds('room', ROOM, '游标').includes(target.id) &&
+      idsOf(memDb.pickMemoriesForPrompt(null, ROOM, undefined, '游标')).includes(target.id),
+  )
+  const mixed = memDb.searchMemoryIds('room', ROOM, '游标 lost')
+  check('R4b 混排取并集（LIKE 短词 + FTS 长词都命中）', mixed.includes(target.id) && mixed.includes(lostEntry.id), JSON.stringify(mixed))
+  check(
+    'R5 LIKE 转义：「%」只命中字面百分号条目',
+    JSON.stringify(memDb.searchMemoryIds('room', ROOM, '%')) === JSON.stringify([percentEntry.id]),
+  )
+  const noQuery = idsOf(memDb.pickMemoriesForPrompt(null, ROOM))
+  const emptyQuery = idsOf(memDb.pickMemoriesForPrompt(null, ROOM, undefined, ''))
+  check(
+    'R7 空 query 与不传一致（不发起检索）',
+    JSON.stringify(noQuery) === JSON.stringify(emptyQuery) && !noQuery.includes(target.id),
+  )
+  check('R8 含引号的查询不抛且命中字面内容', memDb.searchMemoryIds('room', ROOM, '他说"游标"又丢了').includes(quoteEntry.id))
+  memDb.updateMemory(target.id, { pinned: true })
+  check(
+    'R6 钉选优先（旧条目钉选后必在注入中）',
+    idsOf(memDb.pickMemoriesForPrompt(null, ROOM, undefined, '量子纠缠')).includes(target.id),
+  )
+  memDb.updateMemory(target.id, { pinned: false })
+
+  try {
+    rmSync(memDir, { recursive: true, force: true })
+  } catch {
+    /* db handle still open — Windows EBUSY, same treatment as sop-check */
+  }
+}
+
 if (failed) {
   console.log(`\n${failed} case(s) failed`)
   process.exitCode = 1
 } else {
-  console.log('\nOK: prompt transcript contract passed (delivery + bound + budget + ceiling + override)')
+  console.log('\nOK: prompt transcript contract passed (delivery + bound + budget + ceiling + override + memory retrieval)')
 }

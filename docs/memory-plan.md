@@ -1,6 +1,11 @@
 # 跨会话持久身份与共享记忆 · 设计规划
 
-> 状态：PR1 + PR3 已实施（2026-10-26）；PR2（轮末自动提取）与 PR4（embedding 检索）待做。
+> 状态：PR1 + PR3 已实施（2026-10-26）；PR2 以**零模型版**落地（B04，2026-11-06）：干净收尾
+> （有改动 + review PASS + verify 非 fail + 末回合正常）的轮自动写一条 room-scope `episode`
+> （改动路径/结论/验证/交付一句话，`sha256(content)` 去重，编辑即接管——hash 置 null）；
+> PR4 的**检索**部分已落地（B04）：`memories_fts`（FTS5 trigram + 触发器 + 启动 rebuild），
+> ≥3 码点词走 FTS、短中文词 LIKE 回退、混排取并集，注入排序「钉选 → 命中 → 最近」，
+> query 取本轮末条用户消息或任务卡正文；**embedding / 向量未做**，模型提炼与压缩淘汰留 B04b。
 > 已落地：`identities` / `memories` 表、`characters.identity_id` 同名绑定（改名不换身份）、
 > 房间共享记忆 + 角色私人记忆的注入（硬预算 1.2k/0.8k 字符、钉选优先）、
 > REST API（`/api/rooms/:id/memories` 系列）、UI（房间设置「团队记忆」、角色编辑「长期记忆」、

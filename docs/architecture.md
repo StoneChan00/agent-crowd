@@ -42,7 +42,7 @@
    - `error && 无正文` → turn `error` + 系统警告消息；瞬态失败（`isTransientFailure`：死得快）自动重试**恰好一次**（`item.retry` 循环守卫）。
    - 有正文（可能带 `meta.error`）→ 以角色消息落库，meta 携带 harness/model/turnId/durationMs/exitCode/pid/sessionId/tokens/thinking/tools。
 7. **接力**：`!output.error` 时 `enqueueFollowers(hop+1)`；带 error/截断的回合**不接龙**（半成品传给下游比沉默更糟）。
-8. **收尾**：队列排空时先过 SOP 门禁（见下节）——无改动轮直接进轮末总结（`onRoundEnd` 角色）；有改动轮必须 review 结论为 PASS 且（若配置了验证命令）服务端自跑验证通过，否则发一条门禁说明后丢弃本轮状态、不总结也不重排队。
+8. **收尾**：队列排空时先过 SOP 门禁（见下节）——无改动轮直接进轮末总结（`onRoundEnd` 角色）；有改动轮必须 review 结论为 PASS 且（若配置了验证命令）服务端自跑验证通过，否则发一条门禁说明后丢弃本轮状态、不总结也不重排队。三处正常收尾汇入 `closeRoundNormally`（B04）：结算任务卡 → **干净收尾且有改动的轮写一条 room-scope `episode` 记忆**（路径/结论/验证/交付一句话，`sha256` 去重，best-effort）→ 删 round；blocked/error/stopped/纯聊天不写。
 
 ## DB（`db.ts`，node:sqlite 单文件，WAL）
 
@@ -57,7 +57,7 @@
 | `tasks` | title、what、why、acceptance、assignee_id、status、round_id、result | 任务卡（B03）：proposed→running→done 状态机（批准同步段即 running）；批准即系统消息 + assignee 回合，回合收尾经 round_id 回写 |
 | `character_presets` | 同 characters 语义 | 角色库模板；与房间副本是**快照关系**（互不回写） |
 | `identities` | name（唯一索引）、persona | 跨房间身份（同名角色共享） |
-| `memories` | scope(identity/room)、owner_id、pinned、use_count | 长期记忆；`pickMemoriesForPrompt` 预算化注入 |
+| `memories` | scope(identity/room)、owner_id、pinned、use_count、content_hash | 长期记忆；`pickMemoriesForPrompt` 预算化注入（B04 起按「钉选→检索命中→最近」排序，`memories_fts` FTS5 trigram + LIKE 回退）；干净收尾的轮自动写 room-scope episode（B04，hash 去重，编辑即接管） |
 | `meta` | key/value | 杂项 KV |
 
 schema 升级走 `addColumnIfMissing`（`create table if not exists` 不会动已存在的表）。

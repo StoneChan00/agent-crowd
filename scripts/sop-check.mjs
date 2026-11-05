@@ -27,6 +27,12 @@
  *                         must NOT fire the restart (gateActive drains) (4)
  *   S9b stale idle       — a new turn started while the gate's verify was
  *                         running must never see a busy:false (SSE watch) (3)
+ *   S10 B04 episodes     — clean+changed+PASS rounds write exactly one
+ *                         room-scope episode (repeat round = hash no-op;
+ *                         verify-fail/no-verdict/chat write nothing; no-
+ *                         verify PASS writes 「未配置验证」), and the
+ *                         orchestrator's retrieval wiring pulls an out-of-
+ *                         recency memory in only on a query hit (9)
  *
  * Scenarios S4-S8 share one server (each room drained before the next
  * starts, so per-turn change attribution stays clean); S9 boots its own
@@ -494,6 +500,13 @@ async function scenarioEndToEnd() {
 
   const server = await bootServer(dir)
   const port = server.port
+  // S10 (B04) reads these rooms' episode memories after their rounds close.
+  let roomS4
+  let roomS5
+  let roomS6
+  let roomS7
+  let roomS8a
+  let roomS8b
 
   /* S4 green path: write + REVIEW: PASS + verify exit 0 → summary appears. */
   {
@@ -501,6 +514,7 @@ async function scenarioEndToEnd() {
       verifyCommand: 'exit 0',
       reviewerPersona: 'MOCK-评审通过',
     })
+    roomS4 = room
     const messages = await runRoundAndDrain(port, room.id)
     const dev = characterMessages(messages, '开发甲')
     check('S4 开发甲发言 1 条', dev.length === 1, `实际 ${dev.length}`)
@@ -541,6 +555,7 @@ async function scenarioEndToEnd() {
         'node -e "console.log(\'x\'.repeat(2000));console.log(\'sop-verify-fail-marker\');process.exit(1)"',
       reviewerPersona: 'MOCK-评审通过',
     })
+    roomS5 = room
     const messages = await runRoundAndDrain(port, room.id)
     check('S5 验证失败 → 无轮末总结', characterMessages(messages, '总结丙').length === 0, '总结丙发言了')
     const notice = systemNotices(messages, '验证命令未通过')
@@ -563,6 +578,7 @@ async function scenarioEndToEnd() {
       verifyCommand: 'exit 0',
       reviewerPersona: '普通评审角色（不会给结论）',
     })
+    roomS6 = room
     const messages = await runRoundAndDrain(port, room.id)
     check('S6 无 review 结论 → 无轮末总结', characterMessages(messages, '总结丙').length === 0, '总结丙发言了')
     check(
@@ -580,6 +596,7 @@ async function scenarioEndToEnd() {
   /* S7 chat-only round: no changes → gate (and verify) skipped, summary OK. */
   {
     const room = await makeRoom(port, 's7-纯聊天', repo, 'exit 0')
+    roomS7 = room
     await makeCharacter(port, room.id, '闲丁', ON_USER_ONLY, '普通聊天角色')
     await makeCharacter(port, room.id, '总结丙', ROUND_SUMMARIZER, '总结者')
     const messages = await runRoundAndDrain(port, room.id)
@@ -599,6 +616,7 @@ async function scenarioEndToEnd() {
       verifyCommand: '',
       reviewerPersona: 'MOCK-评审通过',
     })
+    roomS8a = roomA
     const messagesA = await runRoundAndDrain(port, roomA.id)
     check('S8a 无验证命令 + PASS → 直接总结', characterMessages(messagesA, '总结丙').length === 1, '总结丙未发言')
     check(
@@ -611,6 +629,7 @@ async function scenarioEndToEnd() {
       verifyCommand: '',
       reviewerPersona: '普通评审角色（不会给结论）',
     })
+    roomS8b = roomB
     const messagesB = await runRoundAndDrain(port, roomB.id)
     check('S8b 无验证命令 + 无结论 → 阻断', characterMessages(messagesB, '总结丙').length === 0, '总结丙发言了')
     check(
@@ -618,6 +637,101 @@ async function scenarioEndToEnd() {
       systemNotices(messagesB, 'SOP 门禁').length === 1,
       `实际 ${systemNotices(messagesB, 'SOP 门禁').length}`,
     )
+  }
+
+  /* S10 (B04): automatic round-end episodes — clean+changed+PASS closes
+   * write exactly one room-scope episode; everything else writes nothing;
+   * identical facts on a repeat round are a hash no-op. */
+  {
+    const memoriesWhere = (roomId, where = '1=1', ...args) =>
+      withDb(
+        dir,
+        (handle) =>
+          handle
+            .prepare(`select * from memories where scope = 'room' and owner_id = ? and kind = 'episode' and ${where}`)
+            .all(roomId, ...args),
+      )
+
+    // S10a: the S4 green round wrote exactly one episode with all facts.
+    const episodes4 = memoriesWhere(roomS4.id)
+    const episode4 = episodes4[0]
+    check(
+      'S10a 全绿轮恰 1 条 episode（含路径/PASS/verify/交付，hash 非空）',
+      episodes4.length === 1 &&
+        episode4.source_room_id === roomS4.id &&
+        episode4.content.includes('mock-') &&
+        episode4.content.includes('review PASS') &&
+        episode4.content.includes('verify 通过') &&
+        episode4.content.includes('交付：') &&
+        typeof episode4.content_hash === 'string' &&
+        episode4.content_hash.length > 0,
+      JSON.stringify(episodes4.map((row) => row.content)),
+    )
+
+    // S10b: a repeat round with identical facts is a no-op (same hash). The
+    // file rewrite still counts as a change via the mtime fingerprint, so
+    // the round stays eligible — only the dedup keeps the count at 1.
+    await runRoundAndDrain(port, roomS4.id)
+    check(
+      'S10b 同事实重复轮不重复写（hash 去重）',
+      memoriesWhere(roomS4.id).length === 1,
+      JSON.stringify(memoriesWhere(roomS4.id).map((row) => row.content)),
+    )
+
+    // S10c: verify fail / no verdict / pure chat all write nothing.
+    check('S10c 验证失败轮 0 条 episode', memoriesWhere(roomS5.id).length === 0)
+    check('S10c 无结论轮 0 条 episode', memoriesWhere(roomS6.id).length === 0)
+    check('S10c 纯聊天轮 0 条 episode', memoriesWhere(roomS7.id).length === 0)
+
+    // S10d: no verify configured + PASS still closes clean — with the
+    // "未配置验证" wording; no verdict writes nothing.
+    const episodes8a = memoriesWhere(roomS8a.id)
+    check(
+      'S10d 无验证直收轮恰 1 条（写「未配置验证」）',
+      episodes8a.length === 1 && episodes8a[0].content.includes('未配置验证'),
+      JSON.stringify(episodes8a.map((row) => row.content)),
+    )
+    check('S10d 无验证无结论轮 0 条 episode', memoriesWhere(roomS8b.id).length === 0)
+
+    // S10e: the orchestrator's query wiring, through the real server (M3's
+    // lock): an old, out-of-recency memory re-enters the prompt only when
+    // this round's own query hits it. The target is ~280 chars so recency
+    // alone can never fit it; the 12 fillers (~97 chars each) fill the
+    // 800-char room budget without containing the probe phrases.
+    {
+      const room = await makeRoom(port, 's10e-检索注入', repo, '')
+      await makeCharacter(port, room.id, '检索丁', ON_USER_ONLY, '普通角色')
+      await req(port, `/api/rooms/${room.id}/memories`, {
+        method: 'POST',
+        body: JSON.stringify({
+          scope: 'room',
+          content: `旧事实：续传游标的修复记录与验证结论（模拟记忆留存）。${'备'.repeat(240)}`,
+        }),
+      })
+      for (let i = 0; i < 12; i += 1) {
+        await req(port, `/api/rooms/${room.id}/memories`, {
+          method: 'POST',
+          body: JSON.stringify({ scope: 'room', content: `填充${String(i).padStart(2, '0')}：${'水'.repeat(92)}` }),
+        })
+        await sleep(2)
+      }
+      const ask = async (content) => {
+        await postMessage(port, room.id, content)
+        const okIdle = await waitIdle(port, room.id, 40_000)
+        if (!okIdle) throw new Error('s10e room never went idle')
+        await sleep(300)
+        const messages = (await req(port, `/api/rooms/${room.id}/messages?limit=200`)).messages
+        return messages.filter((message) => message.authorType === 'character').at(-1)
+      }
+      const missReply = await ask('模拟记忆 量子纠缠')
+      check('S10e 未命中查询：探针不在注入区', missReply?.content.includes('探针「量子纠缠」未命中'), missReply?.content)
+      const hitReply = await ask('模拟记忆 续传游标')
+      check(
+        'S10e 本轮查询命中 → 窗口外旧条目被注入（探针命中）',
+        hitReply?.content.includes('探针「续传游标」命中'),
+        hitReply?.content,
+      )
+    }
   }
 }
 

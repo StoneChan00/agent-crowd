@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { DATA_DIR } from './paths.ts'
+import { buildRoundEpisode, escapeLike, ftsQuote, planMemoryQuery, type RoundEpisodeFacts } from './memory.ts'
 import { DEFAULT_TRIGGERS,
   type AuthorType,
   type Character,
@@ -177,7 +178,8 @@ db.exec(`
     pinned integer not null default 0,
     use_count integer not null default 0,
     created_at integer not null,
-    last_used_at integer
+    last_used_at integer,
+    content_hash text
   );
   create index if not exists idx_memories_owner on memories(scope, owner_id);
 `)
@@ -229,6 +231,59 @@ addColumnIfMissing('turns', 'task_id', 'task_id text')
 // `approved` (e.g. a local DB last touched by the pre-fix build) is unlocked
 // here. Unconditional on purpose: idempotent, and the table is tiny.
 db.prepare("update tasks set status = 'running' where status = 'approved'").run()
+
+// B04 memory search: old databases predate the hash column — the column
+// comes first, THEN the unique index (creating the index inside the schema
+// block above would crash a pre-B04 boot with a missing-column error).
+addColumnIfMissing('memories', 'content_hash', 'content_hash text')
+// Partial unique index: manually-created memories carry a null hash and stay
+// outside the constraint; automatic episodes dedupe on exact same facts.
+db
+  .prepare(
+    'create unique index if not exists idx_memories_hash on memories(scope, owner_id, content_hash) where content_hash is not null',
+  )
+  .run()
+
+/**
+ * FTS5 availability flag (B04): false → retrieval degrades to LIKE-only.
+ * Startup must NEVER die because the search index failed to build.
+ */
+let memoryFts = false
+
+/**
+ * B04 memory search: an external-content FTS5 table over memories with
+ * trigram tokenization (the only mode that substring-matches CJK). The
+ * triggers are NOT optional — a content table without them matches nothing
+ * and reports no error (silent empty search). The unconditional rebuild on
+ * boot re-indexes rows written before FTS existed; the table is small.
+ */
+function initMemorySearch(): void {
+  try {
+    db.exec(`
+      create virtual table if not exists memories_fts using fts5(
+        content, content='memories', content_rowid='rowid', tokenize='trigram'
+      );
+      create trigger if not exists memories_ai after insert on memories begin
+        insert into memories_fts(rowid, content) values (new.rowid, new.content);
+      end;
+      create trigger if not exists memories_ad after delete on memories begin
+        insert into memories_fts(memories_fts, rowid, content) values('delete', old.rowid, old.content);
+      end;
+      create trigger if not exists memories_au after update on memories begin
+        insert into memories_fts(memories_fts, rowid, content) values('delete', old.rowid, old.content);
+        insert into memories_fts(rowid, content) values (new.rowid, new.content);
+      end;
+    `)
+    db.prepare(`insert into memories_fts(memories_fts) values('rebuild')`).run()
+    memoryFts = true
+  } catch (error) {
+    memoryFts = false
+    console.warn(
+      `[agent-crowd] memory FTS unavailable, retrieval degrades to LIKE: ${error instanceof Error ? error.message : error}`,
+    )
+  }
+}
+initMemorySearch()
 
 const now = () => Date.now()
 
@@ -1369,7 +1424,9 @@ export function getMemory(id: string): Memory | undefined {
 /**
  * Add one memory. Exact-duplicate content (same scope+owner) is a no-op that
  * returns the existing entry with `existed: true`, so "记住" buttons and the
- * future automatic extraction can't pile up copies.
+ * automatic extraction can't pile up copies. B04: a `contentHash` (the
+ * automatic episode's sha256) is checked FIRST — same-facts rounds dedupe
+ * before content even enters the picture.
  */
 export function addMemory(input: {
   scope: MemoryScope
@@ -1378,12 +1435,20 @@ export function addMemory(input: {
   content: string
   sourceRoomId?: string | null
   pinned?: boolean
+  contentHash?: string | null
 }): { memory: Memory; existed: boolean } {
   // Truncate BEFORE the duplicate check: the insert stores the truncated
   // text, so deduping on the raw content made a >500-char message insert a
   // second copy on the second "记住" click (the stored row never matched).
   const content = truncateText(input.content.trim(), 500)
   if (!content) throw new Error('记忆内容不能为空')
+  const contentHash = input.contentHash ? input.contentHash : null
+  if (contentHash) {
+    const byHash = db
+      .prepare('select * from memories where scope = ? and owner_id = ? and content_hash = ?')
+      .get(input.scope, input.ownerId, contentHash)
+    if (byHash) return { memory: mapMemory(byHash), existed: true }
+  }
   const duplicate = db
     .prepare('select * from memories where scope = ? and owner_id = ? and content = ?')
     .get(input.scope, input.ownerId, content)
@@ -1401,8 +1466,8 @@ export function addMemory(input: {
     lastUsedAt: null,
   }
   db.prepare(
-    `insert into memories (id, scope, owner_id, kind, content, source_room_id, pinned, use_count, created_at, last_used_at)
-     values (?, ?, ?, ?, ?, ?, ?, 0, ?, null)`,
+    `insert into memories (id, scope, owner_id, kind, content, source_room_id, pinned, use_count, created_at, last_used_at, content_hash)
+     values (?, ?, ?, ?, ?, ?, ?, 0, ?, null, ?)`,
   ).run(
     memory.id,
     memory.scope,
@@ -1412,26 +1477,109 @@ export function addMemory(input: {
     memory.sourceRoomId,
     memory.pinned ? 1 : 0,
     memory.createdAt,
+    contentHash,
   )
   return { memory, existed: false }
+}
+
+/**
+ * Record one clean-closed round as a room-scope episode (B04): content
+ * assembled by buildRoundEpisode, deduped by its sha256. A no-op returns
+ * `existed: true` — repeat rounds with identical facts add nothing.
+ */
+export function addRoundEpisode(facts: RoundEpisodeFacts): { memory: Memory; existed: boolean } {
+  const { content, hash } = buildRoundEpisode(facts)
+  return addMemory({
+    scope: 'room',
+    ownerId: facts.roomId,
+    kind: 'episode',
+    content,
+    sourceRoomId: facts.roomId,
+    contentHash: hash,
+  })
+}
+
+/**
+ * Search a memory scope with the raw query (B04): ≥3-code-point terms go to
+ * the trigram FTS index, shorter ones to LIKE (with escaping) — the union,
+ * FTS order first. Exported for prompt-check. An empty/short-to-nothing
+ * query yields [] without touching the indexes.
+ */
+export function searchMemoryIds(
+  scope: MemoryScope,
+  ownerId: string,
+  rawQuery: string | null | undefined,
+  limit = 100,
+): string[] {
+  const plan = planMemoryQuery(rawQuery)
+  if (!plan) return []
+  const ids: string[] = []
+  const seen = new Set<string>()
+  if (memoryFts && plan.ftsTerms.length > 0) {
+    try {
+      const match = plan.ftsTerms.map(ftsQuote).join(' ')
+      const rows = db
+        .prepare(
+          `select m.id as id from memories_fts f join memories m on m.rowid = f.rowid
+           where memories_fts match ? and m.scope = ? and m.owner_id = ?
+           order by bm25(memories_fts), m.pinned desc, m.created_at desc limit ?`,
+        )
+        .all(match, scope, ownerId, limit) as { id: string }[]
+      for (const row of rows) {
+        if (!seen.has(row.id)) {
+          seen.add(row.id)
+          ids.push(row.id)
+        }
+      }
+    } catch (error) {
+      // A broken index must not take retrieval down with it — LIKE still runs.
+      console.warn(
+        `[agent-crowd] memory FTS query failed, LIKE only: ${error instanceof Error ? error.message : error}`,
+      )
+    }
+  }
+  if (plan.likeTerms.length > 0) {
+    const clauses = plan.likeTerms.map(() => "content like ? escape '\\'").join(' or ')
+    const rows = db
+      .prepare(
+        `select id from memories where scope = ? and owner_id = ? and (${clauses})
+         order by pinned desc, created_at desc limit ?`,
+      )
+      .all(scope, ownerId, ...plan.likeTerms.map((term) => `%${escapeLike(term)}%`), limit) as { id: string }[]
+    for (const row of rows) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id)
+        ids.push(row.id)
+      }
+    }
+  }
+  return ids
 }
 
 export function updateMemory(
   id: string,
   patch: { content?: string; kind?: MemoryKind; pinned?: boolean },
 ): Memory | undefined {
-  const current = getMemory(id)
-  if (!current) return undefined
+  const raw = db.prepare('select * from memories where id = ?').get(id) as Record<string, unknown> | undefined
+  const current = raw ? mapMemory(raw) : undefined
+  if (!current || !raw) return undefined
+  const contentChanged = patch.content !== undefined && truncateText(patch.content.trim(), 500) !== current.content
   const next: Memory = {
     ...current,
     content: patch.content !== undefined ? truncateText(patch.content.trim(), 500) || current.content : current.content,
     kind: patch.kind !== undefined && MEMORY_KINDS.has(patch.kind) ? patch.kind : current.kind,
     pinned: patch.pinned ?? current.pinned,
   }
-  db.prepare('update memories set content = ?, kind = ?, pinned = ? where id = ?').run(
+  // Editing the content means a human took over this memory (B04): its hash
+  // stops matching the automatic episode, so future rounds with the same
+  // facts write their own entry instead of silently no-oping against the
+  // edited row. Pinned/kind edits keep the hash.
+  const keptHash = typeof raw.content_hash === 'string' ? raw.content_hash : null
+  db.prepare(`update memories set content = ?, kind = ?, pinned = ?, content_hash = ? where id = ?`).run(
     next.content,
     next.kind,
     next.pinned ? 1 : 0,
+    contentChanged ? null : keptHash,
     id,
   )
   return next
@@ -1453,19 +1601,34 @@ export function touchMemories(ids: string[]): void {
  * Pick which memories make it into the prompt: pinned entries always ride
  * along, the rest fill the remaining budget newest-first. Hard budgets keep
  * memory from crowding out the transcript (see docs/memory-plan.md).
+ *
+ * B04 retrieval ranking (optional `query`): pinned (recency) → search hits
+ * (FTS/LIKE order) → the rest (recency). Hits outside the `listMemories`
+ * window are dropped rather than re-queried — the recency list is the
+ * universe. No query = the pre-B04 behavior, verbatim.
  */
 export function pickMemoriesForPrompt(
   identityId: string | null,
   roomId: string,
   budgets: { identity: number; room: number } = { identity: 1_200, room: 800 },
+  query?: string | null,
 ): { identity: Memory[]; room: Memory[] } {
-  const pick = (scope: MemoryScope, ownerId: string, budget: number): Memory[] => {
+  const pick = (scope: MemoryScope, ownerId: string, budget: number, rawQuery: string | null | undefined): Memory[] => {
     if (!ownerId) return []
     const all = listMemories(scope, ownerId)
+    let ranked = all
+    if (rawQuery !== undefined && rawQuery !== null) {
+      const hitIds = new Set(searchMemoryIds(scope, ownerId, rawQuery))
+      const pinned = all.filter((memory) => memory.pinned)
+      const unpinned = all.filter((memory) => !memory.pinned)
+      const hits = unpinned.filter((memory) => hitIds.has(memory.id))
+      const rest = unpinned.filter((memory) => !hitIds.has(memory.id))
+      ranked = [...pinned, ...hits, ...rest]
+    }
     const chosen: Memory[] = []
     let used = 0
-    for (const memory of all) {
-      // all is pinned-first already; only stop skipping once past the pinned block
+    for (const memory of ranked) {
+      // ranked is pinned-first already; only stop skipping once past the pinned block
       if (!memory.pinned && used + memory.content.length > budget) continue
       chosen.push(memory)
       used += memory.content.length
@@ -1474,8 +1637,8 @@ export function pickMemoriesForPrompt(
     return chosen
   }
   return {
-    identity: identityId ? pick('identity', identityId, budgets.identity) : [],
-    room: pick('room', roomId, budgets.room),
+    identity: identityId ? pick('identity', identityId, budgets.identity, query) : [],
+    room: pick('room', roomId, budgets.room, query),
   }
 }
 

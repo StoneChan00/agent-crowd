@@ -79,7 +79,22 @@ export const mockAdapter: HarnessAdapter = {
       }
       const identityCount = countSection('【你的长期记忆】')
       const roomCount = countSection('【房间共享记忆】')
-      const reply = `（mock 模式）记忆注入：长期 ${identityCount} 条，共享 ${roomCount} 条`
+      // B04 retrieval probe: "模拟记忆 <词>" additionally reports whether
+      // that probe term landed in the INJECTED room-memory section — the
+      // server-side lock for the orchestrator's query wiring (a hit
+      // re-ranks an out-of-recency entry into the prompt; a miss must not).
+      const sectionText = (label: string): string => {
+        const at = input.prompt.indexOf(label)
+        if (at < 0) return ''
+        const rest = input.prompt.slice(at + label.length)
+        const end = rest.indexOf('\n【')
+        return end > 0 ? rest.slice(0, end) : rest
+      }
+      const probe = lastUser.match(/模拟记忆[：:\s]+(\S+)/)?.[1] ?? ''
+      const probeNote = probe
+        ? `，探针「${probe}」${sectionText('【房间共享记忆】').includes(probe) ? '命中' : '未命中'}`
+        : ''
+      const reply = `（mock 模式）记忆注入：长期 ${identityCount} 条，共享 ${roomCount} 条${probeNote}`
       for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
         if (input.signal.aborted) {
           return { text: reply, exitCode: 130, durationMs: Date.now() - started, error: '已停止' }
