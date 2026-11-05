@@ -26,6 +26,14 @@ export const mockAdapter: HarnessAdapter = {
 
   async run(input: RunInput): Promise<RunOutput> {
     const started = Date.now()
+    // Test seam for task-check T15 (B03 review 3): a persona carrying
+    // MOCK-崩溃 makes the ADAPTER ITSELF throw — exercising the scheduling-
+    // exception path (missing CLI binary, mkdirSync EEXIST), which never
+    // reaches the output.error handling. Deliberately first: the crash must
+    // not be preempted by any other seam.
+    if (input.character.persona.includes('MOCK-崩溃')) {
+      throw new Error('boom（模拟调度崩溃）')
+    }
     // Steer notes render as `用户（中途补充给 X）: …`, so allow a suffix
     // between 用户 and the colon — the steer rerun must see the newest line.
     const lastUser = [...input.prompt.matchAll(/\] 用户[^:\n]*: ([^\n]*)/g)].pop()?.[1] ?? ''

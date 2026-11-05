@@ -223,6 +223,13 @@ addColumnIfMissing('sessions', 'consumed_seq', 'consumed_seq integer not null de
 // the card id so the round settlement can write the card's state back.
 addColumnIfMissing('turns', 'task_id', 'task_id text')
 
+// Task cards (B03 review 1): approval writes `running` synchronously — the
+// fleeting `approved` state is no longer produced and had no exit (a swept
+// queued turn locked the card out of every action). Any row still sitting in
+// `approved` (e.g. a local DB last touched by the pre-fix build) is unlocked
+// here. Unconditional on purpose: idempotent, and the table is tiny.
+db.prepare("update tasks set status = 'running' where status = 'approved'").run()
+
 const now = () => Date.now()
 
 /* ------------------------------------------------------------------ rooms */

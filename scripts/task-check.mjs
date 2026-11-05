@@ -28,6 +28,9 @@
  *       be re-pointed (content fields stay locked), re-dispatch finishes (5)
  *   T14 errored round: card settles running + result=error (never done),
  *       the auto-retry turns keep the task_id link, re-dispatch works (3)
+ *   T15 scheduling exception: the adapter itself throws (missing-CLI /
+ *       mkdir-EEXIST shape) — card settles running + result=error, the
+ *       「回合调度异常」notice fires, re-dispatch works (3)
  *
  * Server scenarios boot one real server (AC_DATA_DIR on a temp dir, mock
  * harness only); T9 uses a real git repo as the room's working dir so the
@@ -577,13 +580,48 @@ try {
     erroredM.status === 'running' && erroredM.result === 'error' && erroredM.doneAt === null,
     JSON.stringify({ status: erroredM.status, result: erroredM.result, doneAt: erroredM.doneAt }),
   )
+  // Filter by task_id, not position: the retry policy (how many error turns
+  // the chat round produces) must not make this assertion drift.
+  const taskTurnsM = turnsM.filter((turn) => turn.task_id === taskM.id)
   check(
     'T14 重试链的 turn 也带 task_id（重启不丢关联）',
-    turnsM.length === 4 && turnsM.slice(2).every((turn) => turn.task_id === taskM.id),
+    taskTurnsM.length >= 2 && taskTurnsM.every((turn) => turn.status === 'error'),
     JSON.stringify(turnsM.map((turn) => [turn.status, turn.task_id])),
   )
   const dispatchM = await req(port, `/api/tasks/${taskM.id}/dispatch`, { method: 'POST' })
   check('T14 出错卡片可重新派发', dispatchM.status === 'running', dispatchM.status)
+
+  /* T15 — a scheduling EXCEPTION (the adapter itself throwing) must not
+     settle done either. (B03 review 3: the catch path never reached the
+     output.error handling, so a crashed turn left lastTurnOutcome at its
+     default 'ok' — missing CLI binaries and mkdirSync EEXIST land here.) */
+  const roomN = await makeRoom(port, 't15-调度崩溃', plainWork)
+  const workerN = await makeCharacter(port, roomN.id, '戊', 'MOCK-崩溃')
+  const taskN = await createTask(port, roomN.id, {
+    title: 'T15-会崩溃的卡',
+    what: '适配器直接抛异常，不走 output.error 路径。',
+    why: '',
+    acceptance: 'ACC-N：崩溃不假 done',
+    assigneeId: workerN.id,
+  })
+  await req(port, `/api/tasks/${taskN.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'approved' }) })
+  await waitIdle(port, roomN.id, 40_000)
+  const crashedN = await getTask(port, taskN.id)
+  const turnsN = turnRows(dir, 'room_id = ?', roomN.id)
+  check(
+    'T15 调度异常（adapter throw）→ 卡片不 done（running + result=error）',
+    crashedN.status === 'running' && crashedN.result === 'error' && crashedN.doneAt === null,
+    JSON.stringify({ status: crashedN.status, result: crashedN.result, doneAt: crashedN.doneAt }),
+  )
+  check(
+    'T15 turn 行 status=error 且调度异常已播报',
+    turnsN.length === 1 &&
+      turnsN[0].status === 'error' &&
+      messageRows(dir, "room_id = ? and content like '%回合调度异常%'", roomN.id).length === 1,
+    JSON.stringify(turnsN.map((turn) => turn.status)),
+  )
+  const dispatchN = await req(port, `/api/tasks/${taskN.id}/dispatch`, { method: 'POST' })
+  check('T15 崩溃卡片可重新派发', dispatchN.status === 'running', dispatchN.status)
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

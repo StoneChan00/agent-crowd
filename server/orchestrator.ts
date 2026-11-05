@@ -827,6 +827,12 @@ async function pump(roomId: string): Promise<void> {
   let activeCharacterName = '未知角色'
   let activeHarness: HarnessKind | undefined = undefined
   let consumed = false
+  // Round identity for the catch handler (B03 review 3): a scheduling
+  // exception must leave its round's outcome as 'error', or the task card
+  // that round executes would settle as done on a crashed turn. Hoisted for
+  // the same reason as activeTurnId — the catch cannot see try-scoped vars.
+  let activeRoundId: string | null = null
+  let activeIsSummary = false
   try {
     const room = db.getRoom(roomId)
     if (!room) return
@@ -892,6 +898,8 @@ async function pump(roomId: string): Promise<void> {
     }
     const turnId = item.turnId
     activeTurnId = turnId
+    activeRoundId = item.roundId ?? null
+    activeIsSummary = item.isRoundSummary ?? false
     const controller = new AbortController()
     const replay: TurnReplay = { text: '', thinking: [], tools: [] }
     active.set(roomId, {
@@ -1258,6 +1266,16 @@ async function pump(roomId: string): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error)
     console.error(`[agent-crowd] pump(${roomId}) failed:`, reason)
     if (activeTurnId !== null) {
+      // A crashed turn is an errored outcome (B03 review 3): anything that
+      // ESCAPES the adapter or the scheduling around it — a missing CLI
+      // binary throwing inside run(), mkdirSync EEXIST on a cwd pointing at
+      // a file, a snapshot failure — never reaches the output.error branch
+      // above, and without this the round would settle its task card as
+      // done on a crashed turn. Round identity re-checked live: if the
+      // entry was replaced mid-crash, the old round never settles (the card
+      // stays running for a re-dispatch — the safe direction).
+      const round = rounds.get(roomId)
+      if (round && round.roundId === activeRoundId && !activeIsSummary) round.lastTurnOutcome = 'error'
       // Best-effort state repair — the db may itself be what's broken, so
       // each step is guarded; a second throw here would defeat the handler.
       try {

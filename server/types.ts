@@ -244,9 +244,11 @@ export type TurnStatus = 'queued' | 'running' | 'done' | 'error' | 'stopped'
 
 /**
  * Task-card lifecycle (B03): a proposed unit of work a human approves before
- * anything runs. `approved` is the fleeting "approved but the first turn
- * hasn't started yet" state; the SOP gate blocking a round leaves the card
- * `running` with `result='blocked'` so it can be re-dispatched.
+ * anything runs. Approval writes `running` SYNCHRONOUSLY — the old fleeting
+ * `approved` state is no longer produced (it had no exit when a queued turn
+ * was swept; a boot migration flips any legacy row). The SOP gate blocking a
+ * round leaves `running` with `result='blocked'`; a crashed or errored turn
+ * leaves `running` with `result='error'` — both re-dispatchable.
  */
 export type TaskStatus = 'proposed' | 'approved' | 'running' | 'done' | 'rejected'
 
@@ -268,7 +270,7 @@ export interface Task {
   doneAt: number | null
   /** The round the approval (or re-dispatch) opened — the write-back anchor. */
   roundId: string | null
-  /** Settlement note: 'blocked' when the SOP gate refused to close the round. */
+  /** Settlement note: 'blocked' (SOP gate refused) | 'error' (crashed/errored round); null only on a clean done. */
   result: string | null
 }
 
