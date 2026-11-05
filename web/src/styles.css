@@ -2409,7 +2409,6 @@ select {
   border-color: rgba(249, 115, 22, 0.4);
   background: rgba(249, 115, 22, 0.1);
 }
-.pill-task-approved,
 .pill-task-running {
   color: #d9d2ff;
   border-color: rgba(139, 118, 246, 0.4);

@@ -486,7 +486,7 @@ export default function App() {
               busy={busy}
               activeCharacterId={activeCharacterId}
               queueLength={queue.length}
-              openTaskCount={tasks.filter((task) => task.status === 'proposed' || task.status === 'running' || task.status === 'approved').length}
+              openTaskCount={tasks.filter((task) => task.status === 'proposed' || task.status === 'running').length}
               onStop={stop}
               onClear={clear}
               onEditRoom={() => setRoomForm('edit')}

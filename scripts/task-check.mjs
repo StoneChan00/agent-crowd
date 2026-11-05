@@ -31,6 +31,8 @@
  *   T15 scheduling exception: the adapter itself throws (missing-CLI /
  *       mkdir-EEXIST shape) — card settles running + result=error, the
  *       「回合调度异常」notice fires, re-dispatch works (3)
+ *   T16 boot migration: a preset legacy `approved` row flips to `running`
+ *       on the next server start (1)
  *
  * Server scenarios boot one real server (AC_DATA_DIR on a temp dir, mock
  * harness only); T9 uses a real git repo as the room's working dir so the
@@ -114,7 +116,7 @@ async function bootServer(dataDir) {
           .catch(() => 'wait'),
         new Promise((resolve) => proc.once('exit', (code) => resolve(`dead:${code}`))).then((state) => state),
       ])
-      if (outcome === 'up') return port
+      if (outcome === 'up') return { port, proc }
       if (typeof outcome === 'string' && outcome.startsWith('dead:')) {
         dead = true
         break
@@ -232,7 +234,8 @@ const plainWork = mkdtempSync(join(tmpdir(), 'ac-task-w-'))
 tempDirs.push(plainWork)
 
 try {
-  const port = await bootServer(dir)
+  const boot = await bootServer(dir)
+  const port = boot.port
 
   /* T1 — create without approve: nothing runs, nothing is announced. */
   const roomA = await makeRoom(port, 't1-建卡', plainWork)
@@ -613,15 +616,33 @@ try {
     crashedN.status === 'running' && crashedN.result === 'error' && crashedN.doneAt === null,
     JSON.stringify({ status: crashedN.status, result: crashedN.result, doneAt: crashedN.doneAt }),
   )
+  // Filter by task_id, not position or count: the retry policy must not
+  // make this assertion drift (same treatment as T14).
+  const taskTurnsN = turnsN.filter((turn) => turn.task_id === taskN.id)
   check(
     'T15 turn 行 status=error 且调度异常已播报',
-    turnsN.length === 1 &&
-      turnsN[0].status === 'error' &&
+    taskTurnsN.length >= 1 &&
+      taskTurnsN.every((turn) => turn.status === 'error') &&
       messageRows(dir, "room_id = ? and content like '%回合调度异常%'", roomN.id).length === 1,
-    JSON.stringify(turnsN.map((turn) => turn.status)),
+    JSON.stringify(taskTurnsN.map((turn) => turn.status)),
   )
   const dispatchN = await req(port, `/api/tasks/${taskN.id}/dispatch`, { method: 'POST' })
   check('T15 崩溃卡片可重新派发', dispatchN.status === 'running', dispatchN.status)
+
+  /* T16 — boot migration: a legacy `approved` row unlocks on startup
+     (B03 review leftover ②: the migration had only a manual probe). */
+  withDb(dir, (handle) => {
+    handle
+      .prepare(
+        `insert into tasks (id, room_id, title, what, why, acceptance, assignee_id, status, created_at, approved_at, done_at, round_id, result)
+         values ('legacy-approved', ?, 'T16-遗留 approved 行', '内容', '', '', null, 'approved', ?, null, null, null, null)`,
+      )
+      .run(roomA.id, Date.now())
+  })
+  await hardKill(boot.proc)
+  const boot2 = await bootServer(dir)
+  const legacy = await req(boot2.port, '/api/tasks/legacy-approved')
+  check('T16 遗留 approved 行启动即迁移为 running', legacy.status === 'running', legacy.status)
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

@@ -1152,7 +1152,7 @@ function mapTask(row: Record<string, unknown>): Task {
     why: String(row.why ?? ''),
     acceptance: String(row.acceptance ?? ''),
     assigneeId: row.assignee_id === null || row.assignee_id === undefined ? null : String(row.assignee_id),
-    status: status === 'approved' || status === 'running' || status === 'done' || status === 'rejected' ? status : 'proposed',
+    status: status === 'running' || status === 'done' || status === 'rejected' ? status : 'proposed',
     createdAt: Number(row.created_at),
     approvedAt: row.approved_at === null || row.approved_at === undefined ? null : Number(row.approved_at),
     doneAt: row.done_at === null || row.done_at === undefined ? null : Number(row.done_at),

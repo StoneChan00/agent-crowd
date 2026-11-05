@@ -15,7 +15,6 @@ interface TaskPanelProps {
 
 const STATUS_LABELS: Record<TaskStatus, string> = {
   proposed: '待批准',
-  approved: '已批准',
   running: '进行中',
   done: '已完成',
   rejected: '已驳回',
@@ -23,7 +22,6 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
 
 const STATUS_PILLS: Record<TaskStatus, string> = {
   proposed: 'pill pill-task-proposed',
-  approved: 'pill pill-task-approved',
   running: 'pill pill-task-running',
   done: 'pill pill-task-done',
   rejected: 'pill pill-task-rejected',

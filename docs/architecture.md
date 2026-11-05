@@ -54,7 +54,7 @@
 | `turns` | status、output、error、trigger_message_id、pid、hop、override、retry、is_round_summary、round_id、changed | 一次回合一行；**兼任队列**（P0-2）：入队即插入 `queued`，开跑 claim 转 `running`，结束置终态；重启时 running 标 error+收割孤儿，queued 原样恢复。`round_id`/`changed` 为 SOP 门禁证据（P0-3）。契约由 `scripts/queue-check.mjs` 锁定 |
 | `round_checks` | room_id、round_id、kind(review/verify)、verdict(pass/fail)、detail | SOP 门禁审计（P0-3）：每条 REVIEW 结论与每次验证命令的运行结果 |
 | `sessions` | (room_id, character_id) 主键、session_id、consumed_at/consumed_seq、harness/model、turns | 会话续传（P0-1）：每 (房间, 角色) 一行 CLI 会话游标，harness/model 漂移即失效 |
-| `tasks` | title、what、why、acceptance、assignee_id、status、round_id、result | 任务卡（B03）：proposed→approved→running→done 状态机；批准即系统消息 + assignee 回合，回合收尾经 round_id 回写 |
+| `tasks` | title、what、why、acceptance、assignee_id、status、round_id、result | 任务卡（B03）：proposed→running→done 状态机（批准同步段即 running）；批准即系统消息 + assignee 回合，回合收尾经 round_id 回写 |
 | `character_presets` | 同 characters 语义 | 角色库模板；与房间副本是**快照关系**（互不回写） |
 | `identities` | name（唯一索引）、persona | 跨房间身份（同名角色共享） |
 | `memories` | scope(identity/room)、owner_id、pinned、use_count | 长期记忆；`pickMemoriesForPrompt` 预算化注入 |

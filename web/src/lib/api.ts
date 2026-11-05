@@ -8,6 +8,7 @@ import type {
   Message,
   Room,
   Task,
+  TaskStatus,
 } from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -133,8 +134,9 @@ export const api = {
   deleteMemory: (memoryId: string) =>
     request<{ ok: boolean }>(`/api/memories/${memoryId}`, { method: 'DELETE' }),
 
-  /* Task cards (B03): proposed → approved (runs the assignee) → running → done;
-     a gate-blocked round leaves the card running for a re-dispatch. */
+  /* Task cards (B03): proposed → running (approval runs the assignee,
+     synchronously) → done; a gate-blocked or errored round leaves the card
+     running for a re-dispatch. */
   tasks: (roomId: string) => request<{ tasks: Task[] }>(`/api/rooms/${roomId}/tasks`),
 
   createTask: (
@@ -146,8 +148,14 @@ export const api = {
       body: JSON.stringify(input),
     }),
 
-  updateTask: (taskId: string, patch: Partial<Pick<Task, 'title' | 'what' | 'why' | 'acceptance' | 'assigneeId' | 'status'>>) =>
-    request<Task>(`/api/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  /** `status` here is a transition REQUEST, not a state readback: the server
+   * maps 'approved' to the approve action (which writes `running`). */
+  updateTask: (
+    taskId: string,
+    patch: Partial<Pick<Task, 'title' | 'what' | 'why' | 'acceptance' | 'assigneeId'>> & {
+      status?: TaskStatus | 'approved'
+    },
+  ) => request<Task>(`/api/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
 
   dispatchTask: (taskId: string) => request<Task>(`/api/tasks/${taskId}/dispatch`, { method: 'POST' }),
 }

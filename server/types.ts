@@ -244,13 +244,14 @@ export type TurnStatus = 'queued' | 'running' | 'done' | 'error' | 'stopped'
 
 /**
  * Task-card lifecycle (B03): a proposed unit of work a human approves before
- * anything runs. Approval writes `running` SYNCHRONOUSLY — the old fleeting
- * `approved` state is no longer produced (it had no exit when a queued turn
- * was swept; a boot migration flips any legacy row). The SOP gate blocking a
- * round leaves `running` with `result='blocked'`; a crashed or errored turn
- * leaves `running` with `result='error'` — both re-dispatchable.
+ * anything runs. Approval writes `running` SYNCHRONOUSLY — there is no
+ * in-between state (the old fleeting `approved` had no exit when a queued
+ * turn was swept; a boot migration flips any legacy row to `running`). The
+ * SOP gate blocking a round leaves `running` with `result='blocked'`; a
+ * crashed or errored turn leaves `running` with `result='error'` — both
+ * re-dispatchable.
  */
-export type TaskStatus = 'proposed' | 'approved' | 'running' | 'done' | 'rejected'
+export type TaskStatus = 'proposed' | 'running' | 'done' | 'rejected'
 
 export interface Task {
   id: string
