@@ -212,6 +212,8 @@ export interface MessageMeta {
    * got a resume argument. Absent on full-replay turns.
    */
   resume?: boolean
+  /** Task card this system message carries (B03 approval / re-dispatch). */
+  taskId?: string
 }
 
 export type AuthorType = 'user' | 'character' | 'system'
@@ -239,6 +241,36 @@ export interface Message {
 }
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'error' | 'stopped'
+
+/**
+ * Task-card lifecycle (B03): a proposed unit of work a human approves before
+ * anything runs. `approved` is the fleeting "approved but the first turn
+ * hasn't started yet" state; the SOP gate blocking a round leaves the card
+ * `running` with `result='blocked'` so it can be re-dispatched.
+ */
+export type TaskStatus = 'proposed' | 'approved' | 'running' | 'done' | 'rejected'
+
+export interface Task {
+  id: string
+  roomId: string
+  title: string
+  /** What to do — lands verbatim in the approval message, i.e. the prompt. */
+  what: string
+  /** Why it matters — context for the assignee. */
+  why: string
+  /** Acceptance criteria — delivered into the prompt; judged by humans/review. */
+  acceptance: string
+  /** Character this card is assigned to; null once that character is deleted. */
+  assigneeId: string | null
+  status: TaskStatus
+  createdAt: number
+  approvedAt: number | null
+  doneAt: number | null
+  /** The round the approval (or re-dispatch) opened — the write-back anchor. */
+  roundId: string | null
+  /** Settlement note: 'blocked' when the SOP gate refused to close the round. */
+  result: string | null
+}
 
 export interface Turn {
   id: string
@@ -269,6 +301,12 @@ export interface Turn {
    * on turns restored by a reboot (their round was cut) and on legacy rows.
    */
   roundId: string | null
+  /**
+   * Task card this turn executes (B03): set on the approval/dispatch turn
+   * and inherited by every relay hand-off of the same round. Null on
+   * ordinary chat turns.
+   */
+  taskId: string | null
   /**
    * Worktree paths this turn changed, JSON-encoded (P0-3 3a); null = the
    * worktree could not be judged (not a git repo) — treated as "unknown",

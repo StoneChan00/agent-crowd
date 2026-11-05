@@ -26,7 +26,7 @@ import * as orchestrator from './orchestrator.ts'
 import { listMcps } from './mcps.ts'
 import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, WEB_DIST } from './paths.ts'
-import type { Character, HarnessKind, Room } from './types.ts'
+import type { Character, HarnessKind, Room, Task } from './types.ts'
 import { HARNESS_LABELS } from './types.ts'
 import { truncate } from './util.ts'
 
@@ -775,6 +775,174 @@ app.post('/api/rooms/:id/stop', (req, res) => {
   if (!room) return
   orchestrator.stopRoom(room.id)
   res.json({ ok: true })
+})
+
+/* ------------------------------------------------------------------- tasks */
+
+/** Field caps (B03): everything lands truncated in the DB, never in the UI. */
+function normalizeTaskField(value: unknown, max: number): string {
+  return typeof value === 'string' ? truncate(value.trim(), max) : ''
+}
+
+/** The assignee must be an enabled member of this room — checked on create, edit AND approve/dispatch. */
+function requireAssignee(res: Response, roomId: string, assigneeId: string | null): Character | undefined {
+  if (!assigneeId) {
+    fail(res, 400, '卡片没有负责人，请先指定负责人')
+    return undefined
+  }
+  const character = db.getCharacter(assigneeId)
+  if (!character || character.roomId !== roomId) {
+    fail(res, 400, '负责人必须是本房间的角色')
+    return undefined
+  }
+  if (!character.enabled) {
+    fail(res, 400, '负责人已停用，请先启用或换人')
+    return undefined
+  }
+  return character
+}
+
+/**
+ * The card's message body (B03): ONE system message carries the whole card,
+ * and that message IS the prompt truth — no second serialization layer. The
+ * assignee line is display only; the wake is by id (startTaskRound).
+ */
+function taskCardContent(task: Task, assigneeName: string, prefix: string): string {
+  return [
+    `${prefix}${task.title}`,
+    task.what,
+    task.why ? `为什么：${task.why}` : '',
+    task.acceptance ? `验收标准：${task.acceptance}` : '',
+    `负责人：@${assigneeName}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+app.get('/api/rooms/:id/tasks', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  res.json({ tasks: db.listTasks(room.id) })
+})
+
+app.get('/api/tasks/:id', (req, res) => {
+  const task = db.getTask(req.params.id)
+  if (!task) return fail(res, 404, '任务卡不存在')
+  res.json(task)
+})
+
+app.post('/api/rooms/:id/tasks', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  const body = req.body ?? {}
+  const title = normalizeTaskField(body.title, 120)
+  const what = normalizeTaskField(body.what, 4_000)
+  if (!title) return fail(res, 400, '任务标题不能为空')
+  if (!what) return fail(res, 400, '任务内容（要做什么）不能为空')
+  const assigneeId = typeof body.assigneeId === 'string' && body.assigneeId ? body.assigneeId : null
+  if (assigneeId && !requireAssignee(res, room.id, assigneeId)) return
+  const task = db.createTask({
+    roomId: room.id,
+    title,
+    what,
+    why: normalizeTaskField(body.why, 2_000),
+    acceptance: normalizeTaskField(body.acceptance, 2_000),
+    assigneeId,
+  })
+  broadcast(room.id, 'task', { roomId: room.id, task })
+  res.status(201).json(task)
+})
+
+app.patch('/api/tasks/:id', (req, res) => {
+  const task = db.getTask(req.params.id)
+  if (!task) return fail(res, 404, '任务卡不存在')
+  const room = requireRoom(res, task.roomId)
+  if (!room) return
+  const body = req.body ?? {}
+  const nextStatus = typeof body.status === 'string' ? body.status : undefined
+
+  if (nextStatus === 'approved') {
+    if (task.status !== 'proposed') return fail(res, 409, `只有待批准的卡片才能批准（当前：${task.status}）`)
+    const assignee = requireAssignee(res, room.id, task.assigneeId)
+    if (!assignee) return
+    // One synchronous section: state flip → card message → assignee turn.
+    // Rejection and dispatch never reach here twice (409 above), so exactly
+    // one round and one assignee turn per approval — idempotence by state.
+    const approved = db.updateTask(task.id, { status: 'approved', approvedAt: Date.now(), result: null, doneAt: null })
+    const message = db.addMessage({
+      roomId: room.id,
+      authorType: 'system',
+      authorName: '系统',
+      content: taskCardContent(approved ?? task, assignee.name, '【任务卡】'),
+      meta: { generated: true, taskId: task.id },
+    })
+    broadcast(room.id, 'message', { roomId: room.id, message })
+    orchestrator.startTaskRound(room, approved ?? task, message)
+    const updated = db.getTask(task.id)
+    if (updated) broadcast(room.id, 'task', { roomId: room.id, task: updated })
+    return res.json(updated)
+  }
+
+  if (nextStatus === 'rejected') {
+    if (task.status !== 'proposed') return fail(res, 409, `只有待批准的卡片才能驳回（当前：${task.status}）`)
+    // Rejection triggers NOTHING: no round, no message — the card itself
+    // stays queryable (T4).
+    const updated = db.updateTask(task.id, { status: 'rejected' })
+    if (updated) broadcast(room.id, 'task', { roomId: room.id, task: updated })
+    return res.json(updated)
+  }
+
+  if (nextStatus !== undefined) {
+    return fail(res, 409, '状态只能通过批准（approved）或驳回（rejected）变更；进行中的卡片用重新派发')
+  }
+
+  // Plain field edit — only while proposed.
+  if (task.status !== 'proposed') return fail(res, 409, '只有待批准的卡片才能编辑字段')
+  const title = body.title !== undefined ? normalizeTaskField(body.title, 120) : task.title
+  const what = body.what !== undefined ? normalizeTaskField(body.what, 4_000) : task.what
+  if (!title) return fail(res, 400, '任务标题不能为空')
+  if (!what) return fail(res, 400, '任务内容（要做什么）不能为空')
+  const assigneeId =
+    body.assigneeId !== undefined
+      ? typeof body.assigneeId === 'string' && body.assigneeId
+        ? body.assigneeId
+        : null
+      : task.assigneeId
+  if (assigneeId && !requireAssignee(res, room.id, assigneeId)) return
+  const updated = db.updateTask(task.id, {
+    ...(body.title !== undefined ? { title } : {}),
+    ...(body.what !== undefined ? { what } : {}),
+    ...(body.why !== undefined ? { why: normalizeTaskField(body.why, 2_000) } : {}),
+    ...(body.acceptance !== undefined ? { acceptance: normalizeTaskField(body.acceptance, 2_000) } : {}),
+    ...(body.assigneeId !== undefined ? { assigneeId } : {}),
+  })
+  if (updated) broadcast(room.id, 'task', { roomId: room.id, task: updated })
+  res.json(updated)
+})
+
+app.post('/api/tasks/:id/dispatch', (req, res) => {
+  const task = db.getTask(req.params.id)
+  if (!task) return fail(res, 404, '任务卡不存在')
+  const room = requireRoom(res, task.roomId)
+  if (!room) return
+  if (task.status !== 'running') return fail(res, 409, '只有进行中的卡片才能重新派发')
+  const assignee = requireAssignee(res, room.id, task.assigneeId)
+  if (!assignee) return
+  // Clear the blocked verdict and re-send the card: the assignee's next
+  // prompt (often a resumed session) must carry the card again in full.
+  const redispatched = db.updateTask(task.id, { result: null, doneAt: null })
+  const message = db.addMessage({
+    roomId: room.id,
+    authorType: 'system',
+    authorName: '系统',
+    content: taskCardContent(redispatched ?? task, assignee.name, '【任务卡·重新派发】'),
+    meta: { generated: true, taskId: task.id },
+  })
+  broadcast(room.id, 'message', { roomId: room.id, message })
+  orchestrator.startTaskRound(room, redispatched ?? task, message)
+  const updated = db.getTask(task.id)
+  if (updated) broadcast(room.id, 'task', { roomId: room.id, task: updated })
+  res.json(updated)
 })
 
 /* ------------------------------------------------------------------ static */

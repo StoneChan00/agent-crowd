@@ -21,7 +21,7 @@
 │ prompt.ts    │ db.ts                   │ harnesses/         │
 │ 群聊上下文+   │ node:sqlite 单文件       │ 8 个适配器 + 共享   │
 │ 人设+记忆 →   │ WAL 模式                │ 子进程运行时        │
-│ 单回合 prompt │ 8 张表（见下）           │ process.ts/bins.ts │
+│ 单回合 prompt │ 11 张表（见下）          │ process.ts/bins.ts │
 └──────────────┴─────────────────────────┴────────────────────┘
                           │ 一次性子进程
         cannbot / opencode / dsh / hermes / claude / codex / mock / cmd.exe
@@ -53,6 +53,8 @@
 | `messages` | author_type、content、meta(JSON) | 群聊流水；meta 里有 exitCode/pid/error/changed（改动证据） 等 |
 | `turns` | status、output、error、trigger_message_id、pid、hop、override、retry、is_round_summary、round_id、changed | 一次回合一行；**兼任队列**（P0-2）：入队即插入 `queued`，开跑 claim 转 `running`，结束置终态；重启时 running 标 error+收割孤儿，queued 原样恢复。`round_id`/`changed` 为 SOP 门禁证据（P0-3）。契约由 `scripts/queue-check.mjs` 锁定 |
 | `round_checks` | room_id、round_id、kind(review/verify)、verdict(pass/fail)、detail | SOP 门禁审计（P0-3）：每条 REVIEW 结论与每次验证命令的运行结果 |
+| `sessions` | (room_id, character_id) 主键、session_id、consumed_at/consumed_seq、harness/model、turns | 会话续传（P0-1）：每 (房间, 角色) 一行 CLI 会话游标，harness/model 漂移即失效 |
+| `tasks` | title、what、why、acceptance、assignee_id、status、round_id、result | 任务卡（B03）：proposed→approved→running→done 状态机；批准即系统消息 + assignee 回合，回合收尾经 round_id 回写 |
 | `character_presets` | 同 characters 语义 | 角色库模板；与房间副本是**快照关系**（互不回写） |
 | `identities` | name（唯一索引）、persona | 跨房间身份（同名角色共享） |
 | `memories` | scope(identity/room)、owner_id、pinned、use_count | 长期记忆；`pickMemoriesForPrompt` 预算化注入 |
@@ -121,3 +123,14 @@ prompt 走 argv 或临时文件、**不经过 shell**（spawn 无 shell，多行
 3. **resume 参数**（`HarnessAdapter.resumeArgs`，声明即能力）：只有 **--help / live 探针证实过**的 CLI 才声明——claude `--resume <id>`；codex `exec resume <id>`（探针结论：session id 可前置于旗标，假 id 快速失败于 session 查找——正是回退路径要处理的形态；注意 resume 子命令不接受 `--sandbox` 但接受 `-c` 覆盖，非 autoApprove 的续传轮用 `-c sandbox_mode=read-only` 保住只读保证，不交给用户 config 的默认值）；opencode/cannbot `run --session <id>`（两个 CLI 分别验证）。dsh/hermes/custom 一律不声明 → 自动全量重放。`pump` 依 `adapter.resumeArgs` 判定能力，`RunInput.resume` 携带 id；claude/codex/opencode-like 的 argv 组装抽成了纯函数（`buildClaudeArgs`/`buildCodexArgs`/`buildOpencodeLikeArgs`），P3 对**完整 argv**（旗标与位置）断言，不只测 resume 片段——codex 续传轮丢沙箱那类缺陷只能在这里被拦下。
 
 回退与开关：续传失败（零文本）→ 清 session 行 + 全量重跑一次（同一 `item.retry` 环路保护，不叠加二次重试；**不发失败播报**——重跑的回复就是用户要的答案）。出错/停止的回合**不推进游标**（宁可重发，不可漏发）。`AC_SESSION_RESUME=0` 只关「乘坐」不关记账（行照常更新，开关回拨即无缝续传）。成功回合把 `meta.resume` 写进消息。契约由 `scripts/session-check.mjs` 锁定（P1 增量纯函数含同毫秒 tiebreak / P1b 溢出折叠与 32k 收缩纯函数 / P2 隔离与失效含 model 漂移 / P3 argv 片段 + 完整 argv / P4 两轮端到端 / P4b 回合运行中插话——锁住游标不吃中途消息 / P4c 超量增量、4k 折叠与取回窗口溢出 / P5 回退 / P6 开关；`scripts/prompt-check.mjs` 第 4 层锁住 32k 守卫不再切 transcript）；真实 CLI 冒烟（P7，claude 两轮）是人工步骤，结果只进交付汇报。
+
+## 任务卡（B03：提案 → 人工批准 → 执行 → 回写）
+
+组织层的第一块：需求不再只是一条群消息，而是一张有状态、有验收、有负责人的卡。
+
+1. **状态机**：`proposed ──批准──> approved ──首个回合开始──> running ──正常收尾──> done`；`proposed ──驳回──> rejected`（0 回合、0 消息）；SOP 门禁 block（有改动无 PASS / verify fail）→ 保持 `running` 且 `result='blocked'`（可重新派发）。只有 `proposed` 可批准/驳回，重复批准一律 409 且不产生第二个回合（幂等靠状态，不靠去重）。回合被真人消息顶掉或被 stop：卡片保持 `running` 不误判 done，`round_id` 留痕供重新派发。
+2. **批准 = 一条系统消息 + 一个回合**：卡片字段（标题/what/why/验收/负责人）作为一条 `authorType:'system'` 消息发进房间（`meta.taskId` 可反查），`startTaskRound` 只 `enqueue` 指定 assignee（`allowActive`，忙则排队）——负责人是数据字段，不走 @ 文本解析。批准消息本身就在 transcript 里，what/why/验收随消息进入 prompt（含续传增量），**不新增任务序列化层**；任务消息的单条上限放宽到 9000 字符（字段上限之和），否则 4k 聊天上限会把验收标准截掉。驳回不触发任何回合。
+3. **回合关联与回写**：`turns.task_id` 在批准/派发时落库，接力 hand-off 同 round 共享；回合收尾（`maybeStartRoundSummary` 的每个 `rounds.delete` 前）经 `settleTaskByRound` 回写——done（正常收尾含轮末总结）或 blocked（门禁拦截），且先做 round 身份校验（只有当前注册的 round 能结算自己的卡；`round_id` 不匹配的旧轮迟到结算自然落空）。删房间级联删卡；删 assignee 只清指针、卡片保留（重新指定后仍可批准）。
+4. **重新派发**：`POST /api/tasks/:id/dispatch`（仅 `running`）重发一张「【任务卡·重新派发】」消息并开新 round——续传会话的增量里必须重新拿到完整卡片。前端 `TaskPanel`（Modal）+ 头部「任务」按钮（未完成数 badge）+ SSE `task` 事件跨标签页同步。
+
+契约由 `scripts/task-check.mjs` 锁定（T1 建卡不跑 / T2 恰一回合一消息 / T3 字段送达含大卡与续传 / T4 驳回零副作用 / T5 幂等 / T6-T7 级联 / T8 时间戳 / T9 门禁拦截 / T10 重派 / T11 校验）。不做：模型自动拆卡、一卡一房间/线程（B18）、跨房间看板、自动验收判定。

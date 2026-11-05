@@ -8,10 +8,13 @@ interface ChatHeaderProps {
   busy: boolean
   activeCharacterId: string | null
   queueLength: number
+  /** Task cards not yet settled (B03): proposed + running. */
+  openTaskCount: number
   onStop: () => void
   onClear: () => void
   onEditRoom: () => void
   onTogglePanel: () => void
+  onShowTasks: () => void
   /** Mobile only: open the sidebar drawer (room list / library nav). */
   onToggleSidebar: () => void
 }
@@ -22,10 +25,12 @@ export function ChatHeader({
   busy,
   activeCharacterId,
   queueLength,
+  openTaskCount,
   onStop,
   onClear,
   onEditRoom,
   onTogglePanel,
+  onShowTasks,
   onToggleSidebar,
 }: ChatHeaderProps) {
   const active = characters.find((character) => character.id === activeCharacterId)
@@ -87,6 +92,9 @@ export function ChatHeader({
         </button>
         <button className="btn btn-ghost" onClick={onEditRoom} disabled={!room}>
           房间设置
+        </button>
+        <button className="btn btn-ghost" onClick={onShowTasks} disabled={!room} title="任务卡">
+          任务{openTaskCount > 0 ? ` · ${openTaskCount}` : ''}
         </button>
         <button className="btn btn-icon btn-ghost panel-toggle" onClick={onTogglePanel} title="角色面板">
           ◫

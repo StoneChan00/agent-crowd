@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Bootstrap, Character, CharacterPreset, Message, Room } from './types'
+import type { Bootstrap, Character, CharacterPreset, Message, Room, Task } from './types'
 import { api } from './lib/api'
 import { Sidebar } from './components/Sidebar'
 import { ChatHeader } from './components/ChatHeader'
@@ -11,6 +11,7 @@ import { RoomSettings } from './components/RoomSettings'
 import { LibraryView } from './components/LibraryView'
 import { PresetPicker } from './components/PresetPicker'
 import { McpPanel } from './components/McpPanel'
+import { TaskPanel } from './components/TaskPanel'
 
 export default function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -27,6 +28,10 @@ export default function App() {
   // Mobile sidebar drawer (≤820px the sidebar is an overlay instead of a column).
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [showMcps, setShowMcps] = useState(false)
+  // Task cards (B03): owned here so the SSE `task` broadcast keeps every
+  // open tab in sync; the panel is a pure view over this state.
+  const [tasks, setTasks] = useState<Task[]>([])
+  const [showTasks, setShowTasks] = useState(false)
   // Bumped after a successful send/steer: MessageList force-scrolls to the
   // bottom once per bump, so "I sent it but I'm reading history" ends with the
   // view at my message instead of wherever I was scrolled.
@@ -88,6 +93,20 @@ export default function App() {
     setLive(null)
     setBusy(false)
     setActiveCharacterId(null)
+    setTasks([])
+
+    const pullTasks = () => {
+      api
+        .tasks(roomId)
+        .then((data) => {
+          if (cancelled) return
+          setTasks(data.tasks)
+        })
+        .catch(() => {
+          /* the panel retries on open; SSE keeps it live afterwards */
+        })
+    }
+    pullTasks()
 
     // Pull messages on every (re)connect and merge by id: the initial load
     // races against SSE appends, and a reconnect must recover any `message`
@@ -215,6 +234,18 @@ export default function App() {
       })
     })
 
+    // Task-card state changes (B03) — approve/reject/dispatch from any tab,
+    // plus round settlement from the server.
+    source.addEventListener('task', (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as { task: Task }
+      setTasks((current) => {
+        const known = current.some((item) => item.id === payload.task.id)
+        return known
+          ? current.map((item) => (item.id === payload.task.id ? payload.task : item))
+          : [payload.task, ...current]
+      })
+    })
+
     return () => {
       cancelled = true
       source.close()
@@ -265,6 +296,14 @@ export default function App() {
     setView('chat')
     setSidebarOpen(false)
   }
+
+  const refreshTasks = useCallback(() => {
+    if (!roomId) return
+    api
+      .tasks(roomId)
+      .then((data) => setTasks(data.tasks))
+      .catch((error) => setNotice(`读取任务卡失败：${error instanceof Error ? error.message : error}`))
+  }, [roomId])
 
   /* ---------------------------------------------------------- characters */
 
@@ -447,10 +486,12 @@ export default function App() {
               busy={busy}
               activeCharacterId={activeCharacterId}
               queueLength={queue.length}
+              openTaskCount={tasks.filter((task) => task.status === 'proposed' || task.status === 'running' || task.status === 'approved').length}
               onStop={stop}
               onClear={clear}
               onEditRoom={() => setRoomForm('edit')}
               onTogglePanel={() => setPanelOpen((open) => !open)}
+              onShowTasks={() => setShowTasks(true)}
               onToggleSidebar={() => setSidebarOpen((open) => !open)}
             />
 
@@ -498,6 +539,17 @@ export default function App() {
       {notice && <div className="toast">{notice}</div>}
 
       {showMcps && <McpPanel onClose={() => setShowMcps(false)} />}
+
+      {showTasks && room && (
+        <TaskPanel
+          roomId={room.id}
+          roomName={room.name}
+          characters={characters}
+          tasks={tasks}
+          onClose={() => setShowTasks(false)}
+          onRefresh={refreshTasks}
+        />
+      )}
 
       {editingCharacter !== undefined && room && (
         <CharacterEditor

@@ -16,6 +16,7 @@ import { DEFAULT_TRIGGERS,
   type Room,
   type RoundCheck,
   type Session,
+  type Task,
   type Triggers,
   type Turn,
   type TurnStatus,
@@ -118,6 +119,23 @@ db.exec(`
     primary key (room_id, character_id)
   );
 
+  create table if not exists tasks (
+    id text primary key,
+    room_id text not null,
+    title text not null,
+    what text not null,
+    why text not null default '',
+    acceptance text not null default '',
+    assignee_id text,
+    status text not null default 'proposed',
+    created_at integer not null,
+    approved_at integer,
+    done_at integer,
+    round_id text,
+    result text
+  );
+  create index if not exists idx_tasks_room on tasks(room_id, created_at);
+
   create table if not exists character_presets (
     id text primary key,
     name text not null,
@@ -201,6 +219,9 @@ addColumnIfMissing('turns', 'changed', 'changed text')
 // Old rows default to seq 0 — a same-ms sibling of such a cursor re-ships once
 // (re-send, never skip), which is exactly the safe direction.
 addColumnIfMissing('sessions', 'consumed_seq', 'consumed_seq integer not null default 0')
+// Task cards (B03): the approval/dispatch turn and its relay hand-offs carry
+// the card id so the round settlement can write the card's state back.
+addColumnIfMissing('turns', 'task_id', 'task_id text')
 
 const now = () => Date.now()
 
@@ -285,6 +306,8 @@ export function deleteRoom(id: string): void {
   db.prepare("delete from memories where scope = 'room' and owner_id = ?").run(id)
   // Session rows belong to this room's transcript; the room is going away.
   db.prepare('delete from sessions where room_id = ?').run(id)
+  // Task cards belong to the room (B03): no orphans for a deleted room.
+  db.prepare('delete from tasks where room_id = ?').run(id)
   db.prepare('delete from rooms where id = ?').run(id)
 }
 
@@ -598,6 +621,9 @@ export function deleteCharacter(id: string): void {
   // Session continuity (P0-1): the character is gone, its CLI session row
   // must not outlive it (a re-created same-name character is a new agent).
   db.prepare('delete from sessions where character_id = ?').run(id)
+  // Task cards (B03) outlive their assignee — the card keeps its content,
+  // only the pointer clears; a re-assigned card can be approved again.
+  db.prepare('update tasks set assignee_id = null where assignee_id = ?').run(id)
 }
 
 /* --------------------------------------------------------------- messages */
@@ -765,6 +791,7 @@ function mapTurn(row: Record<string, unknown>): Turn {
     retry: Number(row.retry ?? 0) === 1,
     isRoundSummary: Number(row.is_round_summary ?? 0) === 1,
     roundId: row.round_id === null || row.round_id === undefined ? null : String(row.round_id),
+    taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     changed: parseChanged(row.changed),
     startedAt: Number(row.started_at),
     endedAt: row.ended_at === null ? null : Number(row.ended_at),
@@ -784,6 +811,8 @@ export function createTurn(input: {
   isRoundSummary?: boolean
   /** Round this turn belongs to (SOP gate, P0-3); null on restored/legacy rows. */
   roundId?: string | null
+  /** Task card this turn executes (B03); null on ordinary chat turns. */
+  taskId?: string | null
 }): Turn {
   const turn: Turn = {
     id: randomUUID(),
@@ -799,14 +828,15 @@ export function createTurn(input: {
     retry: input.retry ?? false,
     isRoundSummary: input.isRoundSummary ?? false,
     roundId: input.roundId ?? null,
+    taskId: input.taskId ?? null,
     changed: null,
     startedAt: now(),
     endedAt: null,
   }
   db.prepare(
     `insert into turns
-       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, is_round_summary, round_id, changed, started_at, ended_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, is_round_summary, round_id, task_id, changed, started_at, ended_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     turn.id,
     turn.roomId,
@@ -820,6 +850,7 @@ export function createTurn(input: {
     turn.retry ? 1 : 0,
     turn.isRoundSummary ? 1 : 0,
     turn.roundId,
+    turn.taskId,
     null,
     turn.startedAt,
     null,
@@ -1100,6 +1131,138 @@ export function setSession(input: {
  */
 export function clearSession(roomId: string, characterId: string): void {
   db.prepare('delete from sessions where room_id = ? and character_id = ?').run(roomId, characterId)
+}
+
+/* ------------------------------------------------------------------- tasks */
+
+function mapTask(row: Record<string, unknown>): Task {
+  const status = String(row.status)
+  return {
+    id: String(row.id),
+    roomId: String(row.room_id),
+    title: String(row.title),
+    what: String(row.what),
+    why: String(row.why ?? ''),
+    acceptance: String(row.acceptance ?? ''),
+    assigneeId: row.assignee_id === null || row.assignee_id === undefined ? null : String(row.assignee_id),
+    status: status === 'approved' || status === 'running' || status === 'done' || status === 'rejected' ? status : 'proposed',
+    createdAt: Number(row.created_at),
+    approvedAt: row.approved_at === null || row.approved_at === undefined ? null : Number(row.approved_at),
+    doneAt: row.done_at === null || row.done_at === undefined ? null : Number(row.done_at),
+    roundId: row.round_id === null || row.round_id === undefined ? null : String(row.round_id),
+    result: row.result === null || row.result === undefined ? null : String(row.result),
+  }
+}
+
+export function getTask(id: string): Task | undefined {
+  const row = db.prepare('select * from tasks where id = ?').get(id)
+  return row ? mapTask(row) : undefined
+}
+
+/** A room's cards, newest first — the panel reads this list. */
+export function listTasks(roomId: string): Task[] {
+  return db
+    .prepare('select * from tasks where room_id = ? order by created_at desc')
+    .all(roomId)
+    .map(mapTask)
+}
+
+export function createTask(input: {
+  roomId: string
+  title: string
+  what: string
+  why?: string
+  acceptance?: string
+  assigneeId?: string | null
+}): Task {
+  const task: Task = {
+    id: randomUUID(),
+    roomId: input.roomId,
+    title: input.title,
+    what: input.what,
+    why: input.why ?? '',
+    acceptance: input.acceptance ?? '',
+    assigneeId: input.assigneeId ?? null,
+    status: 'proposed',
+    createdAt: now(),
+    approvedAt: null,
+    doneAt: null,
+    roundId: null,
+    result: null,
+  }
+  db.prepare(
+    `insert into tasks (id, room_id, title, what, why, acceptance, assignee_id, status, created_at, approved_at, done_at, round_id, result)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, null, null, null, null)`,
+  ).run(
+    task.id,
+    task.roomId,
+    task.title,
+    task.what,
+    task.why,
+    task.acceptance,
+    task.assigneeId,
+    task.status,
+    task.createdAt,
+  )
+  return task
+}
+
+/**
+ * Field patch for a task card (B03). Transition LEGALITY is the API layer's
+ * job — this writes whatever it is given, like updateCharacter.
+ */
+export function updateTask(
+  id: string,
+  patch: Partial<Pick<Task, 'title' | 'what' | 'why' | 'acceptance' | 'assigneeId' | 'status' | 'approvedAt' | 'doneAt' | 'roundId' | 'result'>>,
+): Task | undefined {
+  const current = getTask(id)
+  if (!current) return undefined
+  const next = { ...current, ...pickDefined(patch) }
+  db.prepare(
+    `update tasks set title = ?, what = ?, why = ?, acceptance = ?, assignee_id = ?, status = ?,
+       approved_at = ?, done_at = ?, round_id = ?, result = ? where id = ?`,
+  ).run(
+    next.title,
+    next.what,
+    next.why,
+    next.acceptance,
+    next.assigneeId,
+    next.status,
+    next.approvedAt,
+    next.doneAt,
+    next.roundId,
+    next.result,
+    id,
+  )
+  return next
+}
+
+/**
+ * The approval/dispatch turn is starting: flip `approved` → `running`
+ * (compare-and-set — a re-dispatch of an already-running card is a no-op
+ * here, and a done card is never resurrected).
+ */
+export function markTaskRunning(id: string): void {
+  db.prepare("update tasks set status = 'running' where id = ? and status = 'approved'").run(id)
+}
+
+/**
+ * Round settlement write-back (B03): the round a card opened has closed.
+ * `done` closes the card; `blocked` keeps it `running` with the gate's
+ * verdict as `result` so the panel offers a re-dispatch. The round_id match
+ * is the identity check: a re-dispatched card points at a NEWER round, and
+ * the old round's late settlement must not overwrite it.
+ */
+export function settleTaskByRound(roundId: string, outcome: 'done' | 'blocked'): void {
+  if (outcome === 'done') {
+    db.prepare(
+      "update tasks set status = 'done', result = null, done_at = ? where round_id = ? and status in ('approved', 'running')",
+    ).run(now(), roundId)
+  } else {
+    db.prepare(
+      "update tasks set status = 'running', result = 'blocked', done_at = null where round_id = ? and status in ('approved', 'running')",
+    ).run(roundId)
+  }
 }
 
 /* -------------------------------------------------------------- identities */

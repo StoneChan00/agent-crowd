@@ -12,7 +12,7 @@ import { buildTurnPromptDetailed } from './prompt.ts'
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
 import { gateDecision, parseReviewVerdict } from './sop.ts'
-import type { Character, HarnessKind, Message, Room, ToolTrace, Turn } from './types.ts'
+import type { Character, HarnessKind, Message, Room, Task, ToolTrace, Turn } from './types.ts'
 import { tail, truncate } from './util.ts'
 
 interface QueueItem {
@@ -48,6 +48,8 @@ interface QueueItem {
    * RoundState (the reboot cut that round).
    */
   roundId?: string | null
+  /** Task card this queued turn executes (B03), inherited by relay hand-offs. */
+  taskId?: string | null
 }
 
 /** Replay buffer for the running turn, so clients that join mid-turn can catch up. */
@@ -113,6 +115,8 @@ interface RoundState {
   verifyState: 'none' | 'running' | 'pass' | 'fail'
   /** The gate notice fires at most once per round — repeat blocks stay silent. */
   gateNoticeSent: boolean
+  /** Task card this round executes (B03); undefined on ordinary chat rounds. */
+  taskId?: string
 }
 
 const queues = new Map<string, QueueItem[]>()
@@ -136,7 +140,7 @@ export function gateActive(roomId: string): boolean {
 }
 
 /** Fresh round state for a new human message / manual run (SOP gate fields included). */
-function newRoundState(): RoundState {
+function newRoundState(taskId?: string): RoundState {
   return {
     roundId: randomUUID(),
     hadTurn: false,
@@ -146,6 +150,7 @@ function newRoundState(): RoundState {
     verdict: 'none',
     verifyState: 'none',
     gateNoticeSent: false,
+    taskId,
   }
 }
 
@@ -264,6 +269,29 @@ export function runCharacter(room: Room, character: Character, override?: string
   const round = newRoundState()
   rounds.set(room.id, round)
   enqueue(room.id, character.id, null, 1, override, { allowActive: true, roundId: round.roundId })
+  void pump(room.id)
+}
+
+/**
+ * Approval / re-dispatch of a task card (B03): open a fresh round bound to
+ * the card and wake ONLY the assignee. The assignee is a data field, not
+ * text — no @ parsing, no "first enabled character" fallback. A busy room
+ * queues the turn behind the running one instead of dropping it.
+ */
+export function startTaskRound(room: Room, task: Task, message: Message): void {
+  const assignee = task.assigneeId ? db.getCharacter(task.assigneeId) : undefined
+  if (!task.assigneeId || !assignee) return
+  chains.set(room.id, { limitNoticeSent: false })
+  const round = newRoundState(task.id)
+  rounds.set(room.id, round)
+  // The card's round anchor — settlement writes back through this id, and a
+  // re-dispatch repoints it before the old round can settle late.
+  db.updateTask(task.id, { roundId: round.roundId })
+  enqueue(room.id, task.assigneeId, message.id, 1, undefined, {
+    allowActive: true,
+    roundId: round.roundId,
+    taskId: task.id,
+  })
   void pump(room.id)
 }
 
@@ -394,9 +422,9 @@ export function restoreQueues(turns: Turn[]): void {
         continue
       }
       // Restored items keep their persisted scheduling flags (hop/override/
-      // retry/isRoundSummary): a restart must not zero the relay budget,
-      // re-aim a steer, re-arm the retry loop guard, or let a summary turn
-      // start relaying.
+      // retry/isRoundSummary/taskId): a restart must not zero the relay
+      // budget, re-aim a steer, re-arm the retry loop guard, let a summary
+      // turn start relaying, or drop a task card's association.
       queue.push({
         turnId: turn.id,
         characterId: turn.characterId,
@@ -406,6 +434,7 @@ export function restoreQueues(turns: Turn[]): void {
         retry: turn.retry || undefined,
         isRoundSummary: turn.isRoundSummary || undefined,
         roundId: turn.roundId,
+        taskId: turn.taskId,
       })
     }
     if (queue.length === 0) continue
@@ -450,7 +479,7 @@ function enqueue(
   triggerMessageId: string | null,
   hop: number,
   override?: string,
-  options?: { allowActive?: boolean; retry?: boolean; isRoundSummary?: boolean; roundId?: string | null },
+  options?: { allowActive?: boolean; retry?: boolean; isRoundSummary?: boolean; roundId?: string | null; taskId?: string | null },
 ): boolean {
   const queue = queues.get(roomId) ?? []
   // Relay hand-offs dedupe against the running character (loop guard);
@@ -473,6 +502,7 @@ function enqueue(
     retry: options?.retry || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
     roundId: options?.roundId ?? null,
+    taskId: options?.taskId ?? null,
   })
   queue.push({
     turnId: turn.id,
@@ -483,6 +513,7 @@ function enqueue(
     retry: options?.retry || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
     roundId: options?.roundId ?? null,
+    taskId: options?.taskId ?? null,
   })
   queues.set(roomId, queue)
   broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
@@ -494,7 +525,8 @@ function enqueue(
  * is computed before the message is stored (see `pump`) so the row can carry
  * `meta.relayTo`, which is what the UI shows as "接力 → …": the browser
  * displays the router's own verdict instead of re-deriving the trigger rules.
- * Hand-offs inherit the triggering turn's roundId — one round, one gate.
+ * Hand-offs inherit the triggering turn's roundId — one round, one gate —
+ * and its taskId (B03): a relayed reviewer works the same card.
  */
 function enqueueFollowers(
   roomId: string,
@@ -502,8 +534,9 @@ function enqueueFollowers(
   followers: Character[],
   nextHop: number,
   roundId: string | null,
+  taskId: string | null,
 ): void {
-  for (const character of followers) enqueue(roomId, character.id, messageId, nextHop, undefined, { roundId })
+  for (const follower of followers) enqueue(roomId, follower.id, messageId, nextHop, undefined, { roundId, taskId })
 }
 
 /**
@@ -608,6 +641,19 @@ function sendGateNotice(roomId: string, content: string): void {
 }
 
 /**
+ * Task-card settlement (B03): write the card's state back when the round it
+ * opened closes. Round identity first (the P0-3 discipline): only the round
+ * CURRENTLY registered under this room may settle — a replaced entry (new
+ * human message, re-dispatch) never writes, so a displaced card keeps
+ * `running` for its re-dispatch instead of being falsely closed.
+ */
+function settleTaskForRound(roomId: string, round: RoundState, outcome: 'done' | 'blocked'): void {
+  if (!round.taskId) return
+  if (rounds.get(roomId) !== round) return
+  db.settleTaskByRound(round.roundId, outcome)
+}
+
+/**
  * Round-end summary: called from pump()'s empty-queue branch, i.e. the
  * moment a round that ran at least one turn has nothing left to run —
  * with the SOP gate (P0-3 3c) in front of it: a round that changed the
@@ -636,6 +682,11 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   }
   if (!round.hadTurn || round.summarizing) {
     // Nothing to summarize (or the summary already ran): close the round.
+    // The summarizing branch is the summary's own settlement closing the
+    // loop — the card's round finished normally (B03). A round that never
+    // ran anything (assignee vanished before the turn started) leaves its
+    // card `running` for a re-dispatch instead of falsely closing it.
+    if (round.summarizing) settleTaskForRound(roomId, round, 'done')
     rounds.delete(roomId)
     return false
   }
@@ -668,7 +719,10 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
         )
       }
       // No summary, no re-queue: the next human/character message starts the
-      // next round (deliberate — auto-requeue would gate-loop forever).
+      // next round (deliberate — auto-requeue would gate-loop forever). The
+      // card stays `running` with `result='blocked'` (B03) so the panel
+      // offers a re-dispatch instead of a false done.
+      settleTaskForRound(roomId, round, 'blocked')
       rounds.delete(roomId)
       return false
     }
@@ -698,6 +752,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
             `🚧 SOP 门禁：验证命令未通过（exit ${result.exitCode ?? 'spawn-error'}${result.timedOut ? '，运行超时被终止' : ''}），本轮不做轮末总结。输出尾部：\n${tail(result.output.trim() || '（无输出）', VERIFY_DETAIL_CHARS)}`,
           )
         }
+        settleTaskForRound(roomId, round, 'blocked')
         rounds.delete(roomId)
         return false
       }
@@ -710,6 +765,9 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
 
   const summarizers = db.listCharacters(roomId).filter((character) => character.enabled && character.triggers.onRoundEnd)
   if (summarizers.length === 0) {
+    // No summarizer configured: the round still closed normally — the card
+    // settles done (B03).
+    settleTaskForRound(roomId, round, 'done')
     rounds.delete(roomId)
     return false
   }
@@ -732,6 +790,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   }
   if (!queued) {
     // Every summarizer vanished mid-flight (deleted/disabled): close the round.
+    settleTaskForRound(roomId, round, 'done')
     rounds.delete(roomId)
     return false
   }
@@ -813,6 +872,9 @@ async function pump(roomId: string): Promise<void> {
       void pump(roomId)
       return
     }
+    // The card's first turn is starting: flip approved → running (B03). A
+    // compare-and-set, so re-dispatches of an already-running card no-op.
+    if (item.taskId) db.markTaskRunning(item.taskId)
     const turnId = item.turnId
     activeTurnId = turnId
     const controller = new AbortController()
@@ -1161,7 +1223,7 @@ async function pump(roomId: string): Promise<void> {
         consumedSeq: built.nextCursor.seq,
       })
     }
-    enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null)
+    enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null, item.taskId ?? null)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     console.error(`[agent-crowd] pump(${roomId}) failed:`, reason)

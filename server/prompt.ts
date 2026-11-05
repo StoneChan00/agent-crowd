@@ -11,6 +11,15 @@ import { truncate } from './util.ts'
 export const MAX_MESSAGE_CHARS = 4_000
 
 /**
+ * Per-message cap for task-card messages (B03): the approval message is
+ * operator-authored from per-field caps (title 120 + what 4k + why/acceptance
+ * 2k) and legitimately runs past the chat cap — cutting it at 4k would drop
+ * the acceptance criteria, the one field the assignee must see whole. The
+ * transcript budget (18k) still bounds everything downstream.
+ */
+const TASK_MESSAGE_CHARS = 9_000
+
+/**
  * Whole-transcript budget, filled newest-first. 18k admits four max-length
  * messages plus their header lines — the minimum closing loop
  * (需求 → 修复汇报 → review → 二次修复汇报) must fit uncropped — while
@@ -63,7 +72,8 @@ function speakerLabel(message: Message): string {
 }
 
 function transcriptLine(message: Message): string {
-  const body = truncate(message.content.trim(), MAX_MESSAGE_CHARS)
+  const cap = message.meta?.taskId ? TASK_MESSAGE_CHARS : MAX_MESSAGE_CHARS
+  const body = truncate(message.content.trim(), cap)
   // Change evidence (SOP gate, P0-3 3a): reviewers see what a turn touched
   // without leaving the transcript. Five paths max — the full list lives on
   // the message meta, this is the reviewer's glance line.

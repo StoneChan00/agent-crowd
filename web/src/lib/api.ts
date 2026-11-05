@@ -1,4 +1,14 @@
-import type { Bootstrap, Character, CharacterPreset, HarnessMap, McpMap, Memory, Message, Room } from '../types'
+import type {
+  Bootstrap,
+  Character,
+  CharacterPreset,
+  HarnessMap,
+  McpMap,
+  Memory,
+  Message,
+  Room,
+  Task,
+} from '../types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -122,4 +132,22 @@ export const api = {
 
   deleteMemory: (memoryId: string) =>
     request<{ ok: boolean }>(`/api/memories/${memoryId}`, { method: 'DELETE' }),
+
+  /* Task cards (B03): proposed → approved (runs the assignee) → running → done;
+     a gate-blocked round leaves the card running for a re-dispatch. */
+  tasks: (roomId: string) => request<{ tasks: Task[] }>(`/api/rooms/${roomId}/tasks`),
+
+  createTask: (
+    roomId: string,
+    input: { title: string; what: string; why?: string; acceptance?: string; assigneeId?: string | null },
+  ) =>
+    request<Task>(`/api/rooms/${roomId}/tasks`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  updateTask: (taskId: string, patch: Partial<Pick<Task, 'title' | 'what' | 'why' | 'acceptance' | 'assigneeId' | 'status'>>) =>
+    request<Task>(`/api/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+
+  dispatchTask: (taskId: string) => request<Task>(`/api/tasks/${taskId}/dispatch`, { method: 'POST' }),
 }

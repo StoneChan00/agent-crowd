@@ -9,6 +9,8 @@ export type {
   Message,
   MessageMeta,
   Room,
+  Task,
+  TaskStatus,
   ToolTrace,
   Triggers,
   Turn,

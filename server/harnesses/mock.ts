@@ -143,6 +143,44 @@ export const mockAdapter: HarnessAdapter = {
       }
       return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
+    // Test seam for task-check (B03): persona is the behavior switch, same
+    // convention as the SOP seams below.
+    //   MOCK-任务  → replies TASK-PROMPT-OK iff the prompt carries the card
+    //               (the 【任务卡】 marker AND the acceptance line),
+    //               TASK-PROMPT-MISSING otherwise (T3: field delivery).
+    //   A card whose what contains 返修演练 additionally writes a file and
+    //   ends with a standalone REVIEW: CHANGES, so the SOP gate blocks the
+    //   round (T9: the card must stay running/blocked). The re-dispatch
+    //   message (【任务卡·重新派发】) skips the drill, so the second round
+    //   closes clean (T10: running → done).
+    if (input.character.persona.includes('MOCK-任务')) {
+      const cardInPrompt = input.prompt.includes('【任务卡】') && input.prompt.includes('验收标准：')
+      const drill = input.prompt.includes('返修演练') && !input.prompt.includes('【任务卡·重新派发】')
+      let reply: string
+      if (drill) {
+        const file = `task-${input.character.id.slice(0, 8)}.txt`
+        writeFileSync(join(input.cwd, file), `task drill by ${input.character.name} at ${new Date().toISOString()}\n`)
+        reply = `（mock 模式）任务返修演练：已在工作目录写入 ${file}，改动已提交。\nREVIEW: CHANGES`
+      } else {
+        reply = cardInPrompt
+          ? '（mock 模式）TASK-PROMPT-OK：任务卡字段已完整送达。'
+          : '（mock 模式）TASK-PROMPT-MISSING：任务卡字段未完整送达。'
+      }
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        if (input.signal.aborted) {
+          return { text: reply, exitCode: 130, durationMs: Date.now() - started, error: '已停止' }
+        }
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return {
+        text: reply,
+        exitCode: 0,
+        sessionId: mockSessionId(input.character.id),
+        durationMs: Date.now() - started,
+        tokens: { input: 0, output: reply.length, total: reply.length },
+      }
+    }
     // Test seams for sop-check (SOP gate, P0-3): the character's PERSONA is
     // the behavior switch — one character per role in the fixture, no
     // prompt-text coupling to the user message.
