@@ -8,10 +8,12 @@ import { buildTurnPrompt } from './prompt.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
-import type { Character, HarnessKind, Message, Room, ToolTrace } from './types.ts'
+import type { Character, HarnessKind, Message, Room, ToolTrace, Turn } from './types.ts'
 import { truncate } from './util.ts'
 
 interface QueueItem {
+  /** Turn row this queue entry persists as (turns double as the queue, P0-2). */
+  turnId: string
   characterId: string
   triggerMessageId: string | null
   /** Manual instruction from the "让它发言" button. */
@@ -212,35 +214,119 @@ export function steer(room: Room, target: Character, message: Message): void {
 
   const queued = queue.find((item) => item.characterId === target.id)
   if (queued) {
-    // Already waiting its turn: re-aim the pending item at the steer note.
+    // Already waiting its turn: re-aim the pending item at the steer note,
+    // in memory AND on its turn row (a restart restores the row, so the
+    // re-aim must survive it).
     queued.triggerMessageId = message.id
     queued.override = override
+    db.updateQueuedTurn(queued.turnId, { triggerMessageId: message.id, override })
+    queues.set(room.id, queue)
+    broadcast(room.id, 'queue', { roomId: room.id, characters: queue.map((item) => item.characterId) })
+  } else if (activeIsTarget) {
+    // Kill the in-flight run so the rerun starts right away. The active
+    // entry survives until the aborted run settles, so the rerun has to
+    // bypass enqueue()'s "already active" dedupe and take the head of the
+    // queue (the target was running, so it keeps its position).
+    current.controller.abort()
+    const turn = db.createTurn({
+      roomId: room.id,
+      characterId: target.id,
+      triggerMessageId: message.id,
+      hop: 1,
+      override,
+    })
+    queue.unshift({
+      turnId: turn.id,
+      characterId: target.id,
+      triggerMessageId: message.id,
+      hop: 1,
+      override,
+    })
+    queues.set(room.id, queue)
+    broadcast(room.id, 'queue', { roomId: room.id, characters: queue.map((item) => item.characterId) })
   } else {
-    if (activeIsTarget) {
-      // Kill the in-flight run so the rerun starts right away. The active
-      // entry survives until the aborted run settles, so the rerun has to
-      // bypass enqueue()'s "already active" dedupe and take the head of the
-      // queue (the target was running, so it keeps its position).
-      current.controller.abort()
-      queue.unshift({ characterId: target.id, triggerMessageId: message.id, hop: 1, override })
-    } else {
-      queue.push({ characterId: target.id, triggerMessageId: message.id, hop: 1, override })
-    }
+    // Idle target: wake it like a direct call. allowActive bypasses the
+    // same-character dedupe (unreachable here — that item went through the
+    // `queued` branch); enqueue persists the turn row.
+    enqueue(room.id, target.id, message.id, 1, override, { allowActive: true })
   }
-  queues.set(room.id, queue)
-  broadcast(room.id, 'queue', { roomId: room.id, characters: queue.map((item) => item.characterId) })
   void pump(room.id)
 }
 
 export function stopRoom(roomId: string): void {
   const current = active.get(roomId)
   if (current) current.controller.abort()
+  // Sweep the queued turn rows too (P0-2): without this a hard kill + reboot
+  // would resurrect a round the user asked to silence — 'stopped' rows are
+  // never restored by restoreQueues().
+  db.markQueuedTurnsStopped(roomId, '用户手动停止')
   queues.set(roomId, [])
   chains.delete(roomId)
   // Manual stop = the user asked for silence: close the round without a
   // summary (the aborted turn's settlement re-pumps into an empty queue).
   rounds.delete(roomId)
   broadcast(roomId, 'queue', { roomId, characters: [] })
+}
+
+/**
+ * Boot-time queue restore (P0-2): rehydrate the in-memory queues from the
+ * 'queued' turn rows a hard-killed server left behind, then resume pumping.
+ * Called from index.ts AFTER app.listen — restored items start running the
+ * moment this returns, and that must not outrun the port being up.
+ *
+ * Rows whose room or character is gone (deleted mid-queue, disabled while
+ * waiting) are swept to 'stopped' instead of restored — no resurrecting
+ * runs the live system would have refused to start.
+ *
+ * The restored round starts with `hadTurn: false` on purpose: the reboot
+ * already interrupted the round these items belonged to, so when they drain
+ * there is nothing new to summarize — no summary is fired for pre-restart
+ * activity.
+ */
+export function restoreQueues(turns: Turn[]): void {
+  const byRoom = new Map<string, Turn[]>()
+  for (const turn of turns) {
+    const list = byRoom.get(turn.roomId) ?? []
+    list.push(turn)
+    byRoom.set(turn.roomId, list)
+  }
+  for (const [roomId, roomTurns] of byRoom) {
+    const room = db.getRoom(roomId)
+    const queue: QueueItem[] = []
+    for (const turn of roomTurns) {
+      const character = db.getCharacter(turn.characterId)
+      const reason = !room
+        ? '房间已被删除'
+        : !character
+          ? '角色已被删除'
+          : !character.enabled
+            ? '角色已停用'
+            : null
+      if (reason) {
+        db.updateTurn(turn.id, { status: 'stopped', error: reason, endedAt: Date.now() })
+        continue
+      }
+      // Restored items keep their persisted scheduling flags (hop/override/
+      // retry/isRoundSummary): a restart must not zero the relay budget,
+      // re-aim a steer, re-arm the retry loop guard, or let a summary turn
+      // start relaying.
+      queue.push({
+        turnId: turn.id,
+        characterId: turn.characterId,
+        triggerMessageId: turn.triggerMessageId,
+        hop: turn.hop,
+        override: turn.override ?? undefined,
+        retry: turn.retry || undefined,
+        isRoundSummary: turn.isRoundSummary || undefined,
+      })
+    }
+    if (queue.length === 0) continue
+    queues.set(roomId, queue)
+    chains.set(roomId, { limitNoticeSent: false })
+    rounds.set(roomId, { hadTurn: false, summarizing: false, endReason: 'completed' })
+    broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
+    void pump(roomId)
+  }
 }
 
 /** The part of a message the wake rules actually read (a real row or a not-yet-saved reply). */
@@ -286,7 +372,20 @@ function enqueue(
   // item was already waiting and this call was a silent no-op.
   if (!options?.allowActive && active.get(roomId)?.characterId === characterId) return false
   if (queue.some((item) => item.characterId === characterId)) return false
+  // Persist the entry the moment it enters the queue (turns double as the
+  // queue, P0-2): a hard-killed server restores 'queued' rows on boot, so
+  // pending work survives the restart instead of vanishing with the heap.
+  const turn = db.createTurn({
+    roomId,
+    characterId,
+    triggerMessageId,
+    hop,
+    override,
+    retry: options?.retry || undefined,
+    isRoundSummary: options?.isRoundSummary || undefined,
+  })
   queue.push({
+    turnId: turn.id,
     characterId,
     triggerMessageId,
     hop,
@@ -324,6 +423,9 @@ function budgetExceeded(room: Room, hop: number): boolean {
   const round = rounds.get(room.id)
   if (round) round.endReason = 'limit'
   queues.set(room.id, [])
+  // Same persistence rule as stopRoom: the dropped items must stay dropped
+  // across a restart, or a reboot would re-run a chain the budget just cut.
+  db.markQueuedTurnsStopped(room.id, `本轮接力已达上限（${room.maxHops} 层）`)
   const message = db.addMessage({
     roomId: room.id,
     authorType: 'system',
@@ -424,6 +526,13 @@ async function pump(roomId: string): Promise<void> {
 
     const character = db.getCharacter(item.characterId)
     if (!character || !character.enabled) {
+      // The dequeued turn's row must reach a terminal state too: a 'queued'
+      // row left behind would resurrect this run on the next boot.
+      db.updateTurn(item.turnId, {
+        status: 'stopped',
+        error: !character ? '角色已被删除' : '角色已停用',
+        endedAt: Date.now(),
+      })
       void pump(roomId)
       return
     }
@@ -431,20 +540,32 @@ async function pump(roomId: string): Promise<void> {
     activeCharacterName = character.name
     activeHarness = character.harness
     if (budgetExceeded(room, item.hop)) {
+      // The over-budget item itself is swept to 'stopped' as well —
+      // budgetExceeded already terminal-swept the rest of the queue's rows.
+      db.updateTurn(item.turnId, {
+        status: 'stopped',
+        error: `接力达到上限（hop ${item.hop} > ${room.maxHops} 层）`,
+        endedAt: Date.now(),
+      })
       broadcast(roomId, 'busy', { roomId, busy: false, characterId: null })
       return
     }
 
-    const turn = db.createTurn({
-      roomId,
-      characterId: character.id,
-      triggerMessageId: item.triggerMessageId,
-    })
-    activeTurnId = turn.id
+    // The turn row was persisted as 'queued' at enqueue time (turns double
+    // as the queue, P0-2). Claim it compare-and-set: a false return means
+    // the row is no longer 'queued' (claimed or swept elsewhere — e.g. a
+    // stop racing this pump), so the in-memory entry is dropped rather than
+    // double-run.
+    if (!db.claimTurn(item.turnId)) {
+      void pump(roomId)
+      return
+    }
+    const turnId = item.turnId
+    activeTurnId = turnId
     const controller = new AbortController()
     const replay: TurnReplay = { text: '', thinking: [], tools: [] }
     active.set(roomId, {
-      turnId: turn.id,
+      turnId,
       characterId: character.id,
       controller,
       startedAt: Date.now(),
@@ -456,8 +577,7 @@ async function pump(roomId: string): Promise<void> {
     // round's closing act, not new activity.
     const round = rounds.get(roomId)
     if (round && !round.summarizing && !item.isRoundSummary) round.hadTurn = true
-    db.updateTurn(turn.id, { status: 'running' })
-    broadcast(roomId, 'turn', { roomId, turnId: turn.id, characterId: character.id, status: 'running' })
+    broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'running' })
     broadcast(roomId, 'busy', { roomId, busy: true, characterId: character.id })
 
     const cwd = character.cwd.trim() || room.workingDir
@@ -485,17 +605,17 @@ async function pump(roomId: string): Promise<void> {
       // can show it while the turn runs.
       onSpawn: (pid) => {
         const entry = active.get(roomId)
-        if (entry?.turnId !== turn.id) return
+        if (entry?.turnId !== turnId) return
         entry.pid = pid
         // Also persist on the turn row: a hard-killed server runs no exit
         // hooks, so this pid is the only handle the boot sweep has to reap
         // the orphaned CLI tree afterwards.
         try {
-          db.setTurnPid(turn.id, pid)
+          db.setTurnPid(turnId, pid)
         } catch {
           /* db hiccup; the in-memory pid still works for this session */
         }
-        broadcast(roomId, 'pid', { roomId, turnId: turn.id, characterId: character.id, pid })
+        broadcast(roomId, 'pid', { roomId, turnId, characterId: character.id, pid })
       },
       emit: (event) => {
         if (event.kind === 'text') {
@@ -509,7 +629,7 @@ async function pump(roomId: string): Promise<void> {
         }
         broadcast(roomId, 'delta', {
           roomId,
-          turnId: turn.id,
+          turnId,
           characterId: character.id,
           kind: event.kind,
           text: event.text,
@@ -518,8 +638,8 @@ async function pump(roomId: string): Promise<void> {
     })
 
     if (controller.signal.aborted) {
-      db.updateTurn(turn.id, { status: 'stopped', output: output.text, endedAt: Date.now() })
-      broadcast(roomId, 'turn', { roomId, turnId: turn.id, characterId: character.id, status: 'stopped' })
+      db.updateTurn(turnId, { status: 'stopped', output: output.text, endedAt: Date.now() })
+      broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'stopped' })
       // Keep whatever streamed before the stop: without this the text vanished
       // together with the live buffer. meta.error flags it as incomplete.
       if (output.text.trim()) {
@@ -534,7 +654,7 @@ async function pump(roomId: string): Promise<void> {
           meta: {
             harness: character.harness,
             model: character.model,
-            turnId: turn.id,
+            turnId,
             durationMs: output.durationMs,
             exitCode: output.exitCode,
             pid: output.pid,
@@ -548,13 +668,13 @@ async function pump(roomId: string): Promise<void> {
     }
 
     if (output.error && !output.text.trim()) {
-      db.updateTurn(turn.id, {
+      db.updateTurn(turnId, {
         status: 'error',
         error: output.error,
         output: output.text,
         endedAt: Date.now(),
       })
-      broadcast(roomId, 'turn', { roomId, turnId: turn.id, characterId: character.id, status: 'error' })
+      broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'error' })
       // A turn that died without a single character of text is worth ONE
       // automatic retry only when it also died FAST (isTransientFailure):
       // a transient CLI hiccup / upstream API error surfaces within
@@ -638,7 +758,7 @@ async function pump(roomId: string): Promise<void> {
       meta: {
         harness: character.harness,
         model: character.model,
-        turnId: turn.id,
+        turnId,
         durationMs: output.durationMs,
         exitCode: output.exitCode,
         pid: output.pid,
@@ -652,7 +772,7 @@ async function pump(roomId: string): Promise<void> {
       },
     })
 
-    db.updateTurn(turn.id, {
+    db.updateTurn(turnId, {
       status: output.error ? 'error' : 'done',
       output: content,
       error: output.error ?? null,
@@ -660,7 +780,7 @@ async function pump(roomId: string): Promise<void> {
     })
     broadcast(roomId, 'turn', {
       roomId,
-      turnId: turn.id,
+      turnId,
       characterId: character.id,
       status: output.error ? 'error' : 'done',
     })

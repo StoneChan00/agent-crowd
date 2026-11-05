@@ -14,7 +14,7 @@
     "build": "vite build",
     "start": "tsx server/index.ts",
     "serve": "npm run build && npm start",
-    "test": "node scripts/test-timeout.mjs && node scripts/killtree-check.mjs && node scripts/mention-check.mjs && node scripts/markdown-breaks-check.mjs && node scripts/prompt-check.mjs",
+    "test": "node scripts/test-timeout.mjs && node scripts/killtree-check.mjs && node scripts/mention-check.mjs && node scripts/markdown-breaks-check.mjs && node scripts/prompt-check.mjs && node scripts/queue-check.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "smoke": "node scripts/smoke.mjs",
     "docs:check": "node scripts/devlog-draft.mjs --check"

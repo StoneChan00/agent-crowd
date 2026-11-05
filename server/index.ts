@@ -123,7 +123,14 @@ function longestTemplateLiteral(template: string): string | null {
 }
 
 function recoverInterruptedTurns(): void {
-  const stale = db.recoverInterruptedTurns()
+  // 'running' rows are interrupted and swept below; 'queued' rows are left
+  // untouched and re-queued after listen (orchestrator.restoreQueues) — they
+  // were never started, so their work simply continues instead of dying
+  // with the process (P0-2).
+  const { interrupted: stale, queued } = db.startupRecovery()
+  if (queued.length > 0) {
+    console.log(`[agent-crowd] startup recovery: ${queued.length} queued turn(s) will be restored`)
+  }
   if (stale.length === 0) return
   const byRoom = new Map<string, { count: number; killed: number; skipped: number }>()
   for (const item of stale) {
@@ -779,4 +786,9 @@ app.listen(PORT, HOST, () => {
     console.log(`  ${meta.available ? '✓' : '×'} ${kind.padEnd(9)} ${meta.detail ?? ''}`)
   }
   console.log('')
+  // Restore the queue a hard-killed server left behind (P0-2). AFTER listen
+  // on purpose: restored items start pumping the moment this returns, and
+  // the turns they spawn must not outrun the port they answer through.
+  const queuedTurns = db.listAllQueuedTurns()
+  if (queuedTurns.length > 0) orchestrator.restoreQueues(queuedTurns)
 })

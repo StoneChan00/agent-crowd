@@ -11,7 +11,8 @@
                           │ REST + SSE
 ┌─────────────────────────▼──────────────────────────────────┐
 │ server/index.ts        Express API + SSE 广播 + 静态托管    │
-│   · 启动时 sweep 中断回合、收割孤儿 CLI 树（turn 行里存 pid）│
+│   · 启动 sweep：running 标中断+收割孤儿 CLI 树（存 pid）│
+│   · listen 后恢复 queued 回合（队列持久化 P0-2）           │
 │   · /api/bootstrap /rooms /characters /presets /memories …  │
 ├────────────────────────────────────────────────────────────┤
 │ server/orchestrator.ts 回合编排核心（全部内存态都在这）     │
@@ -32,8 +33,8 @@
    - 用户消息严格按 @ 路由：`@all`/`@所有人` 唤醒全部启用角色；`@名字`/`@别名` 点名；只 @ 了停用角色则发系统提示、不落兜底；没人被 @ 时由第一个启用角色接手（`handleUserMessage`，hop=1）。
    - 角色发言后的接力由触发规则表决定（任何角色发言后 / 指定角色发言后 / 被 @ / 关键词，`shouldWake`），hop 逐层 +1。
    - 特殊入口：手动「▶ 发言」（`runCharacter`）、中途补充 steer（打断在飞回合、保留半截文本，`steer`）。
-2. **入队**（`enqueue`）：同房间串行（同一时刻只有一个角色在跑）；接力对「正在跑的同角色」去重防死循环，显式用户意图（@、▶）则允许排队追加。
-3. **消费**（`pump`）：`createTurn` → `active.set`（AbortController + 流式 replay 缓冲）→ 广播 `turn running`。接力预算 `maxHops` 超限时清队列并发一次系统提示（`budgetExceeded`，按 hop 计深度，@all 全员都是 hop 1）。
+2. **入队**（`enqueue`）：同房间串行（同一时刻只有一个角色在跑）；接力对「正在跑的同角色」去重防死循环，显式用户意图（@、▶）则允许排队追加。**入队即落库**：每条排队项都是一行 `status='queued'` 的 turn（hop/override/retry/isRoundSummary 一并持久化）——队列与回合记录同表，重启后按行恢复（P0-2）。
+3. **消费**（`pump`）：`claimTurn`（compare-and-set `queued`→`running`，防双跑）→ `active.set`（AbortController + 流式 replay 缓冲）→ 广播 `turn running`；角色已删/停用或接力预算 `maxHops` 超限时该行直接置 `stopped`。重启时 `running` 标 error + 收割孤儿进程（宁丢不重），`queued` 原样恢复重跑（restoreQueues 在 listen 后执行，恢复轮不触发轮末总结）。
 4. **组 prompt**（`prompt.ts buildTurnPrompt`）：最近 80 条群聊消息按字符预算（18000 字符、单条截断 4000——完整 review/修复汇报必须整条到达；总预算 32000，溢出时只切头部、【现在轮到你】指令永不丢；override 超长同样按单条上限截断，防其借 tail 保护绕过总上限）重放成时间戳对话 + 成员花名册（名字/别名/harness/模型）+ 人设 + 长期记忆（角色跨房间身份记忆 + 房间共享记忆，带预算防挤占）+ override（steer/手动指令）。契约由 `scripts/prompt-check.mjs` 锁定。
 5. **调 CLI**（`harnesses/*`）：按适配器契约（见下）spawn 子进程；`onSpawn` 把 CLI pid 存进 `active` 和 turn 行（后者供宕机 sweep 收割孤儿）；流式 `emit` text/thinking/tool 增量，经 SSE `delta` 推给前端，同时进 replay 缓冲（中途加入的客户端可追）。
 6. **落库**：
@@ -49,7 +50,7 @@
 | `rooms` | working_dir、max_hops | 每房间一个工作目录、一个接力上限 |
 | `characters` | harness、model、persona、triggers、auto_approve、identity_id、preset_id | 房间内角色副本；`identity_id` 绑定跨房间身份记忆 |
 | `messages` | author_type、content、meta(JSON) | 群聊流水；meta 里有 exitCode/pid/error 等 |
-| `turns` | status、output、error、trigger_message_id、pid | 一次回合一行；running 中 server 被杀 → 启动 sweep 依此收割 |
+| `turns` | status、output、error、trigger_message_id、pid、hop、override、retry、is_round_summary | 一次回合一行；**兼任队列**（P0-2）：入队即插入 `queued`，开跑 claim 转 `running`，结束置终态；重启时 running 标 error+收割孤儿，queued 原样恢复。契约由 `scripts/queue-check.mjs` 锁定 |
 | `character_presets` | 同 characters 语义 | 角色库模板；与房间副本是**快照关系**（互不回写） |
 | `identities` | name（唯一索引）、persona | 跨房间身份（同名角色共享） |
 | `memories` | scope(identity/room)、owner_id、pinned、use_count | 长期记忆；`pickMemoriesForPrompt` 预算化注入 |

@@ -221,6 +221,19 @@ export interface Turn {
   error: string | null
   /** Pid of the CLI process behind this turn; persisted while running so the boot sweep can reap orphaned trees after a hard kill. */
   pid: number | null
+  /**
+   * Relay depth at enqueue time (1 = direct target of a human message / manual
+   * run, +1 per hand-off). Turns double as the queue, so these three
+   * scheduling fields are persisted at enqueue and restored on boot — a
+   * restart must not zero the relay budget or retry a turn twice.
+   */
+  hop: number
+  /** Manual instruction for this turn (steer note / run button / round summary); null = none. */
+  override: string | null
+  /** Loop guard: marks the automatic second attempt so a restart never re-arms it. */
+  retry: boolean
+  /** Round-end summary turns never relay and don't count as round activity. */
+  isRoundSummary: boolean
   startedAt: number
   endedAt: number | null
 }

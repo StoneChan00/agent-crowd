@@ -78,6 +78,10 @@ db.exec(`
     trigger_message_id text,
     output text not null default '',
     error text,
+    hop integer not null default 1,
+    override text,
+    retry integer not null default 0,
+    is_round_summary integer not null default 0,
     started_at integer not null,
     ended_at integer
   );
@@ -151,6 +155,12 @@ addColumnIfMissing('characters', 'identity_id', 'identity_id text')
 addColumnIfMissing('characters', 'preset_id', 'preset_id text')
 // Persisted so the boot sweep can taskkill CLI trees orphaned by a hard kill.
 addColumnIfMissing('turns', 'pid', 'pid integer')
+// Turns double as the queue (P0-2): these scheduling fields are written at
+// enqueue time so a hard-killed server can restore the pending queue on boot.
+addColumnIfMissing('turns', 'hop', 'hop integer not null default 1')
+addColumnIfMissing('turns', 'override', 'override text')
+addColumnIfMissing('turns', 'retry', 'retry integer not null default 0')
+addColumnIfMissing('turns', 'is_round_summary', 'is_round_summary integer not null default 0')
 
 const now = () => Date.now()
 
@@ -619,6 +629,10 @@ function mapTurn(row: Record<string, unknown>): Turn {
     output: String(row.output ?? ''),
     error: row.error === null ? null : String(row.error),
     pid: row.pid === null || row.pid === undefined ? null : Number(row.pid),
+    hop: Number(row.hop ?? 1) || 1,
+    override: row.override === null || row.override === undefined ? null : String(row.override),
+    retry: Number(row.retry ?? 0) === 1,
+    isRoundSummary: Number(row.is_round_summary ?? 0) === 1,
     startedAt: Number(row.started_at),
     endedAt: row.ended_at === null ? null : Number(row.ended_at),
   }
@@ -628,6 +642,13 @@ export function createTurn(input: {
   roomId: string
   characterId: string
   triggerMessageId: string | null
+  /** Relay depth; persisted so a restart restores the budget instead of zeroing it. */
+  hop?: number
+  /** Manual instruction (steer note / run button / round summary text). */
+  override?: string
+  /** Loop-guard flag for the automatic second attempt. */
+  retry?: boolean
+  isRoundSummary?: boolean
 }): Turn {
   const turn: Turn = {
     id: randomUUID(),
@@ -638,12 +659,32 @@ export function createTurn(input: {
     output: '',
     error: null,
     pid: null,
+    hop: input.hop ?? 1,
+    override: input.override ?? null,
+    retry: input.retry ?? false,
+    isRoundSummary: input.isRoundSummary ?? false,
     startedAt: now(),
     endedAt: null,
   }
   db.prepare(
-    'insert into turns (id, room_id, character_id, status, trigger_message_id, output, error, started_at, ended_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  ).run(turn.id, turn.roomId, turn.characterId, turn.status, turn.triggerMessageId, '', null, turn.startedAt, null)
+    `insert into turns
+       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, is_round_summary, started_at, ended_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    turn.id,
+    turn.roomId,
+    turn.characterId,
+    turn.status,
+    turn.triggerMessageId,
+    '',
+    null,
+    turn.hop,
+    turn.override,
+    turn.retry ? 1 : 0,
+    turn.isRoundSummary ? 1 : 0,
+    turn.startedAt,
+    null,
+  )
   return turn
 }
 
@@ -671,28 +712,97 @@ export function listRunningTurns(roomId: string): Turn[] {
     .map(mapTurn)
 }
 
+/** Turns that are still waiting in the queue (turns double as the queue, P0-2). */
+export function listQueuedTurns(roomId: string): Turn[] {
+  return db
+    .prepare("select * from turns where room_id = ? and status = 'queued' order by started_at asc")
+    .all(roomId)
+    .map(mapTurn)
+}
+
+/** Every queued turn across all rooms — the boot-time restore source. */
+export function listAllQueuedTurns(): Turn[] {
+  return db
+    .prepare("select * from turns where status = 'queued' order by started_at asc")
+    .all()
+    .map(mapTurn)
+}
+
+/**
+ * Compare-and-set a queued turn to 'running': exactly one claimant wins, so a
+ * restored in-memory queue can never double-run a row the DB already handed
+ * out. Returns false when the row is no longer 'queued' (claimed elsewhere,
+ * stopped, or already terminal).
+ */
+export function claimTurn(id: string): boolean {
+  return db.prepare("update turns set status = 'running' where id = ? and status = 'queued'").run(id).changes === 1
+}
+
+/**
+ * Re-aim a still-queued turn at a new trigger/override (steer hitting a
+ * waiting item). No-op once the turn has been claimed or ended — the steer
+ * path then falls back to queueing a fresh turn.
+ */
+export function updateQueuedTurn(
+  id: string,
+  patch: { triggerMessageId?: string | null; override?: string | null },
+): boolean {
+  const triggerMessageId = patch.triggerMessageId ?? null
+  const override = patch.override ?? null
+  return (
+    db
+      .prepare("update turns set trigger_message_id = ?, override = ? where id = ? and status = 'queued'")
+      .run(triggerMessageId, override, id).changes === 1
+  )
+}
+
+/**
+ * Terminal-sweep the pending queue rows of a room (user stop, hop limit,
+ * room cleared). Without this a hard kill + reboot would resurrect a round
+ * the user had explicitly silenced — 'stopped' rows are never restored.
+ */
+export function markQueuedTurnsStopped(roomId: string, reason: string): number {
+  return Number(
+    db
+      .prepare(
+        "update turns set status = 'stopped', error = ?, ended_at = ? where room_id = ? and status = 'queued'",
+      )
+      .run(reason, now(), roomId).changes,
+  )
+}
+
 /** Persist the CLI pid on the turn row the moment it spawns (boot sweep handle). */
 export function setTurnPid(id: string, pid: number): void {
   db.prepare('update turns set pid = ? where id = ?').run(pid, id)
 }
 
 /**
- * Boot-time sweep: a hard-killed server (tsx watch reload, crash, reboot)
- * runs no exit hooks, so turns stay 'queued'/'running' in the DB forever and
- * their CLI process trees survive as orphans the stop button can no longer
- * reach. Mark them interrupted and hand the persisted pids back so the
- * caller can taskkill the orphaned trees.
+ * Boot-time sweep (P0-2 split): a hard-killed server (tsx watch reload,
+ * crash, reboot) runs no exit hooks, so turns stay 'running' in the DB
+ * forever and their CLI process trees survive as orphans the stop button can
+ * no longer reach.
+ * - `running` rows are marked interrupted (error) and returned so the caller
+ *   can taskkill the persisted pids. They are NOT re-run — a half-finished
+ *   turn is worse lost than double-run ("宁丢不重").
+ * - `queued` rows are left untouched and returned: they were never started,
+ *   so the caller re-queues them (orchestrator.restoreQueues) after listen
+ *   and the pending work simply continues.
  */
-export function recoverInterruptedTurns(): { roomId: string; characterId: string; pid: number | null }[] {
-  const stale = db
-    .prepare("select * from turns where status in ('queued','running')")
+export function startupRecovery(): { interrupted: Turn[]; queued: Turn[] } {
+  const interrupted = db
+    .prepare("select * from turns where status = 'running'")
     .all()
     .map(mapTurn)
-  if (stale.length === 0) return []
-  db.prepare(
-    "update turns set status = 'error', error = coalesce(error, '服务器重启，回合中断'), ended_at = ? where status in ('queued','running')",
-  ).run(now())
-  return stale.map((turn) => ({ roomId: turn.roomId, characterId: turn.characterId, pid: turn.pid }))
+  if (interrupted.length > 0) {
+    db.prepare(
+      "update turns set status = 'error', error = coalesce(error, '服务器重启，回合中断'), ended_at = ? where status = 'running'",
+    ).run(now())
+  }
+  const queued = db
+    .prepare("select * from turns where status = 'queued' order by started_at asc")
+    .all()
+    .map(mapTurn)
+  return { interrupted, queued }
 }
 
 /* -------------------------------------------------------------- identities */
