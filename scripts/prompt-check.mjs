@@ -290,10 +290,14 @@ const mark = (tag) => `⟪${tag}⟫`
         ]) === '最后一条' &&
         mem.memoryQueryFromMessages([]) === '',
     )
-    // Table-driven cross-check against the gate itself (B04 review 3): for
+    // Table-driven cross-check against the gate itself (B04 review 3/4): for
     // every verdict shape, the gate seeing a verdict must coincide with the
     // stripper removing exactly that line — expectations derive from
     // parseReviewVerdict, not from a hand-listed subset that can drift.
+    // SAMPLE DISCIPLINE (review non-blocking 1): keep every sample short
+    // enough that its verdict sits inside the gate's trailing-5-lines window
+    // — a verdict followed by 6+ more lines is stripped but not gate-seen,
+    // and would break the equivalence on purpose.
     {
       const verdictShapes = [
         'REVIEW: PASS',
@@ -304,12 +308,18 @@ const mark = (tag) => `⟪${tag}⟫`
         '`**REVIEW：CHANGES**`',
         '``REVIEW: PASS``',
         '  REVIEW: PASS  ',
+        '- REVIEW: PASS',
+        '- `REVIEW: PASS`',
+        '1. REVIEW: PASS',
+        '- 复核\n\n    REVIEW: PASS',
         '> REVIEW: PASS',
         '| 门禁 | REVIEW: PASS |',
         'REVIEW: PASSED',
         '我认为 REVIEW: PASS 不合适',
         '```\nREVIEW: PASS\n```',
         '\n    REVIEW: PASS',
+        '<div>\nREVIEW: PASS\n</div>',
+        '> 结论\nREVIEW: PASS',
       ]
       let shapesAligned = true
       let shapeDetail = ''
@@ -329,8 +339,23 @@ const mark = (tag) => `⟪${tag}⟫`
       mem.episodeDelivery('完成\n`REVIEW: PASS`') === '完成' && mem.episodeDelivery('完成\n``REVIEW: PASS``') === '完成',
     )
     check(
-      'R-pure 纯结论消息的交付为空串（含反引号形态）',
-      mem.episodeDelivery('REVIEW: PASS') === '' && mem.episodeDelivery('`REVIEW: PASS`') === '' && mem.episodeDelivery('**REVIEW：CHANGES**') === '',
+      'R-pure 剥离覆盖列表项形态（无序/有序/嵌 code span/列表续行）',
+      mem.episodeDelivery('- REVIEW: PASS') === '' &&
+        mem.episodeDelivery('- `REVIEW: PASS`') === '' &&
+        mem.episodeDelivery('1. REVIEW: PASS') === '' &&
+        mem.episodeDelivery('- 复核\n\n    REVIEW: PASS') === '- 复核',
+    )
+    check(
+      'R-pure 引用块 lazy continuation 与 HTML 块不被误删',
+      mem.episodeDelivery('> 结论\nREVIEW: PASS').includes('REVIEW: PASS') &&
+        mem.episodeDelivery('<div>\nREVIEW: PASS\n</div>').includes('REVIEW: PASS'),
+    )
+    check(
+      'R-pure 纯结论消息的交付为空串（含反引号与列表形态）',
+      mem.episodeDelivery('REVIEW: PASS') === '' &&
+        mem.episodeDelivery('`REVIEW: PASS`') === '' &&
+        mem.episodeDelivery('**REVIEW：CHANGES**') === '' &&
+        mem.episodeDelivery('- REVIEW: PASS') === '',
     )
     const epOther = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['c.ts'], verify: 'pass', delivery: '另一种交付' })
     const epOtherDelivery = mem.buildRoundEpisode({ roomId: 'r', changedPaths: ['a.ts', 'b.ts'], verify: 'pass', delivery: '不同的交付' })

@@ -33,8 +33,8 @@ export const REVIEW_TAIL_LINES = 5
  * gate accepts? Covers the plain form REVIEW_LINE already describes, plus
  * the whole-line CODE SPAN (`` `REVIEW: PASS` `` — agents copy rule 9's
  * example text into backticks; the span's inner text is what the gate
- * reads). PURE line logic, no mdast — memory.ts reuses it so the episode
- * delivery stripper can never drift from the parser a third time.
+ * reads). Used by stripVerdictLines on EXTRACTED paragraph lines, where
+ * mdast has already stripped list markers and code-span backticks.
  */
 export function isVerdictProtocolLine(line: string): boolean {
   const trimmed = line.trim()
@@ -44,41 +44,103 @@ export function isVerdictProtocolLine(line: string): boolean {
 }
 
 /**
+ * A paragraph's extracted lines, each mapped back to the RAW source lines it
+ * came from (B04 review 4). Mirrors paragraphLines' inline walk exactly —
+ * same parts, same order — while tracking positions: text nodes advance one
+ * raw line per embedded newline; an inlineCode node spans start..end raw
+ * lines but yields ONE extracted line (mdast normalizes its internal
+ * newlines to spaces); break nodes end the current extracted line. The
+ * lines array is therefore always identical to paragraphLines' output.
+ */
+function paragraphLineSpans(paragraph: MdNode): { lines: string[]; spans: Array<{ start: number; end: number }> } {
+  let raw = paragraph.position?.start.line ?? 1
+  let current = ''
+  let lineStart = raw
+  const lines: string[] = []
+  const spans: Array<{ start: number; end: number }> = []
+  const finishLine = (): void => {
+    lines.push(current)
+    spans.push({ start: lineStart, end: raw })
+    current = ''
+    lineStart = raw
+  }
+  const walk = (node: MdNode): void => {
+    if (node.type === 'break') {
+      const at = node.position?.start.line ?? raw
+      raw = Math.max(raw, at)
+      finishLine()
+      raw = Math.max(raw, at + 1)
+      lineStart = raw
+      return
+    }
+    if (NOT_A_CALL.has(node.type)) {
+      if (node.type === 'inlineCode' && node.value) current += node.value
+      const end = node.position?.end.line
+      if (end && end > raw) raw = end
+      return
+    }
+    if (node.type === 'text') {
+      const value = node.value ?? ''
+      // Soft breaks live INSIDE text values in this mdast build (probe:
+      // 'a\nb' is one text node) — each embedded newline ends the extracted
+      // line and advances the raw line, exactly like a break node would.
+      value.split('\n').forEach((segment, index) => {
+        if (index > 0) {
+          finishLine()
+          raw += 1
+          lineStart = raw
+        }
+        current += segment
+      })
+      const end = node.position?.end.line
+      if (end && end > raw) raw = end
+      return
+    }
+    for (const child of node.children ?? []) walk(child)
+  }
+  for (const child of paragraph.children ?? []) walk(child)
+  finishLine()
+  return { lines, spans }
+}
+
+/**
  * Strip gate-protocol verdict lines from raw message text (B04: the episode
- * memory's delivery). Whole-line verdicts in every shape the gate accepts
- * are removed; lines inside FENCED (```/~~~) or INDENTED (4+ spaces after a
- * blank line) code blocks are KEPT — quoted code is content the gate never
- * reads as a verdict, so it must not vanish from the delivery either.
- * Shares isVerdictProtocolLine with the parser; blockquotes and tables never
- * match the line shape and pass through untouched.
+ * memory's delivery). One mdast pass, the SAME traversal shape the verdict
+ * extractor reads (paragraphs, including inside list items — the gate
+ * accepts `- REVIEW: PASS`; blockquotes, tables, headings, fenced/indented
+ * code and html contribute nothing and are kept verbatim as content). Each
+ * extracted line that is a verdict marks its raw line span for removal —
+ * list markers, code-span backticks and multi-line code spans included via
+ * the position mapping, so the stripping judgment can never drift from the
+ * parser's again.
  */
 export function stripVerdictLines(text: string): string {
-  const kept: string[] = []
-  let fence: { marker: string; length: number } | null = null
-  let inIndentedCode = false
-  let prevBlank = true
-  for (const raw of text.split('\n')) {
-    const fenceHit = /^ {0,3}(`{3,}|~{3,})/.exec(raw)
-    if (fence) {
-      kept.push(raw)
-      if (fenceHit && fenceHit[1][0] === fence.marker && fenceHit[1].length >= fence.length && raw.trim() === fenceHit[1].trim()) {
-        fence = null
-      }
-    } else if (fenceHit) {
-      fence = { marker: fenceHit[1][0], length: fenceHit[1].length }
-      kept.push(raw)
-    } else if (inIndentedCode) {
-      kept.push(raw)
-      if (raw.trim() !== '' && !/^[ \t]{4,}/.test(raw)) inIndentedCode = false
-    } else if (prevBlank && /^[ \t]{4,}\S/.test(raw)) {
-      inIndentedCode = true
-      kept.push(raw)
-    } else if (!isVerdictProtocolLine(raw)) {
-      kept.push(raw)
+  const drop = new Set<number>()
+  const root = fromMarkdown(text, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  }) as unknown as MdNode
+  const collect = (node: MdNode): void => {
+    if (node.type === 'paragraph') {
+      const { lines, spans } = paragraphLineSpans(node)
+      lines.forEach((line, index) => {
+        if (!isVerdictProtocolLine(line)) return
+        for (let raw = spans[index].start; raw <= spans[index].end; raw += 1) drop.add(raw)
+      })
+      return
     }
-    prevBlank = raw.trim() === ''
+    if (node.type === 'list' || node.type === 'listItem') {
+      for (const child of node.children ?? []) collect(child)
+      return
+    }
+    // Everything else (blockquote, table, heading, code, html, ...) is
+    // quoted or structural text — content, never stripped.
   }
-  return kept.join('\n')
+  for (const child of root.children ?? []) collect(child)
+  return text
+    .split('\n')
+    .filter((_, index) => !drop.has(index + 1))
+    .join('\n')
 }
 
 /** Minimal mdast shape — enough for the extraction pass (same trick as mentions.ts). */
@@ -86,6 +148,7 @@ interface MdNode {
   type: string
   value?: string
   children?: MdNode[]
+  position?: { start: { line: number }; end: { line: number } }
 }
 
 /**

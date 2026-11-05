@@ -812,6 +812,25 @@ async function scenarioEndToEnd() {
         JSON.stringify(episodes.map((row) => row.content)),
       )
     }
+
+    // S10g-c (B04 review 4): a list-item verdict ("- REVIEW: PASS" — the
+    // gate accepts listItem paragraphs) must not become the delivery; the
+    // reviewer's prose line above the bullet survives as the delivery.
+    {
+      const room = await makeSopRoom(port, repo, 's10g-列表结论', {
+        verifyCommand: 'exit 0',
+        reviewerPersona: 'MOCK-列表结论',
+      })
+      await runRoundAndDrain(port, room.id)
+      const episodes = memoriesWhere(room.id)
+      check(
+        'S10g-c 列表项 verdict 不成为交付（交付是结论行之外的正文）',
+        episodes.length === 1 &&
+          episodes[0].content.includes('复核完毕，结论如下：') &&
+          !episodes[0].content.includes('REVIEW'),
+        JSON.stringify(episodes.map((row) => row.content)),
+      )
+    }
   }
 }
 

@@ -204,6 +204,17 @@ export const mockAdapter: HarnessAdapter = {
         tokens: { input: 0, output: reply.length, total: reply.length },
       }
     }
+    // Test seam (B04 review 4, S10g-c): a reviewer that concludes in a LIST
+    // ITEM — the gate accepts "- REVIEW: PASS" (listItem paragraphs are
+    // verdict sources). The bullet must not become the delivery either.
+    if (input.character.persona.includes('MOCK-列表结论')) {
+      const reply = '复核完毕，结论如下：\n- REVIEW: PASS'
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
     // Test seam (B04 review 2, S10g): a reviewer that replies with the
     // verdict line ONLY — the gate convention's minimal reviewer. Its
     // stripped delivery is empty and must not wipe the round's real one.
