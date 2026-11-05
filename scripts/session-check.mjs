@@ -12,7 +12,9 @@
  *       rest ride along as a deterministic fold (count + oldest excerpts,
  *       no model), the cursor advances over what was represented — next
  *       round's increment is empty; the 32k guard squeezes the transcript
- *       budget instead of slicing the transcript away (11)
+ *       budget instead of slicing the transcript away; fold accounting:
+ *       overflow disclosed in the header only, foldedCount = dropped +
+ *       beyond-window, window-overflow-with-fitting-fetch (15)
  *   P2  db isolation & invalidation: two rooms never cross sessions;
  *       delete character / clear messages / harness drift / model drift /
  *       delete room each sweep the row (11)
@@ -463,6 +465,59 @@ function scenarioFoldPrompt() {
     'P1b 32k 极端：截断保住最新消息与折叠（不再切 transcript 尾部）',
     extreme.prompt.includes(mark('FOLD-4')) && /〔已折叠 [1-9]\d* 条/.test(extreme.prompt),
     extreme.prompt.slice(-600),
+  )
+
+  // Fold accounting (B01 review, non-blocking 2/4/6): overflow rides in the
+  // header's own disclosure — the "其余 N 条未摘录" line counts DROPPED
+  // messages only; foldedCount = dropped + beyond-window; and a flood that
+  // fits whole still leaves a count line when part of it sat beyond the
+  // fetch window.
+  // (a) 8×4k + overflow 3: four dropped, all excerpted → no rest line, the
+  //     header alone discloses the 3 window-outside ones.
+  const big8 = (i) => msg(`g${i}`, `${mark(`GAP-${i}`)}${'g'.repeat(3_900)}`, 2_000 + i * 100, 40 + i)
+  const messages8 = Array.from({ length: 8 }, (_, i) => big8(i))
+  const withOverflow = buildTurnPromptDetailed({
+    room,
+    character,
+    characters: [character],
+    messages: messages8,
+    cwd: 'D:/tmp',
+    since: { at: 1_900, seq: 0 },
+    resumed: true,
+    foldOverflow: 3,
+  })
+  check(
+    'P1b 溢出账目：摘录齐全不出现「未摘录」行（窗口外只在 header 披露）',
+    !withOverflow.prompt.includes('未摘录') &&
+      withOverflow.prompt.includes('已折叠 7 条') &&
+      withOverflow.prompt.includes('另有 3 条在取回窗口之外仅计数'),
+    withOverflow.prompt.slice(-900),
+  )
+  check('P1b 溢出账目：foldedCount = dropped + 窗口外', withOverflow.foldedCount === 7, `foldedCount=${withOverflow.foldedCount}`)
+
+  // (b) fetched all fit + window overflow: count line only, originals
+  //     render verbatim, cursor still advances to the newest.
+  const fitting = buildTurnPromptDetailed({
+    room,
+    character,
+    characters: [character],
+    messages: [msg('h0', '短消息一', 3_000, 50), msg('h1', '短消息二', 3_100, 51)],
+    cwd: 'D:/tmp',
+    since: { at: 2_900, seq: 0 },
+    resumed: true,
+    foldOverflow: 7,
+  })
+  check(
+    'P1b 窗口外但 fetched 全装得下：仅计数行、原文照常渲染',
+    fitting.prompt.includes('〔已折叠 7 条较早的新消息，均在取回窗口之外，仅计数〕') &&
+      fitting.prompt.includes('短消息一') &&
+      fitting.prompt.includes('短消息二'),
+    fitting.prompt.slice(-400),
+  )
+  check(
+    'P1b 窗口外但 fetched 全装得下：游标推到最新、foldedCount 计入窗口外',
+    JSON.stringify(fitting.nextCursor) === JSON.stringify({ at: 3_100, seq: 51 }) && fitting.foldedCount === 7,
+    JSON.stringify({ cursor: fitting.nextCursor, foldedCount: fitting.foldedCount }),
   )
 }
 

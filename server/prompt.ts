@@ -121,7 +121,10 @@ function foldBlock(dropped: Message[], room: number, overflow: number): string[]
     `${overflow > 0 ? `，另有 ${overflow} 条在取回窗口之外仅计数` : ''}）；以下为最旧几条的开头摘录，其余仅计数不展开〕`
   if (header.length + 1 > room) {
     // Squeezed budget: the count marker alone still represents every dropped
-    // message — an excerpt-less fold beats a silent drop.
+    // message — an excerpt-less fold beats a silent drop. This one-liner is
+    // the fold's hard floor (~40 chars, always inside FOLD_MIN_BUDGET) and
+    // the one place the block may exceed `room` by a few chars; the 32k
+    // guard absorbs it.
     return [`${FOLD_MARK} ${total} 条较早的新消息，因长度预算未逐条展开〕`]
   }
   const lines = [header]
@@ -134,8 +137,12 @@ function foldBlock(dropped: Message[], room: number, overflow: number): string[]
     used += line.length + 1
     excerpted += 1
   }
-  const rest = dropped.length - excerpted + overflow
-  if (rest > 0) lines.push(`…（其余 ${rest} 条未摘录，仅计入上述总数）`)
+  // Overflow stays in the header's own disclosure — counting it here again
+  // would read as "N dropped messages went missing" when the header already
+  // says they sit beyond the fetch window (review round 1, non-blocking 2).
+  const rest = dropped.length - excerpted
+  const restLine = `…（其余 ${rest} 条未摘录，仅计入上述总数）`
+  if (rest > 0 && used + restLine.length + 1 <= room) lines.push(restLine)
   return lines
 }
 
@@ -151,6 +158,12 @@ interface TranscriptPlan {
    * for them `represented` is just the rendered suffix.
    */
   represented: Message[]
+  /**
+   * Messages carried ONLY by the fold summary: the dropped ones plus any
+   * beyond the fetch window (the latter aren't in `represented` — the count
+   * marker speaks for them). Purely observability; the cursor never reads it.
+   */
+  foldedOnly: number
 }
 
 /** Newest-first fill: the index rendered starts at (0 = everything fit). */
@@ -165,7 +178,7 @@ function fillNewestFirst(visible: Message[], budget: number): { dropIndex: numbe
 }
 
 function planTranscript(visible: Message[], budget: number, fold: boolean, overflow: number): TranscriptPlan {
-  if (visible.length === 0 && overflow === 0) return { lines: [], rendered: [], represented: [] }
+  if (visible.length === 0 && overflow === 0) return { lines: [], rendered: [], represented: [], foldedOnly: 0 }
   // The newest message (this turn's trigger) always renders; when a fold is
   // possible, its count marker reserves room too. A budget below this floor
   // is a mis-sized budget, not a license to drop the trigger.
@@ -178,7 +191,7 @@ function planTranscript(visible: Message[], budget: number, fold: boolean, overf
     // Everything fits — or a fresh turn, where the trim is the cold start's
     // recency window, not a skip.
     const rendered = visible.slice(plainIndex(pass1))
-    return { lines: rendered.map(transcriptLine), rendered, represented: rendered }
+    return { lines: rendered.map(transcriptLine), rendered, represented: rendered, foldedOnly: 0 }
   }
   // Overflow on a resumed turn (B01): re-fill with the fold budget reserved,
   // then fold everything older into the deterministic summary above. Nothing
@@ -196,6 +209,7 @@ function planTranscript(visible: Message[], budget: number, fold: boolean, overf
     lines: [...block, ...rendered.map(transcriptLine)],
     rendered,
     represented: block.length > 0 ? [...dropped, ...rendered] : rendered,
+    foldedOnly: (block.length > 0 ? dropped.length : 0) + overflow,
   }
 }
 
@@ -210,7 +224,11 @@ export interface TurnPromptBuild {
    * cursor past a message the prompt didn't represent is a permanent skip.
    */
   nextCursor: SessionCursor
-  /** Increment messages carried only as fold-summary counts/excerpts. */
+  /**
+   * Increment messages carried only by the fold summary: the dropped ones
+   * plus any beyond the fetch window (count-only). Observability — the
+   * cursor is derived from `nextCursor` alone.
+   */
   foldedCount: number
 }
 
@@ -360,7 +378,7 @@ export function buildTurnPromptDetailed(input: {
   return {
     prompt,
     nextCursor: nextSessionCursor(plan.represented, since),
-    foldedCount: plan.represented.length - plan.rendered.length,
+    foldedCount: plan.foldedOnly,
   }
 }
 
