@@ -356,9 +356,19 @@ export default function App() {
     setLive(null)
   }
 
-  const saveRoom = async (draft: { name: string; topic: string; workingDir: string; maxHops: number }) => {
+  const saveRoom = async (draft: {
+    name: string
+    topic: string
+    workingDir: string
+    maxHops: number
+    verifyCommand: string
+  }) => {
     if (roomForm === 'create') {
-      const created = await api.createRoom({ ...draft, workingDir: draft.workingDir || room?.workingDir || '' })
+      const created = await api.createRoom({
+        ...draft,
+        workingDir: draft.workingDir || room?.workingDir || '',
+        verifyCommand: draft.verifyCommand || room?.verifyCommand || '',
+      })
       await refresh()
       setRoomId(created.id)
       setView('chat')

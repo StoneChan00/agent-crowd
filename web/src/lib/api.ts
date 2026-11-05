@@ -38,7 +38,7 @@ export const api = {
   clearRoom: (roomId: string) =>
     request<{ ok: boolean }>(`/api/rooms/${roomId}/clear`, { method: 'POST' }),
 
-  createRoom: (input: { name: string; topic?: string; workingDir: string; maxHops?: number }) =>
+  createRoom: (input: { name: string; topic?: string; workingDir: string; maxHops?: number; verifyCommand?: string }) =>
     request<Room>('/api/rooms', { method: 'POST', body: JSON.stringify(input) }),
 
   updateRoom: (roomId: string, patch: Partial<Room>) =>

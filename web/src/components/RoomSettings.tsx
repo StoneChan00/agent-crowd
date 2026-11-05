@@ -7,7 +7,13 @@ interface RoomSettingsProps {
   room: Room | null
   canDelete: boolean
   onClose: () => void
-  onSave: (draft: { name: string; topic: string; workingDir: string; maxHops: number }) => Promise<void>
+  onSave: (draft: {
+    name: string
+    topic: string
+    workingDir: string
+    maxHops: number
+    verifyCommand: string
+  }) => Promise<void>
   onDelete?: () => Promise<void>
 }
 
@@ -22,6 +28,7 @@ export function RoomSettings({ room, canDelete, onClose, onSave, onDelete }: Roo
   const [topic, setTopic] = useState(room?.topic ?? '')
   const [workingDir, setWorkingDir] = useState(room?.workingDir ?? '')
   const [maxHops, setMaxHops] = useState(room?.maxHops ?? 6)
+  const [verifyCommand, setVerifyCommand] = useState(room?.verifyCommand ?? '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   /** Team memory (room scope): shared context every member sees in their prompt. */
@@ -102,7 +109,7 @@ export function RoomSettings({ room, canDelete, onClose, onSave, onDelete }: Roo
     setSaving(true)
     setError('')
     try {
-      await onSave({ name: name.trim(), topic, workingDir: workingDir.trim(), maxHops })
+      await onSave({ name: name.trim(), topic, workingDir: workingDir.trim(), maxHops, verifyCommand: verifyCommand.trim() })
       onClose()
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '保存失败')
@@ -178,6 +185,18 @@ export function RoomSettings({ room, canDelete, onClose, onSave, onDelete }: Roo
           onChange={(event) => setMaxHops(Number(event.target.value))}
         />
         <span className="field-hint">角色之间最多接力多少层；你和 @ 点名（含 @all）唤起的角色都算第 1 层，不计入上限。</span>
+      </div>
+      <div className="field">
+        <label>验证命令（收尾门禁）</label>
+        <input
+          className="input"
+          value={verifyCommand}
+          onChange={(event) => setVerifyCommand(event.target.value)}
+          placeholder="例如：npm test（留空 = 不做验证）"
+        />
+        <span className="field-hint">
+          本轮有代码改动时，服务器会在轮末收尾前自动运行这条命令，并要求最后一条 review 结论是 REVIEW: PASS，否则本轮不收尾。
+        </span>
       </div>
 
       {room && (

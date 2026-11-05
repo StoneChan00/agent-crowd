@@ -36,7 +36,14 @@ function transcriptLine(message: Message): string {
   }
   if (message.authorType === 'system') return `[${clock}] 系统: ${body}`
   const tag = message.meta?.harness ? ` (${message.meta.harness})` : ''
-  return `[${clock}] ${message.authorName}${tag}: ${body}`
+  // Change evidence (SOP gate, P0-3 3a): reviewers see what a turn touched
+  // without leaving the transcript. Five paths max — the full list lives on
+  // the message meta, this is the reviewer's glance line.
+  const changed = message.meta?.changed ?? []
+  const changedTag = changed.length
+    ? ` [改动: ${changed.slice(0, 5).join('、')}${changed.length > 5 ? ` 等 ${changed.length} 个文件` : ''}]`
+    : ''
+  return `[${clock}] ${message.authorName}${tag}: ${body}${changedTag}`
 }
 
 function memoryLine(memory: Memory): string {
@@ -122,6 +129,12 @@ export function buildTurnPrompt(input: {
     '6. 要用户拍板时只向用户提问，不要顺手 @ 任何角色——那会被当成交接，把话题从用户手里抢走。同一句话里既有问题又要提到某人时，用第 5 条的写法。',
     '7. 除非任务本身要求，否则保持简洁。',
     '8. 收敛规则：目标是把事情做完，不是把对话填满。任务已闭环（review 通过、双方结论一致、或一方已明确收尾）后，不要再发“收到/确认/同意/最终快照”类消息——一方收尾即话题终止，直到出现新需求或新 @点名。review 只有在提出具体问题时才需要你修复并重新提交；review 仅表示通过时，任务即完成，无需再回复确认。',
+    '9. review 结论（SOP 门禁）：当你给出 review 时，必须单独成行写 `REVIEW: PASS` 或 `REVIEW: CHANGES`（服务端据此决定本轮能否收尾；返修后重新通过时再写一行新的）。行内混在其他文字里、写成 REVIEW: PASSED 之类的变体都不被识别。',
+    ...(room.verifyCommand.trim()
+      ? [
+          '10. 本房间配置了验证命令（收尾门禁）：服务端会在轮末收尾前自动运行它，你不需要自己跑测试来证明改动没问题——把改动和 review 结论本身做好即可。',
+        ]
+      : []),
     '',
     '【最近的群聊记录】',
     recent.join('\n') || '（空）',

@@ -1,3 +1,5 @@
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -81,6 +83,31 @@ export const mockAdapter: HarnessAdapter = {
         }
         input.emit({ kind: 'text', text: chunk })
         await sleep(25)
+      }
+      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
+    // Test seams for sop-check (SOP gate, P0-3): the character's PERSONA is
+    // the behavior switch — one character per role in the fixture, no
+    // prompt-text coupling to the user message.
+    //   MOCK-写文件    → really writes a file into cwd (change evidence, 3a)
+    //   MOCK-评审通过  → replies ending with a standalone `REVIEW: PASS` (3b)
+    //   MOCK-评审返修  → replies ending with a standalone `REVIEW: CHANGES`
+    if (input.character.persona.includes('MOCK-写文件')) {
+      const file = `mock-${input.character.id.slice(0, 8)}.txt`
+      writeFileSync(join(input.cwd, file), `written by ${input.character.name} at ${new Date().toISOString()}\n`)
+      const reply = `（mock 模式）${input.character.name} 已在工作目录写入 ${file}。`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
+    if (input.character.persona.includes('MOCK-评审')) {
+      const verdict = input.character.persona.includes('MOCK-评审返修') ? 'REVIEW: CHANGES' : 'REVIEW: PASS'
+      const reply = `（mock 模式）${input.character.name} 的 review：改动看起来没问题，同意收尾。\n${verdict}`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
       }
       return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }

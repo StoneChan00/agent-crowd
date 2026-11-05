@@ -33,10 +33,10 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as db from './db.ts'
 import { broadcast } from './events.ts'
-// Circular with orchestrator (it calls maybeRestartNow, we call isBusy): safe
-// under ESM late binding - both sides only call functions at runtime, never
-// at module top level.
-import { isBusy } from './orchestrator.ts'
+// Circular with orchestrator (it calls maybeRestartNow, we call isBusy /
+// gateActive): safe under ESM late binding - both sides only call functions
+// at runtime, never at module top level.
+import { gateActive, isBusy } from './orchestrator.ts'
 
 /** Mirrors server/index.ts (AC_PORT wins, then PORT, then 8787). */
 const PORT = Number(process.env.AC_PORT ?? process.env.PORT ?? 8787)
@@ -187,7 +187,13 @@ export function maybeRestartNow(): void {
   // should be unreachable - but a re-entry here would double-launch.
   if (launching) return
   const rooms = db.listRooms()
-  const busyRooms = rooms.filter((room) => room.name !== options.excludeRoom && isBusy(room.id))
+  // A room is "busy" for the restart drain when a turn runs OR the SOP gate's
+  // verification command is still executing (P0-3): killing the server mid-
+  // verify would silently lose the gate's verdict — the round would close on
+  // the next boot with no evidence the verify ever ran.
+  const busyRooms = rooms.filter(
+    (room) => room.name !== options.excludeRoom && (isBusy(room.id) || gateActive(room.id)),
+  )
   if (busyRooms.length > 0) return // not idle yet; the next pump() finally retries
 
   pending = null

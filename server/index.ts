@@ -288,20 +288,30 @@ function normalizeMaxHops(value: unknown): number {
   return Number.isFinite(n) && n >= 1 ? Math.min(30, Math.round(n)) : 6
 }
 
+/**
+ * SOP gate (P0-3): the room's verification command, run by the SERVER
+ * before a changed round may close. Trim, cap at 500 chars; empty is legal
+ * (= the gate checks only the review verdict).
+ */
+function normalizeVerifyCommand(value: unknown): string {
+  return typeof value === 'string' ? value.trim().slice(0, 500) : ''
+}
+
 app.post('/api/rooms', (req, res) => {
-  const { name, topic, workingDir, maxHops } = req.body ?? {}
+  const { name, topic, workingDir, maxHops, verifyCommand } = req.body ?? {}
   if (typeof name !== 'string' || !name.trim()) return fail(res, 400, '房间名不能为空')
   const room = db.createRoom({
     name: name.trim(),
     topic: typeof topic === 'string' ? topic.trim() : '',
     workingDir: normalizeWorkingDir(workingDir),
     maxHops: normalizeMaxHops(maxHops),
+    verifyCommand: normalizeVerifyCommand(verifyCommand),
   })
   res.status(201).json(room)
 })
 
 app.patch('/api/rooms/:id', (req, res) => {
-  const { name, topic, workingDir, maxHops } = req.body ?? {}
+  const { name, topic, workingDir, maxHops, verifyCommand } = req.body ?? {}
   if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
     return fail(res, 400, '房间名不能为空')
   }
@@ -310,6 +320,7 @@ app.patch('/api/rooms/:id', (req, res) => {
     ...(typeof topic === 'string' ? { topic: topic.trim() } : {}),
     ...(typeof workingDir === 'string' ? { workingDir: normalizeWorkingDir(workingDir) } : {}),
     ...(maxHops !== undefined ? { maxHops: normalizeMaxHops(maxHops) } : {}),
+    ...(verifyCommand !== undefined ? { verifyCommand: normalizeVerifyCommand(verifyCommand) } : {}),
   })
   if (!room) return fail(res, 404, '房间不存在')
   // Other tabs of the same room only hear about settings changes via SSE.
@@ -333,6 +344,8 @@ app.get('/api/rooms/:id/state', (req, res) => {
     /** Pid of the CLI process running the active turn (null when idle). */
     activePid: orchestrator.activePid(room.id) ?? null,
     queuedCharacterIds: orchestrator.queuedCharacters(room.id),
+    /** SOP gate (P0-3): 'running' while the room's verification command executes. */
+    gate: orchestrator.gateActive(room.id) ? 'running' : 'idle',
   })
 })
 

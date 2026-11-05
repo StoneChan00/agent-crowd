@@ -61,6 +61,13 @@ export interface Room {
   workingDir: string
   maxHops: number
   createdAt: number
+  /**
+   * SOP gate (P0-3 3c): verification command the SERVER itself runs before a
+   * round with worktree changes may close (shell semantics, room workingDir,
+   * 300s budget). Empty = no verification, the gate then only checks the
+   * review verdict.
+   */
+  verifyCommand: string
 }
 
 /**
@@ -192,6 +199,13 @@ export interface MessageMeta {
   relayTo?: string[]
   /** Present when this user message is a steer note (「中途补充」). */
   steer?: SteerMeta
+  /**
+   * Worktree paths this turn changed (SOP gate, P0-3 3a): computed from
+   * before/after git snapshots taken by the orchestrator around the turn.
+   * Absent on turns that changed nothing; a turn that could not be judged
+   * (not a git repo) simply never sets it.
+   */
+  changed?: string[]
 }
 
 export type AuthorType = 'user' | 'character' | 'system'
@@ -234,6 +248,18 @@ export interface Turn {
   retry: boolean
   /** Round-end summary turns never relay and don't count as round activity. */
   isRoundSummary: boolean
+  /**
+   * Round this turn belongs to (SOP gate, P0-3): one roundId per human
+   * message / manual run, shared by every relay hand-off it triggers. Null
+   * on turns restored by a reboot (their round was cut) and on legacy rows.
+   */
+  roundId: string | null
+  /**
+   * Worktree paths this turn changed, JSON-encoded (P0-3 3a); null = the
+   * worktree could not be judged (not a git repo) — treated as "unknown",
+   * never as "no changes".
+   */
+  changed: string[] | null
   startedAt: number
   endedAt: number | null
 }
@@ -242,4 +268,23 @@ export interface ParseResult<T> {
   ok: boolean
   value?: T
   error?: string
+}
+
+/**
+ * One recorded outcome of the SOP gate (P0-3): either a review verdict the
+ * server parsed out of a character message (kind='review') or a run of the
+ * room's verification command (kind='verify'). The gate reads the round's
+ * latest entries to decide whether a changed round may close.
+ */
+export interface RoundCheck {
+  id: string
+  roomId: string
+  roundId: string
+  kind: 'review' | 'verify'
+  verdict: 'pass' | 'fail'
+  characterId: string | null
+  messageId: string | null
+  /** Verify runs keep the output tail here; review rows leave it null. */
+  detail: string | null
+  createdAt: number
 }

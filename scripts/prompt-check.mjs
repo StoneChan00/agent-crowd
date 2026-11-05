@@ -43,7 +43,9 @@ function check(name, ok, detail = '') {
   }
 }
 
-const room = { id: 'r1', name: '测试房', topic: '', workingDir: 'D:/tmp', maxHops: 8, createdAt: 0 }
+const room = {
+  id: 'r1', name: '测试房', topic: '', workingDir: 'D:/tmp', maxHops: 8, verifyCommand: '', createdAt: 0,
+}
 
 const baseCharacter = {
   id: 'c1',
@@ -180,6 +182,48 @@ const mark = (tag) => `⟪${tag}⟫`
 {
   const prompt = build([])
   check('an empty room renders the placeholder', prompt.includes('（空）'))
+}
+
+// ---- 7. SOP gate surfaces (P0-3): change evidence + gate rules -----------------------
+
+{
+  // meta.changed renders as the reviewer's glance line in the transcript.
+  const touched = msg('m1', '已改完', 1)
+  touched.meta = { harness: 'cannbot', changed: ['server/a.ts', 'server/b.ts'] }
+  const withChanges = build([touched])
+  check(
+    'meta.changed renders the [改动: …] glance line',
+    withChanges.includes('[改动: server/a.ts、server/b.ts]'),
+    'transcript line missing the change tag',
+  )
+  check('a change-less message carries no glance line', !build([msg('m1', '纯聊天', 1)]).includes('[改动:'))
+
+  // More than five files: the list is summarized, not sprawled.
+  const many = msg('m2', '批量改动', 1)
+  many.meta = { changed: ['1.ts', '2.ts', '3.ts', '4.ts', '5.ts', '6.ts', '7.ts'] }
+  const withMany = build([many])
+  check(
+    '6+ changed files collapse to the first five + total count',
+    withChanges && withMany.includes('[改动: 1.ts、2.ts、3.ts、4.ts、5.ts 等 7 个文件]'),
+    'long change list not summarized',
+  )
+
+  // Rule 9 (REVIEW verdict line) rides along for every room…
+  check('rule 9 (REVIEW verdict) is always announced', withChanges.includes('REVIEW: PASS'))
+  // …rule 10 (verify-command notice) only for rooms that configured one.
+  check('rule 10 absent without a verify command', !withChanges.includes('验证命令（收尾门禁）'))
+  const verified = buildTurnPrompt({
+    room: { ...room, verifyCommand: 'pnpm test' },
+    character: baseCharacter,
+    characters: [baseCharacter],
+    messages: [touched],
+    cwd: 'D:/tmp',
+  })
+  check(
+    'rule 10 appears when the room configured a verify command',
+    verified.includes('验证命令（收尾门禁）') && verified.includes('服务端会在轮末收尾前自动运行'),
+    'rule 10 missing for a configured room',
+  )
 }
 
 if (failed) {

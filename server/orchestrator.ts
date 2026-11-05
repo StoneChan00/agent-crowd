@@ -1,13 +1,17 @@
+import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure } from './harnesses/process.ts'
+import { diffSnapshotPaths, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPrompt } from './prompt.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
+import { gateDecision, parseReviewVerdict } from './sop.ts'
 import type { Character, HarnessKind, Message, Room, ToolTrace, Turn } from './types.ts'
 import { truncate } from './util.ts'
 
@@ -37,6 +41,13 @@ interface QueueItem {
    * activity, so they can't resurrect a round that is being closed out.
    */
   isRoundSummary?: boolean
+  /**
+   * The round this turn belongs to (SOP gate, P0-3): one roundId per human
+   * message / manual run, inherited by every relay hand-off and steer it
+   * triggers. Restored turns keep their persisted roundId but own no live
+   * RoundState (the reboot cut that round).
+   */
+  roundId?: string | null
 }
 
 /** Replay buffer for the running turn, so clients that join mid-turn can catch up. */
@@ -82,14 +93,26 @@ interface ChainState {
  *   it both prevents the summary's own relay echo from re-triggering the
  *   summary and lets the round close cleanly on the next empty-queue visit;
  * - `endReason` is fed into the summary instruction so the summarizer can
- *   say why the round ended.
- * A new human message or manual run replaces the entry (new round); a manual
- * stop deletes it (deliberately silenced — the user asked for silence).
+ *   say why the round ended;
+ * - the SOP-gate fields (`roundId`/`changedPaths`/`verdict`/`verifyState`/
+ *   `gateNoticeSent`, P0-3) decide whether a round that CHANGED the worktree
+ *   may close: verdict must be pass, and when the room configured a verify
+ *   command the server must have run it to a pass. A new human message or
+ *   manual run replaces the entry (new round); a manual stop deletes it.
  */
 interface RoundState {
+  roundId: string
   hadTurn: boolean
   summarizing: boolean
   endReason: 'completed' | 'limit'
+  /** Worktree paths any turn of this round changed so far (union, 3a). */
+  changedPaths: string[]
+  /** Latest REVIEW: verdict seen in this round's character messages (3b). */
+  verdict: 'none' | 'pass' | 'changes'
+  /** Verification command outcome for this round (3c); 'running' guards re-entry. */
+  verifyState: 'none' | 'running' | 'pass' | 'fail'
+  /** The gate notice fires at most once per round — repeat blocks stay silent. */
+  gateNoticeSent: boolean
 }
 
 const queues = new Map<string, QueueItem[]>()
@@ -97,10 +120,37 @@ const active = new Map<string, ActiveTurn>()
 const chains = new Map<string, ChainState>()
 const rounds = new Map<string, RoundState>()
 
+/** Rooms whose verification command is currently running (SOP gate, P0-3). */
+const verifyRuns = new Set<string>()
+
+/** True while the room's verification command runs — the restart drain must wait for it. */
+export function gateActive(roomId: string): boolean {
+  return verifyRuns.has(roomId)
+}
+
+/** Fresh round state for a new human message / manual run (SOP gate fields included). */
+function newRoundState(): RoundState {
+  return {
+    roundId: randomUUID(),
+    hadTurn: false,
+    summarizing: false,
+    endReason: 'completed',
+    changedPaths: [],
+    verdict: 'none',
+    verifyState: 'none',
+    gateNoticeSent: false,
+  }
+}
+
 /** Bound the replay buffers so a chatty turn can't grow memory forever (mirrors the UI's tail-60). */
 const REPLAY_CAP = 60
 /** Upper bound for the replayed text tail. */
 const REPLAY_TEXT_CAP = 200_000
+
+/** Verification command budget (SOP gate, P0-3): a room verify must answer within 5 minutes. */
+const VERIFY_TIMEOUT_MS = 300_000
+/** Output tail kept for the round_checks row and the gate notice. */
+const VERIFY_DETAIL_CHARS = 1_500
 
 export function isBusy(roomId: string): boolean {
   return active.has(roomId)
@@ -149,7 +199,8 @@ export function liveTurn(roomId: string): LiveTurnSnapshot | null {
  */
 export function handleUserMessage(room: Room, message: Message): void {
   chains.set(room.id, { limitNoticeSent: false })
-  rounds.set(room.id, { hadTurn: false, summarizing: false, endReason: 'completed' })
+  const round = newRoundState()
+  rounds.set(room.id, round)
   const everyone = db.listCharacters(room.id)
   const enabled = everyone.filter((character) => character.enabled)
   // Extract once, match per member: the same text is scanned for every character.
@@ -180,7 +231,10 @@ export function handleUserMessage(room: Room, message: Message): void {
     // Human intent is explicit: a message aimed at a character that is
     // mid-turn queues a follow-up run for right after, instead of being
     // silently dropped by the dedupe (relay hand-offs keep the dedupe).
-    enqueue(room.id, character.id, message.id, 1, undefined, { allowActive: true })
+    enqueue(room.id, character.id, message.id, 1, undefined, {
+      allowActive: true,
+      roundId: round.roundId,
+    })
   }
   void pump(room.id)
 }
@@ -188,8 +242,9 @@ export function handleUserMessage(room: Room, message: Message): void {
 /** Queue one character manually (the "让它发言" action). */
 export function runCharacter(room: Room, character: Character, override?: string): void {
   chains.set(room.id, { limitNoticeSent: false })
-  rounds.set(room.id, { hadTurn: false, summarizing: false, endReason: 'completed' })
-  enqueue(room.id, character.id, null, 1, override, { allowActive: true })
+  const round = newRoundState()
+  rounds.set(room.id, round)
+  enqueue(room.id, character.id, null, 1, override, { allowActive: true, roundId: round.roundId })
   void pump(room.id)
 }
 
@@ -211,6 +266,12 @@ export function steer(room: Room, target: Character, message: Message): void {
   const override = interrupted
     ? `用户在你上一轮说到一半时插入了补充指令（聊天记录里「用户（中途补充给 ${target.name}）」那条，其后是你被打断的半截回复）。请把补充指令并入本轮要求，给出最终的完整回复。`
     : `用户插入了补充指令（聊天记录里「用户（中途补充给 ${target.name}）」那条）。请把它并入本轮要求后发言。`
+
+  // A steer lands inside the running round when there is one — its turn joins
+  // that round's SOP gate accounting (the work it triggers belongs to the
+  // round the user is steering). No live round (idle steer) → null: the turn
+  // records evidence but no round closes on it.
+  const roundId = rounds.get(room.id)?.roundId ?? null
 
   const queued = queue.find((item) => item.characterId === target.id)
   if (queued) {
@@ -234,6 +295,7 @@ export function steer(room: Room, target: Character, message: Message): void {
       triggerMessageId: message.id,
       hop: 1,
       override,
+      roundId,
     })
     queue.unshift({
       turnId: turn.id,
@@ -241,6 +303,7 @@ export function steer(room: Room, target: Character, message: Message): void {
       triggerMessageId: message.id,
       hop: 1,
       override,
+      roundId,
     })
     queues.set(room.id, queue)
     broadcast(room.id, 'queue', { roomId: room.id, characters: queue.map((item) => item.characterId) })
@@ -248,7 +311,7 @@ export function steer(room: Room, target: Character, message: Message): void {
     // Idle target: wake it like a direct call. allowActive bypasses the
     // same-character dedupe (unreachable here — that item went through the
     // `queued` branch); enqueue persists the turn row.
-    enqueue(room.id, target.id, message.id, 1, override, { allowActive: true })
+    enqueue(room.id, target.id, message.id, 1, override, { allowActive: true, roundId })
   }
   void pump(room.id)
 }
@@ -323,6 +386,7 @@ export function restoreQueues(turns: Turn[]): void {
         override: turn.override ?? undefined,
         retry: turn.retry || undefined,
         isRoundSummary: turn.isRoundSummary || undefined,
+        roundId: turn.roundId,
       })
     }
     if (queue.length === 0) continue
@@ -367,7 +431,7 @@ function enqueue(
   triggerMessageId: string | null,
   hop: number,
   override?: string,
-  options?: { allowActive?: boolean; retry?: boolean; isRoundSummary?: boolean },
+  options?: { allowActive?: boolean; retry?: boolean; isRoundSummary?: boolean; roundId?: string | null },
 ): boolean {
   const queue = queues.get(roomId) ?? []
   // Relay hand-offs dedupe against the running character (loop guard);
@@ -389,6 +453,7 @@ function enqueue(
     override,
     retry: options?.retry || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
+    roundId: options?.roundId ?? null,
   })
   queue.push({
     turnId: turn.id,
@@ -398,6 +463,7 @@ function enqueue(
     override,
     retry: options?.retry || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
+    roundId: options?.roundId ?? null,
   })
   queues.set(roomId, queue)
   broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
@@ -409,9 +475,16 @@ function enqueue(
  * is computed before the message is stored (see `pump`) so the row can carry
  * `meta.relayTo`, which is what the UI shows as "接力 → …": the browser
  * displays the router's own verdict instead of re-deriving the trigger rules.
+ * Hand-offs inherit the triggering turn's roundId — one round, one gate.
  */
-function enqueueFollowers(roomId: string, messageId: string, followers: Character[], nextHop: number): void {
-  for (const character of followers) enqueue(roomId, character.id, messageId, nextHop)
+function enqueueFollowers(
+  roomId: string,
+  messageId: string,
+  followers: Character[],
+  nextHop: number,
+  roundId: string | null,
+): void {
+  for (const character of followers) enqueue(roomId, character.id, messageId, nextHop, undefined, { roundId })
 }
 
 /**
@@ -444,11 +517,75 @@ function budgetExceeded(room: Room, hop: number): boolean {
 }
 
 /**
+ * Run the room's verification command (SOP gate 3c, P0-3). Shell semantics,
+ * the room's workingDir, a hard 300s budget, output tail 1_500 for the
+ * notice. The room id sits in `verifyRuns` for the whole run — that flag is
+ * what keeps the restart drain (restart.ts) and /state's `gate` honest while
+ * a verify is in flight.
+ */
+async function runVerifyCommand(
+  room: Room,
+): Promise<{ ok: boolean; exitCode: number | null; output: string; timedOut: boolean }> {
+  verifyRuns.add(room.id)
+  try {
+    return await new Promise((resolve) => {
+      const child = spawn(room.verifyCommand.trim(), {
+        shell: true,
+        cwd: room.workingDir,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let output = ''
+      let timedOut = false
+      const append = (chunk: Buffer) => {
+        output = (output + chunk.toString('utf8')).slice(-4_000)
+      }
+      child.stdout?.on('data', append)
+      child.stderr?.on('data', append)
+      const timer = setTimeout(() => {
+        timedOut = true
+        if (process.platform === 'win32' && child.pid) {
+          spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+        } else {
+          child.kill('SIGKILL')
+        }
+      }, VERIFY_TIMEOUT_MS)
+      const finish = (exitCode: number | null) => {
+        clearTimeout(timer)
+        resolve({ ok: !timedOut && exitCode === 0, exitCode, output, timedOut })
+      }
+      child.on('error', () => finish(null))
+      child.on('close', (code) => finish(code))
+    })
+  } finally {
+    verifyRuns.delete(room.id)
+  }
+}
+
+/** One gate notice per round: what blocked the close, in one system message. */
+function sendGateNotice(roomId: string, content: string): void {
+  const message = db.addMessage({
+    roomId,
+    authorType: 'system',
+    authorName: '系统',
+    content,
+    meta: { generated: true },
+  })
+  broadcast(roomId, 'message', { roomId, message })
+}
+
+/**
  * Round-end summary: called from pump()'s empty-queue branch, i.e. the
- * moment a round that ran at least one turn has nothing left to run. Every
- * enabled character with `triggers.onRoundEnd` is queued with a
- * summarization instruction (the hop budget doesn't apply — the summary is
- * orchestrator bookkeeping, not part of the relay chain it closes).
+ * moment a round that ran at least one turn has nothing left to run —
+ * with the SOP gate (P0-3 3c) in front of it: a round that changed the
+ * worktree only closes when its LAST review verdict is pass and (when the
+ * room configured one) the verification command passed. Blocked rounds get
+ * one notice and are deleted without a summary and without re-queueing —
+ * the follow-up (fix, review, new round) belongs to the next human/character
+ * message, not to an automatic loop that would gate itself forever.
+ *
+ * The gate is async only when it actually runs the verify command; chat-only
+ * and already-passing rounds close as cheaply as before.
  *
  * Idempotent per round: the `summarizing` flag makes the summary's own
  * settlement (and any relay echo of the summary message) close the round
@@ -456,9 +593,14 @@ function budgetExceeded(room: Room, hop: number): boolean {
  * entered the queue, so the caller can keep pumping instead of flashing
  * the room idle.
  */
-function maybeStartRoundSummary(roomId: string): boolean {
+async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   const round = rounds.get(roomId)
   if (!round) return false
+  if (round.verifyState === 'running') {
+    // A verify from this round is still in flight (its own await will carry
+    // on here); re-entering now would double-run the command.
+    return false
+  }
   if (!round.hadTurn || round.summarizing) {
     // Nothing to summarize (or the summary already ran): close the round.
     rounds.delete(roomId)
@@ -469,6 +611,71 @@ function maybeStartRoundSummary(roomId: string): boolean {
     rounds.delete(roomId)
     return false
   }
+
+  // ---- SOP gate (P0-3 3c): only rounds that changed the worktree pass through.
+  if (round.changedPaths.length > 0) {
+    const decision = gateDecision({
+      changed: round.changedPaths.length,
+      verifyRequired: room.verifyCommand.trim().length > 0,
+      verify: round.verifyState === 'pass' || round.verifyState === 'fail' ? round.verifyState : 'none',
+      verdict: round.verdict,
+    })
+    if (decision === 'block') {
+      if (!round.gateNoticeSent) {
+        round.gateNoticeSent = true
+        const reason =
+          round.verifyState === 'fail'
+            ? `验证命令未通过，本轮不做轮末总结。`
+            : round.verdict === 'changes'
+              ? '最后一条 review 结论为 REVIEW: CHANGES，本轮不做轮末总结。'
+              : '本轮有代码改动，但没有 review 结论（需要 review 角色单独一行给出 REVIEW: PASS）。'
+        sendGateNotice(
+          roomId,
+          `🚧 SOP 门禁：${reason}改动文件：${round.changedPaths.slice(0, 5).join('、')}${round.changedPaths.length > 5 ? ` 等 ${round.changedPaths.length} 个` : ''}。请继续处理，处理完成后重新给出 review 结论即可收尾。`,
+        )
+      }
+      // No summary, no re-queue: the next human/character message starts the
+      // next round (deliberate — auto-requeue would gate-loop forever).
+      rounds.delete(roomId)
+      return false
+    }
+    if (decision === 'run-verify') {
+      round.verifyState = 'running'
+      const result = await runVerifyCommand(room)
+      // The round the verify belonged to may have been replaced while the
+      // command ran (a new human message opens a new round): the outcome is
+      // still recorded against its roundId, but only the SAME round object
+      // may close on it.
+      db.addRoundCheck({
+        roomId,
+        roundId: round.roundId,
+        kind: 'verify',
+        verdict: result.ok ? 'pass' : 'fail',
+        detail: truncate(
+          `${result.timedOut ? '（超时被终止）' : ''}exit ${result.exitCode ?? 'spawn-error'}\n${result.output.trim()}`,
+          VERIFY_DETAIL_CHARS,
+        ),
+      })
+      if (rounds.get(roomId) !== round) return false
+      if (!result.ok) {
+        round.verifyState = 'fail'
+        if (!round.gateNoticeSent) {
+          round.gateNoticeSent = true
+          sendGateNotice(
+            roomId,
+            `🚧 SOP 门禁：验证命令未通过（exit ${result.exitCode ?? 'spawn-error'}${result.timedOut ? '，运行超时被终止' : ''}），本轮不做轮末总结。输出尾部：\n${truncate(result.output.trim() || '（无输出）', VERIFY_DETAIL_CHARS)}`,
+          )
+        }
+        rounds.delete(roomId)
+        return false
+      }
+      round.verifyState = 'pass'
+      sendGateNotice(roomId, `✅ SOP 门禁：验证命令通过（exit ${result.exitCode}），本轮开始收尾总结。`)
+      // fall through to the summary below.
+    }
+    // decision === 'close' → straight to the summary below.
+  }
+
   const summarizers = db.listCharacters(roomId).filter((character) => character.enabled && character.triggers.onRoundEnd)
   if (summarizers.length === 0) {
     rounds.delete(roomId)
@@ -489,7 +696,7 @@ function maybeStartRoundSummary(roomId: string): boolean {
   ].join('\n')
   let queued = false
   for (const character of summarizers) {
-    queued = enqueue(roomId, character.id, null, 1, override, { isRoundSummary: true }) || queued
+    queued = enqueue(roomId, character.id, null, 1, override, { isRoundSummary: true, roundId: round.roundId }) || queued
   }
   if (!queued) {
     // Every summarizer vanished mid-flight (deleted/disabled): close the round.
@@ -521,9 +728,10 @@ async function pump(roomId: string): Promise<void> {
     if (!item) {
       // Empty queue + no active turn: the round (if one was running) just
       // ended — either drained naturally or cut by the hop budget. Fire the
-      // round-end summary before declaring the room idle, so the summary
-      // turn starts without a busy→idle→busy flicker.
-      if (maybeStartRoundSummary(roomId)) return void pump(roomId)
+      // round-end summary (through the SOP gate) before declaring the room
+      // idle, so the summary turn starts without a busy→idle→busy flicker.
+      // The gate may run the room's verify command first — await it.
+      if (await maybeStartRoundSummary(roomId)) return void pump(roomId)
       broadcast(roomId, 'busy', { roomId, busy: false, characterId: null })
       return
     }
@@ -582,13 +790,18 @@ async function pump(roomId: string): Promise<void> {
     // summary is already scheduled) don't flip the flag — they are the
     // round's closing act, not new activity.
     const round = rounds.get(roomId)
-    if (round && !round.summarizing && !item.isRoundSummary) round.hadTurn = true
+    if (round && round.roundId === item.roundId && !round.summarizing && !item.isRoundSummary) round.hadTurn = true
     broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'running' })
     broadcast(roomId, 'busy', { roomId, busy: true, characterId: character.id })
 
     const cwd = character.cwd.trim() || room.workingDir
 
     mkdirSync(cwd, { recursive: true })
+    // Before-snapshot (SOP gate 3a): bracket the turn's own CLI run so the
+    // after-snapshot can tell WHICH paths this turn touched. Shot at the
+    // repo root (see gitstate.ts) — the room cwd is usually a subdirectory.
+    // Unjudgeable worktrees simply leave the turn's `changed` null.
+    const before = await snapshotWorktree(cwd)
     const messages = db.listMessages(roomId, 80)
     const characters = db.listCharacters(roomId)
     // Long-term memory rides along on every turn: the character's cross-room
@@ -701,6 +914,7 @@ async function pump(roomId: string): Promise<void> {
           allowActive: true,
           retry: true,
           isRoundSummary: item.isRoundSummary,
+          roundId: item.roundId ?? null,
         })
       const message = db.addMessage({
         roomId,
@@ -753,6 +967,18 @@ async function pump(roomId: string): Promise<void> {
               ),
           )
       : []
+
+    // After-snapshot (SOP gate 3a): what did THIS turn change on disk? Only
+    // successful turns are judged — stopped/error turns keep whatever their
+    // CLI partially did, and pinning that noise onto the round's evidence
+    // would block closes on half-finished work. Unjudgeable (non-git) stays
+    // null; equal digests short-circuit to "no changes" without a diff.
+    let changedPaths: string[] | null = null
+    if (before.available) {
+      const after = await snapshotWorktree(cwd)
+      changedPaths = after.available && after.digest !== before.digest ? diffSnapshotPaths(before, after) : []
+    }
+
     const message = db.addMessage({
       roomId,
       authorType: 'character',
@@ -775,6 +1001,7 @@ async function pump(roomId: string): Promise<void> {
         error: output.error,
         relayTo: followers.length > 0 ? followers.map((member) => member.name) : undefined,
         generated: true,
+        ...(changedPaths && changedPaths.length > 0 ? { changed: changedPaths } : {}),
       },
     })
 
@@ -783,6 +1010,7 @@ async function pump(roomId: string): Promise<void> {
       output: content,
       error: output.error ?? null,
       endedAt: Date.now(),
+      changed: changedPaths,
     })
     broadcast(roomId, 'turn', {
       roomId,
@@ -791,7 +1019,35 @@ async function pump(roomId: string): Promise<void> {
       status: output.error ? 'error' : 'done',
     })
     broadcast(roomId, 'message', { roomId, message })
-    enqueueFollowers(roomId, message.id, followers, item.hop + 1)
+
+    // Review verdict (SOP gate 3b): any character may end a message with a
+    // standalone REVIEW: line — the round's LATEST verdict wins, and every
+    // verdict lands in round_checks as audit evidence. The table's verdict
+    // column speaks pass/fail, so CHANGES maps to 'fail' with the original
+    // line kept in detail.
+    const verdict = parseReviewVerdict(content)
+    if (verdict) {
+      if (item.roundId) {
+        db.addRoundCheck({
+          roomId,
+          roundId: item.roundId,
+          kind: 'review',
+          verdict: verdict === 'pass' ? 'pass' : 'fail',
+          characterId: character.id,
+          messageId: message.id,
+          detail: verdict === 'pass' ? 'REVIEW: PASS' : 'REVIEW: CHANGES',
+        })
+      }
+      if (round && round.roundId === item.roundId) round.verdict = verdict
+    }
+    // Fold this turn's changes into the round's evidence (3a): the gate at
+    // close time judges the round's CUMULATIVE footprint, not per-turn.
+    if (round && round.roundId === item.roundId && changedPaths) {
+      for (const path of changedPaths) {
+        if (!round.changedPaths.includes(path)) round.changedPaths.push(path)
+      }
+    }
+    enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     console.error(`[agent-crowd] pump(${roomId}) failed:`, reason)

@@ -14,6 +14,7 @@ import { DEFAULT_TRIGGERS,
   type Message,
   type MessageMeta,
   type Room,
+  type RoundCheck,
   type Triggers,
   type Turn,
   type TurnStatus,
@@ -32,6 +33,7 @@ db.exec(`
     topic text not null default '',
     working_dir text not null,
     max_hops integer not null default 6,
+    verify_command text not null default '',
     created_at integer not null
   );
 
@@ -82,9 +84,24 @@ db.exec(`
     override text,
     retry integer not null default 0,
     is_round_summary integer not null default 0,
+    round_id text,
+    changed text,
     started_at integer not null,
     ended_at integer
   );
+
+  create table if not exists round_checks (
+    id text primary key,
+    room_id text not null,
+    round_id text not null,
+    kind text not null,
+    verdict text not null,
+    character_id text,
+    message_id text,
+    detail text,
+    created_at integer not null
+  );
+  create index if not exists idx_round_checks_round on round_checks(room_id, round_id, kind);
 
   create table if not exists character_presets (
     id text primary key,
@@ -161,6 +178,10 @@ addColumnIfMissing('turns', 'hop', 'hop integer not null default 1')
 addColumnIfMissing('turns', 'override', 'override text')
 addColumnIfMissing('turns', 'retry', 'retry integer not null default 0')
 addColumnIfMissing('turns', 'is_round_summary', 'is_round_summary integer not null default 0')
+// SOP gate (P0-3): per-room verification command + per-round evidence.
+addColumnIfMissing('rooms', 'verify_command', "verify_command text not null default ''")
+addColumnIfMissing('turns', 'round_id', 'round_id text')
+addColumnIfMissing('turns', 'changed', 'changed text')
 
 const now = () => Date.now()
 
@@ -173,6 +194,7 @@ function mapRoom(row: Record<string, unknown>): Room {
     topic: String(row.topic ?? ''),
     workingDir: String(row.working_dir),
     maxHops: Number(row.max_hops ?? 6),
+    verifyCommand: String(row.verify_command ?? ''),
     createdAt: Number(row.created_at),
   }
 }
@@ -191,6 +213,7 @@ export function createRoom(input: {
   topic?: string
   workingDir: string
   maxHops?: number
+  verifyCommand?: string
 }): Room {
   const room: Room = {
     id: randomUUID(),
@@ -198,35 +221,47 @@ export function createRoom(input: {
     topic: input.topic?.trim() ?? '',
     workingDir: input.workingDir,
     maxHops: clampHops(input.maxHops),
+    verifyCommand: clampVerifyCommand(input.verifyCommand),
     createdAt: now(),
   }
   db.prepare(
-    'insert into rooms (id, name, topic, working_dir, max_hops, created_at) values (?, ?, ?, ?, ?, ?)',
-  ).run(room.id, room.name, room.topic, room.workingDir, room.maxHops, room.createdAt)
+    'insert into rooms (id, name, topic, working_dir, max_hops, verify_command, created_at) values (?, ?, ?, ?, ?, ?, ?)',
+  ).run(room.id, room.name, room.topic, room.workingDir, room.maxHops, room.verifyCommand, room.createdAt)
   return room
 }
 
-export function updateRoom(id: string, patch: Partial<Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops'>>): Room | undefined {
+export function updateRoom(
+  id: string,
+  patch: Partial<Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops' | 'verifyCommand'>>,
+): Room | undefined {
   const current = getRoom(id)
   if (!current) return undefined
   const next: Room = {
     ...current,
     ...pickDefined(patch),
     maxHops: patch.maxHops === undefined ? current.maxHops : clampHops(patch.maxHops),
+    verifyCommand: patch.verifyCommand === undefined ? current.verifyCommand : clampVerifyCommand(patch.verifyCommand),
   }
-  db.prepare('update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ? where id = ?').run(
+  db.prepare('update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ? where id = ?').run(
     next.name,
     next.topic,
     next.workingDir,
     next.maxHops,
+    next.verifyCommand,
     id,
   )
   return next
 }
 
+/** Verification commands are operator-supplied one-liners: trim, cap at 500, empty is legal (= gate skips verify). */
+function clampVerifyCommand(value: string | undefined): string {
+  return (value ?? '').trim().slice(0, 500)
+}
+
 export function deleteRoom(id: string): void {
   db.prepare('delete from messages where room_id = ?').run(id)
   db.prepare('delete from turns where room_id = ?').run(id)
+  db.prepare('delete from round_checks where room_id = ?').run(id)
   db.prepare('delete from characters where room_id = ?').run(id)
   db.prepare("delete from memories where scope = 'room' and owner_id = ?").run(id)
   db.prepare('delete from rooms where id = ?').run(id)
@@ -615,9 +650,22 @@ export function addMessage(input: {
 export function clearMessages(roomId: string): void {
   db.prepare('delete from messages where room_id = ?').run(roomId)
   db.prepare('delete from turns where room_id = ?').run(roomId)
+  db.prepare('delete from round_checks where room_id = ?').run(roomId)
 }
 
 /* ------------------------------------------------------------------ turns */
+
+/** `turns.changed` JSON: null = unjudgeable (not a git worktree). */
+function parseChanged(raw: unknown): string[] | null {
+  if (raw === null || raw === undefined) return null
+  if (typeof raw !== 'string' || raw.trim() === '') return null
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map(String) : null
+  } catch {
+    return null
+  }
+}
 
 function mapTurn(row: Record<string, unknown>): Turn {
   return {
@@ -633,6 +681,8 @@ function mapTurn(row: Record<string, unknown>): Turn {
     override: row.override === null || row.override === undefined ? null : String(row.override),
     retry: Number(row.retry ?? 0) === 1,
     isRoundSummary: Number(row.is_round_summary ?? 0) === 1,
+    roundId: row.round_id === null || row.round_id === undefined ? null : String(row.round_id),
+    changed: parseChanged(row.changed),
     startedAt: Number(row.started_at),
     endedAt: row.ended_at === null ? null : Number(row.ended_at),
   }
@@ -649,6 +699,8 @@ export function createTurn(input: {
   /** Loop-guard flag for the automatic second attempt. */
   retry?: boolean
   isRoundSummary?: boolean
+  /** Round this turn belongs to (SOP gate, P0-3); null on restored/legacy rows. */
+  roundId?: string | null
 }): Turn {
   const turn: Turn = {
     id: randomUUID(),
@@ -663,13 +715,15 @@ export function createTurn(input: {
     override: input.override ?? null,
     retry: input.retry ?? false,
     isRoundSummary: input.isRoundSummary ?? false,
+    roundId: input.roundId ?? null,
+    changed: null,
     startedAt: now(),
     endedAt: null,
   }
   db.prepare(
     `insert into turns
-       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, is_round_summary, started_at, ended_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, is_round_summary, round_id, changed, started_at, ended_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     turn.id,
     turn.roomId,
@@ -682,6 +736,8 @@ export function createTurn(input: {
     turn.override,
     turn.retry ? 1 : 0,
     turn.isRoundSummary ? 1 : 0,
+    turn.roundId,
+    null,
     turn.startedAt,
     null,
   )
@@ -690,17 +746,19 @@ export function createTurn(input: {
 
 export function updateTurn(
   id: string,
-  patch: Partial<Pick<Turn, 'status' | 'output' | 'error' | 'endedAt'>>,
+  patch: Partial<Pick<Turn, 'status' | 'output' | 'error' | 'endedAt' | 'changed'>>,
 ): void {
   const current = db.prepare('select * from turns where id = ?').get(id)
   if (!current) return
   const turn = mapTurn(current)
   const next = { ...turn, ...pickDefined(patch) }
-  db.prepare('update turns set status = ?, output = ?, error = ?, ended_at = ? where id = ?').run(
+  db.prepare('update turns set status = ?, output = ?, error = ?, ended_at = ?, changed = ? where id = ?').run(
     next.status,
     next.output,
     next.error,
     next.endedAt,
+    // null stays null ("unjudgeable"); a changed list is JSON-encoded.
+    next.changed === null ? null : JSON.stringify(next.changed),
     id,
   )
 }
@@ -816,6 +874,72 @@ export function startupRecovery(): { interrupted: Turn[]; queued: Turn[] } {
     .all()
     .map(mapTurn)
   return { interrupted, queued }
+}
+
+/* ----------------------------------------------------------- round checks */
+
+function mapRoundCheck(row: Record<string, unknown>): RoundCheck {
+  return {
+    id: String(row.id),
+    roomId: String(row.room_id),
+    roundId: String(row.round_id),
+    kind: String(row.kind) === 'verify' ? 'verify' : 'review',
+    verdict: String(row.verdict) === 'fail' ? 'fail' : 'pass',
+    characterId: row.character_id === null || row.character_id === undefined ? null : String(row.character_id),
+    messageId: row.message_id === null || row.message_id === undefined ? null : String(row.message_id),
+    detail: row.detail === null || row.detail === undefined ? null : String(row.detail),
+    createdAt: Number(row.created_at),
+  }
+}
+
+/**
+ * Record one SOP-gate outcome (P0-3): a parsed review verdict, or a run of
+ * the room's verification command. Written as evidence — the gate itself
+ * keeps its live state in the orchestrator's RoundState.
+ */
+export function addRoundCheck(input: {
+  roomId: string
+  roundId: string
+  kind: 'review' | 'verify'
+  verdict: 'pass' | 'fail'
+  characterId?: string | null
+  messageId?: string | null
+  detail?: string | null
+}): RoundCheck {
+  const check: RoundCheck = {
+    id: randomUUID(),
+    roomId: input.roomId,
+    roundId: input.roundId,
+    kind: input.kind,
+    verdict: input.verdict,
+    characterId: input.characterId ?? null,
+    messageId: input.messageId ?? null,
+    detail: input.detail ?? null,
+    createdAt: now(),
+  }
+  db.prepare(
+    `insert into round_checks (id, room_id, round_id, kind, verdict, character_id, message_id, detail, created_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    check.id,
+    check.roomId,
+    check.roundId,
+    check.kind,
+    check.verdict,
+    check.characterId,
+    check.messageId,
+    check.detail,
+    check.createdAt,
+  )
+  return check
+}
+
+/** All gate outcomes of one room, oldest first — the room's SOP audit trail. */
+export function listRoundChecks(roomId: string): RoundCheck[] {
+  return db
+    .prepare('select * from round_checks where room_id = ? order by created_at asc')
+    .all(roomId)
+    .map(mapRoundCheck)
 }
 
 /* -------------------------------------------------------------- identities */
