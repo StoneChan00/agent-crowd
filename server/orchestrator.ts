@@ -5,7 +5,7 @@ import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure } from './harnesses/process.ts'
-import { diffSnapshotPaths, snapshotWorktree } from './gitstate.ts'
+import { changedPathsBetween, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPrompt } from './prompt.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
@@ -13,7 +13,7 @@ import { buildTurnPrompt } from './prompt.ts'
 import { maybeRestartNow } from './restart.ts'
 import { gateDecision, parseReviewVerdict } from './sop.ts'
 import type { Character, HarnessKind, Message, Room, ToolTrace, Turn } from './types.ts'
-import { truncate } from './util.ts'
+import { tail, truncate } from './util.ts'
 
 interface QueueItem {
   /** Turn row this queue entry persists as (turns double as the queue, P0-2). */
@@ -149,8 +149,12 @@ const REPLAY_TEXT_CAP = 200_000
 
 /** Verification command budget (SOP gate, P0-3): a room verify must answer within 5 minutes. */
 const VERIFY_TIMEOUT_MS = 300_000
-/** Output tail kept for the round_checks row and the gate notice. */
+/** Rolling output window kept while the command runs; the tail is where a failure explains itself. */
+const VERIFY_OUTPUT_CHARS = 4_000
+/** Output tail kept for the round_checks row and the gate notice (a TRUE tail — see `tail()`). */
 const VERIFY_DETAIL_CHARS = 1_500
+/** Grace for the timeout kill to land before the run is force-settled. */
+const VERIFY_KILL_BACKSTOP_MS = 10_000
 
 export function isBusy(roomId: string): boolean {
   return active.has(roomId)
@@ -537,11 +541,20 @@ async function runVerifyCommand(
       })
       let output = ''
       let timedOut = false
+      let settled = false
       const append = (chunk: Buffer) => {
-        output = (output + chunk.toString('utf8')).slice(-4_000)
+        output = (output + chunk.toString('utf8')).slice(-VERIFY_OUTPUT_CHARS)
       }
       child.stdout?.on('data', append)
       child.stderr?.on('data', append)
+      let backstop: ReturnType<typeof setTimeout> | null = null
+      const finish = (exitCode: number | null) => {
+        if (settled) return
+        settled = true
+        if (backstop) clearTimeout(backstop)
+        clearTimeout(timer)
+        resolve({ ok: !timedOut && exitCode === 0, exitCode, output, timedOut })
+      }
       const timer = setTimeout(() => {
         timedOut = true
         if (process.platform === 'win32' && child.pid) {
@@ -549,11 +562,12 @@ async function runVerifyCommand(
         } else {
           child.kill('SIGKILL')
         }
+        // Backstop: a kill that doesn't take (unkillable process, Windows
+        // grief) would leave this promise pending forever, and with it
+        // verifyRuns — gateActive — holding the restart drain hostage for
+        // the life of the server. Settle regardless, 10s after the kill.
+        backstop = setTimeout(() => finish(null), VERIFY_KILL_BACKSTOP_MS)
       }, VERIFY_TIMEOUT_MS)
-      const finish = (exitCode: number | null) => {
-        clearTimeout(timer)
-        resolve({ ok: !timedOut && exitCode === 0, exitCode, output, timedOut })
-      }
       child.on('error', () => finish(null))
       child.on('close', (code) => finish(code))
     })
@@ -651,10 +665,11 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
         roundId: round.roundId,
         kind: 'verify',
         verdict: result.ok ? 'pass' : 'fail',
-        detail: truncate(
-          `${result.timedOut ? '（超时被终止）' : ''}exit ${result.exitCode ?? 'spawn-error'}\n${result.output.trim()}`,
-          VERIFY_DETAIL_CHARS,
-        ),
+        // exit line always survives; the output part keeps its TRUE tail —
+        // a head-keeping cap drops exactly the lines that explain the death.
+        // exit line always survives; the output part keeps its TRUE tail —
+        // a head-keeping cap drops exactly the lines that explain the death.
+        detail: `${result.timedOut ? '（超时被终止）' : ''}exit ${result.exitCode ?? 'spawn-error'}\n${tail(result.output.trim(), VERIFY_DETAIL_CHARS)}`,
       })
       if (rounds.get(roomId) !== round) return false
       if (!result.ok) {
@@ -663,7 +678,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
           round.gateNoticeSent = true
           sendGateNotice(
             roomId,
-            `🚧 SOP 门禁：验证命令未通过（exit ${result.exitCode ?? 'spawn-error'}${result.timedOut ? '，运行超时被终止' : ''}），本轮不做轮末总结。输出尾部：\n${truncate(result.output.trim() || '（无输出）', VERIFY_DETAIL_CHARS)}`,
+            `🚧 SOP 门禁：验证命令未通过（exit ${result.exitCode ?? 'spawn-error'}${result.timedOut ? '，运行超时被终止' : ''}），本轮不做轮末总结。输出尾部：\n${tail(result.output.trim() || '（无输出）', VERIFY_DETAIL_CHARS)}`,
           )
         }
         rounds.delete(roomId)
@@ -732,7 +747,14 @@ async function pump(roomId: string): Promise<void> {
       // idle, so the summary turn starts without a busy→idle→busy flicker.
       // The gate may run the room's verify command first — await it.
       if (await maybeStartRoundSummary(roomId)) return void pump(roomId)
-      broadcast(roomId, 'busy', { roomId, busy: false, characterId: null })
+      // That await can straddle a new human message: by now ITS pump() may
+      // have a turn running (or fresh items queued). Broadcasting idle HERE
+      // would flash the room dark mid-turn — the web client drops the live
+      // view on busy:false. Re-read the room state instead of trusting the
+      // empty queue we saw before the gate went async.
+      if (!active.has(roomId) && (queues.get(roomId) ?? []).length === 0) {
+        broadcast(roomId, 'busy', { roomId, busy: false, characterId: null })
+      }
       return
     }
     consumed = true
@@ -972,11 +994,14 @@ async function pump(roomId: string): Promise<void> {
     // successful turns are judged — stopped/error turns keep whatever their
     // CLI partially did, and pinning that noise onto the round's evidence
     // would block closes on half-finished work. Unjudgeable (non-git) stays
-    // null; equal digests short-circuit to "no changes" without a diff.
+    // null; equal digests short-circuit to "no changes"; a digest that moved
+    // without a attributable diff degrades to the after snapshot's dirty set
+    // (see changedPathsBetween — a tracked file edited again keeps its XY
+    // code, and an ungated change is worth more than precise attribution).
     let changedPaths: string[] | null = null
     if (before.available) {
       const after = await snapshotWorktree(cwd)
-      changedPaths = after.available && after.digest !== before.digest ? diffSnapshotPaths(before, after) : []
+      changedPaths = changedPathsBetween(before, after)
     }
 
     const message = db.addMessage({

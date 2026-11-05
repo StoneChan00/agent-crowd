@@ -5,21 +5,27 @@
  *   node scripts/sop-check.mjs
  *
  * Layers:
- *   S1  verdict parser  — standalone REVIEW: lines, quoting, variants (13)
+ *   S1  verdict parser  — standalone REVIEW: lines, multi-block markdown
+ *                         (blank-line splits, bold paragraphs, lists),
+ *                         quoting, variants, whole-line code spans (19)
  *   S2  gate table      — all 7 decision rows of gateDecision (7)
  *   S3  worktree snap   — repo-root resolution: a cwd INSIDE a subdirectory
  *                         still sees sibling-directory changes; non-git
- *                         working dirs report available:false (5)
+ *                         working dirs report available:false; untracked
+ *                         fingerprints + dirty-file re-edit fallback (14)
  *   S4  green path      — write + REVIEW: PASS + verify exit 0 → verify runs
  *                         exactly once, round-end summary appears (7)
- *   S5  verify fails     — exit 1 → no summary, gate notice with exit code,
- *                         round_checks verify/fail row (4)
+ *   S5  verify fails     — exit 1 with a LONG output (marker beyond the
+ *                         1500-char prefix) → no summary, gate notice whose
+ *                         output TAIL (not head) carries the marker (4)
  *   S6  no verdict      — changed round, no REVIEW line → blocked before any
  *                         verify runs (3)
  *   S7  chat-only round  — no changes → gate never runs, summary normal (3)
  *   S8  no verify config — changed + PASS closes directly; no verdict blocks (4)
  *   S9  restart race     — while the verify command runs, POST /api/restart
  *                         must NOT fire the restart (gateActive drains) (3)
+ *   S9b stale idle       — a new turn started while the gate's verify was
+ *                         running must never see a busy:false (SSE watch) (3)
  *
  * Scenarios S4-S8 share one server (each room drained before the next
  * starts, so per-turn change attribution stays clean); S9 boots its own
@@ -34,7 +40,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { diffSnapshotPaths, snapshotWorktree } from '../server/gitstate.ts'
+import { changedPathsBetween, diffSnapshotPaths, snapshotWorktree } from '../server/gitstate.ts'
 import { gateDecision, parseReviewVerdict } from '../server/sop.ts'
 
 const ROOT = join(import.meta.dirname, '..')
@@ -222,6 +228,56 @@ async function waitIdle(port, roomId, timeoutMs = 30_000) {
   return state !== null
 }
 
+/**
+ * Subscribe to a room's SSE stream and collect every event frame — the only
+ * way to catch a TRANSIENT broadcast (a busy:false flash has no persistent
+ * trace in /state or the db, but it drops the web client's live view on
+ * arrival).
+ */
+async function sseWatch(port, roomId) {
+  const controller = new AbortController()
+  const events = []
+  const response = await fetch(`http://127.0.0.1:${port}/api/rooms/${roomId}/events`, {
+    signal: controller.signal,
+  })
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  const drain = (async () => {
+    let buffer = ''
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let index
+        while ((index = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, index)
+          buffer = buffer.slice(index + 2)
+          const lines = frame.split('\n')
+          const event = lines.find((line) => line.startsWith('event: '))?.slice('event: '.length)
+          const dataLine = lines.find((line) => line.startsWith('data: '))
+          if (!event || !dataLine) continue
+          try {
+            events.push({ event, data: JSON.parse(dataLine.slice('data: '.length)) })
+          } catch {
+            /* partial frame; the next chunk completes it */
+          }
+        }
+      }
+    } catch {
+      /* aborted */
+    }
+  })()
+  return {
+    events,
+    stop: async () => {
+      await sleep(300) // let buffered frames land before tearing down
+      controller.abort()
+      await drain
+    },
+  }
+}
+
 /* ------------------------------------------------------- S1 verdict parser */
 
 function scenarioParser() {
@@ -251,6 +307,22 @@ function scenarioParser() {
   check('S1 超出尾部 5 行的结论不识别', parseReviewVerdict(beyondTail) === null, `实际 ${parseReviewVerdict(beyondTail)}`)
   const withinTail = 'REVIEW: CHANGES\n其一\n其二\n其三\n其四\nREVIEW: PASS'
   check('S1 尾部 5 行内的最后结论生效', parseReviewVerdict(withinTail) === 'pass', `实际 ${parseReviewVerdict(withinTail)}`)
+
+  // Multi-block markdown — how real reviews arrive (review round 2: the
+  // space-joining extraction glued these into one line and every one of
+  // them parsed null while the mock-only S1 cases stayed green).
+  const casesBlocks = [
+    ['结论：通过。\n\nREVIEW: PASS', 'pass', '空行分段不与结论粘连'],
+    ['**结论：通过。**\n\nREVIEW: PASS', 'pass', '加粗独立段不吞结论行'],
+    ['- 问题一\n- 问题二\n\nREVIEW: PASS', 'pass', '列表后的结论行独立'],
+    ['REVIEW: PASS\n\n其一\n\n其二\n\n其三', 'pass', '尾部 5 行内含空行仍生效'],
+    ['看\n**REVIEW: PASS**', 'pass', '软换行后整行加粗是独立行'],
+    ['`REVIEW: PASS`', 'pass', '整行仅一个 code span 仍识别（规则 9 示例被照抄）'],
+  ]
+  for (const [content, expected, label] of casesBlocks) {
+    const actual = parseReviewVerdict(content)
+    check(`S1 ${label}`, actual === expected, `实际 ${JSON.stringify(actual)}`)
+  }
 }
 
 /* -------------------------------------------------------- S2 decision table */
@@ -306,6 +378,57 @@ async function scenarioSnapshot() {
     diff.length === 1 && diff[0] === 'server-sim/a.ts',
     JSON.stringify(diff),
   )
+
+  // A tracked file edited AGAIN keeps its XY code (` M` → ` M`) AND, for a
+  // 1-line-for-1-line swap, the diffstat numbers too (`2 +-` twice) — only
+  // the entry fingerprint sees it (review round 2: the status-only diff
+  // let a gated round close).
+  const tracked = join(repo, 'tracked.ts')
+  writeFileSync(tracked, 'export const t = 1\n')
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, '-c', 'user.name=sop', '-c', 'user.email=sop@t', 'commit', '-m', 'tracked', '--allow-empty'], { stdio: 'ignore' })
+  const cleanTracked = await snapshotWorktree(sub)
+  writeFileSync(tracked, 'export const t = 2\n')
+  const dirtyTracked = await snapshotWorktree(sub)
+  check('S3 dirty 文件首次弄脏 → changed 含该文件', changedPathsBetween(cleanTracked, dirtyTracked).includes('tracked.ts'))
+  await sleep(60)
+  writeFileSync(tracked, 'export const t = 9\n') // same ` M` code, same 1-line swap, new content
+  const reEdited = await snapshotWorktree(sub)
+  check('S3 二次修改同文件（XY 与 diffstat 均不变）→ digest 仍变化', reEdited.digest !== dirtyTracked.digest)
+  const reDiff = diffSnapshotPaths(dirtyTracked, reEdited)
+  check(
+    'S3 二次修改同文件 → 指纹级 diff 恰好得到该文件',
+    reDiff.length === 1 && reDiff[0] === 'tracked.ts',
+    JSON.stringify(reDiff),
+  )
+  // The fallback: a digest that moved with NO attributable entry diff
+  // (defensive — anything the fingerprint somehow missed) degrades to the
+  // after snapshot's dirty set, never to "no change".
+  check(
+    'S3 digest 变化但 diff 无法归属 → 退化为 after 脏路径全集',
+    JSON.stringify(changedPathsBetween(dirtyTracked, { ...reEdited, digest: 'force-different' })) === JSON.stringify(reEdited.paths),
+    JSON.stringify(changedPathsBetween(dirtyTracked, { ...reEdited, digest: 'force-different' })),
+  )
+
+  // Untracked content edits keep `??` and never show in `git diff HEAD`:
+  // the size+mtime fingerprint is what makes them visible to the gate.
+  const untracked = join(sub, 'scratch.txt')
+  writeFileSync(untracked, 'v1')
+  const un1 = await snapshotWorktree(sub)
+  check('S3 untracked 快照带指纹', un1.entries.some((entry) => entry.path === 'workspace/scratch.txt' && entry.fingerprint))
+  await sleep(60)
+  writeFileSync(untracked, 'version 2 with different length')
+  const un2 = await snapshotWorktree(sub)
+  check('S3 untracked 内容变化 → digest 变化', un2.digest !== un1.digest)
+  check(
+    'S3 untracked 内容变化 → changed 含该文件',
+    changedPathsBetween(un1, un2).includes('workspace/scratch.txt'),
+    JSON.stringify(changedPathsBetween(un1, un2)),
+  )
+
+  // Unjudgeable stays "cannot tell" — never silently "no changes".
+  check('S3 两侧其一不可判定 → null（无法判定≠无改动）', changedPathsBetween(clean1, { ...clean1, available: false }) === null)
+  check('S3 digest 相同 → []', JSON.stringify(changedPathsBetween(clean1, { ...clean1 })) === '[]')
 
   const nonGit = mkdtempSync(join(tmpdir(), 'ac-sop-s3n-'))
   tempDirs.push(nonGit)
@@ -391,10 +514,14 @@ async function scenarioEndToEnd() {
     check('S4 轮末总结出现（总结丙发言）', characterMessages(messages, '总结丙').length === 1, '总结丙未发言')
   }
 
-  /* S5 verify fails: exit 1 → no summary, fail notice, verify/fail row. */
+  /* S5 verify fails: exit 1 with a LONG output → no summary, fail notice
+   * whose output TAIL carries the marker. The marker sits BEYOND the
+   * 1500-char prefix: a head-keeping cap (the truncate() this replaced)
+   * dropped exactly this line — the only one that names the failure. */
   {
     const room = await makeSopRoom(port, repo, 's5-验证失败', {
-      verifyCommand: 'echo sop-verify-fail-marker && exit 1',
+      verifyCommand:
+        'node -e "console.log(\'x\'.repeat(2000));console.log(\'sop-verify-fail-marker\');process.exit(1)"',
       reviewerPersona: 'MOCK-评审通过',
     })
     const messages = await runRoundAndDrain(port, room.id)
@@ -525,6 +652,72 @@ async function scenarioRestartRace() {
   // hardKill() cleans up (the WMI script was never launched).
 }
 
+/* ------------------------------------------------- S9b stale idle broadcast */
+
+/**
+ * The gate's async await (a verify run) can straddle a new human message:
+ * that message's own pump() starts a turn, and when the verify settles the
+ * OLD pump resumes into "queue was empty" state and used to broadcast
+ * busy:false straight over the running turn — the web client drops its
+ * live view on busy:false, mid-turn. The fix re-checks active/queue after
+ * the await; this scenario pins it with a real SSE listener, the only
+ * witness of a transient broadcast.
+ */
+async function scenarioStaleIdleRace() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-sop-s9b-'))
+  tempDirs.push(dir)
+  const repo = mkdtempSync(join(tmpdir(), 'ac-sop-s9brepo-'))
+  tempDirs.push(repo)
+  execFileSync('git', ['-C', repo, 'init'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, '-c', 'user.name=sop', '-c', 'user.email=sop@t', 'commit', '-m', 'seed', '--allow-empty'], {
+    stdio: 'ignore',
+  })
+
+  const server = await bootServer(dir)
+  const port = server.port
+  // The verify must outlive the turns that triggered it (write → PASS) but
+  // stay INSIDE the slow turn fired while it runs — that overlap is the
+  // window where the stale pump wakes up. ping -n 5 / sleep 4 ≈ 4s; the
+  // mock 模拟慢速 turn runs ~4.8s.
+  const room = await makeSopRoom(port, repo, 's9b-陈旧idle', {
+    verifyCommand: IS_WIN ? 'ping -n 5 127.0.0.1' : 'sleep 4',
+    reviewerPersona: 'MOCK-评审通过',
+  })
+  await makeCharacter(
+    port,
+    room.id,
+    '慢戊',
+    { onUser: false, onAll: false, onCharacters: [], onCharacterNames: [], keyword: '', mention: true, onRoundEnd: false },
+    '慢速测试角色',
+  )
+
+  const watch = await sseWatch(port, room.id)
+  await postMessage(port, room.id, '请开始干活，完成后请评审')
+  const gateRunning = await waitState(port, room.id, (state) => state.gate === 'running', 40_000)
+  check('S9b 验证运行中 gate=running（慢回合启动前的锚点）', gateRunning !== null, '40s 内未见 gate running')
+  // The slow turn (mock 模拟慢速, ~5s) starts while the verify (~4s) is
+  // still running: the verify settles mid-turn and its pump resumes.
+  await postMessage(port, room.id, '@慢戊 模拟慢速')
+  const idle = await waitIdle(port, room.id, 40_000)
+  check('S9b 场景完整收敛（慢回合与门禁均落地）', idle, '房间未回到 idle')
+  await watch.stop()
+
+  // Scan the whole stream: a busy:false must never arrive between a turn's
+  // running and its terminal event. (A legitimate busy:false only ever
+  // follows the turn's done/stopped broadcast — never precedes it.)
+  let violations = 0
+  let inTurn = false
+  for (const { event, data } of watch.events) {
+    if (event === 'turn') {
+      inTurn = data.status === 'running'
+    } else if (event === 'busy' && data.busy === false && inTurn) {
+      violations += 1
+    }
+  }
+  check('S9b 门禁 await 悬空期无陈旧 idle 广播（运行中回合不闪 busy:false）', violations === 0, `${violations} 个 busy:false 落在回合区间内`)
+}
+
 /* ------------------------------------------------------------------- main */
 
 try {
@@ -533,6 +726,7 @@ try {
   await scenarioSnapshot()
   await scenarioEndToEnd()
   await scenarioRestartRace()
+  await scenarioStaleIdleRace()
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

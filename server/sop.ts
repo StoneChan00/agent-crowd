@@ -8,10 +8,13 @@
  * tolerated, case-insensitive). `REVIEW: PASSED` and friends are NOT
  * verdicts — the line must contain verdict and nothing else, otherwise a
  * sentence like "I don't think REVIEW: PASSED is right here" would gate a
- * round shut. Verdicts inside code spans/fences are invisible on purpose:
- * they are quoted text, same rule as @mentions.
+ * round shut. Verdicts inside code fences are invisible on purpose: they
+ * are quoted text, same rule as @mentions.
  */
-import { visibleText } from './mentions.ts'
+import { fromMarkdown } from 'mdast-util-from-markdown'
+import { gfm } from 'micromark-extension-gfm'
+import { gfmFromMarkdown } from 'mdast-util-gfm'
+import { NOT_A_CALL } from './mentions.ts'
 
 /** Whole-line verdict: optional `**`/whitespace framing, REVIEW, colon, keyword, nothing else. */
 const REVIEW_LINE = /^\s*\**\s*review\s*[:：]\s*\**\s*(pass|changes)\s*\**\s*$/i
@@ -21,12 +24,75 @@ export type ReviewVerdict = 'pass' | 'changes'
 /** How many trailing non-empty lines of a message are scanned for the verdict. */
 export const REVIEW_TAIL_LINES = 5
 
+/** Minimal mdast shape — enough for the extraction pass (same trick as mentions.ts). */
+interface MdNode {
+  type: string
+  value?: string
+  children?: MdNode[]
+}
+
+/**
+ * Block-level nodes: a boundary between two of them is a REAL line break in
+ * the rendered output. The list mirrors the mdast block set the web pipeline
+ * renders as separate blocks.
+ */
+const BLOCK_NODES = new Set([
+  'paragraph', 'heading', 'code', 'html', 'list', 'listItem', 'blockquote',
+  'table', 'tableRow', 'tableCell', 'thematicBreak', 'definition',
+])
+
+/**
+ * The visible text of a message with BLOCK BOUNDARIES PRESERVED — the one
+ * thing `visibleText` (mentions.ts) cannot offer: it joins every fragment
+ * with spaces so a `@name` boundary can never be created or eaten, which
+ * flattens `结论。\n\nREVIEW: PASS` into a single glued line the whole-line
+ * verdict anchor then can never match. Real review messages arrive as
+ * multi-block markdown (paragraph → list → conclusion), so the extraction
+ * walks the same mdast tree but emits `\n` around block nodes and keeps
+ * soft line breaks (they live inside text values).
+ *
+ * Code spans are the deliberate exception to the opaque set: their content
+ * flows into the line. A whole line that is just `` `REVIEW: PASS` `` still
+ * reads as a verdict — agents copy rule 9's example text into backticks —
+ * while `先看 `REVIEW: PASS` 这行` keeps its framing text and matches
+ * nothing. Fenced code, html and link labels stay invisible exactly like
+ * mentions: quoted text, never a gate signal.
+ */
+function blockwiseText(content: string): string {
+  const parts: string[] = []
+  const walk = (node: MdNode): void => {
+    if (node.type === 'break') {
+      parts.push('\n')
+      return
+    }
+    if (NOT_A_CALL.has(node.type)) {
+      if (node.type === 'inlineCode' && node.value) parts.push(node.value)
+      return
+    }
+    if (node.type === 'text') {
+      if (node.value) parts.push(node.value)
+      return
+    }
+    const block = BLOCK_NODES.has(node.type)
+    if (block) parts.push('\n')
+    for (const child of node.children ?? []) walk(child)
+    if (block) parts.push('\n')
+  }
+  walk(
+    fromMarkdown(content, {
+      extensions: [gfm()],
+      mdastExtensions: [gfmFromMarkdown()],
+    }) as unknown as MdNode,
+  )
+  return parts.join('')
+}
+
 /**
  * The verdict a message carries, or null. When several tail lines carry a
  * verdict the LAST one wins — "CHANGES → PASS after the fix" is a pass.
  */
 export function parseReviewVerdict(content: string): ReviewVerdict | null {
-  const plain = visibleText(content)
+  const plain = blockwiseText(content)
   const lines = plain
     .split('\n')
     .map((line) => line.trim())

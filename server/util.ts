@@ -13,6 +13,16 @@ export function truncate(text: string, max: number, suffix = '…'): string {
   return text.slice(0, Math.max(0, max - suffix.length)) + suffix
 }
 
+/**
+ * Keep the LAST max chars — the counterpart of truncate(). A command's
+ * output ends with the error that killed it, so a head-keeping cap on
+ * "output tail" silently discards exactly the diagnostic part.
+ */
+export function tail(text: string, max: number, prefix = '…'): string {
+  if (text.length <= max) return text
+  return prefix + text.slice(text.length - Math.max(0, max - prefix.length))
+}
+
 export function formatClock(ts: number): string {
   return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false })
 }
