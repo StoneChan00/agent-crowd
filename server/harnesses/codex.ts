@@ -41,9 +41,10 @@ interface CodexEvent {
 /**
  * Codex adapter: `codex exec --json --skip-git-repo-check
  * [--dangerously-bypass-approvals-and-sandbox|--sandbox read-only] [--model M]
- * <prompt>`. `exec` is codex's one-shot non-interactive mode: JSONL events on
- * stdout (thread.started / turn.started / item.* / turn.completed / error /
- * turn.failed), everything else on stderr.
+ * <prompt>` (resumed turns: `exec resume <id>` + `-c sandbox_mode=read-only`
+ * when not autoApprove — see buildCodexArgs). `exec` is codex's one-shot
+ * non-interactive mode: JSONL events on stdout (thread.started / turn.started
+ * / item.* / turn.completed / error / turn.failed), everything else on stderr.
  *
  * The bypass flag is codex's full-trust equivalent of the house style
  * (opencode --auto / cannbot --dangerously-skip-permissions / hermes --yolo);
@@ -61,10 +62,46 @@ interface CodexEvent {
  * positionals before options) and the run then fails fast on the SESSION
  * lookup — exactly the shape the orchestrator's clear-and-rerun-full
  * fallback exists for. Note `exec resume` does NOT accept `--sandbox`
- * (rejected at argv parse, only the bypass flag exists), so a resumed
- * non-autoApprove turn rides codex's own default sandbox.
+ * (rejected at argv parse, only the bypass flag exists), but it DOES
+ * accept `-c` overrides — probe-verified: `exec resume <uuid> -c
+ * sandbox_mode=read-only --json --skip-git-repo-check "hi"` parses clean
+ * and dies only on the session lookup. So a resumed non-autoApprove turn
+ * keeps its read-only guarantee via `-c sandbox_mode=read-only`; letting
+ * it ride codex's own default would hand the user's explicit "read-only"
+ * choice to whatever `sandbox_mode` the local config happens to carry.
  */
 const codexResumeArgs = (id: string): string[] => ['exec', 'resume', id]
+
+/**
+ * Pure argv assembly for one codex turn (exported for session-check P3).
+ * The assembly point itself is asserted — fragment tests alone let the
+ * resume branch silently drop the sandbox guarantee through (review round
+ * of P0-1); a full-argv assertion pins every flag's presence and position.
+ */
+export function buildCodexArgs(input: {
+  argsPrefix: string[]
+  resumeId?: string
+  autoApprove: boolean
+  model: string
+  prompt: string
+}): string[] {
+  const args = [
+    ...input.argsPrefix,
+    ...(input.resumeId ? codexResumeArgs(input.resumeId) : ['exec']),
+    '--json',
+    '--skip-git-repo-check',
+    ...(input.autoApprove
+      ? ['--dangerously-bypass-approvals-and-sandbox']
+      : input.resumeId
+        ? ['-c', 'sandbox_mode=read-only']
+        : ['--sandbox', 'read-only']),
+  ]
+  const model = input.model.trim()
+  if (model) args.push('--model', model)
+  args.push(input.prompt)
+  return args
+}
+
 export const codexAdapter: HarnessAdapter = {
   id: 'codex',
   label: 'Codex',
@@ -79,23 +116,13 @@ export const codexAdapter: HarnessAdapter = {
     }
 
     const started = Date.now()
-    const args = [
-      ...spec.argsPrefix,
-      // Resume rides the `exec resume` subcommand (P0-1); see the probe
-      // notes on codexResumeArgs — `--sandbox` is not accepted there, so a
-      // resumed non-autoApprove run rides codex's default sandbox instead.
-      ...(input.resume ? codexResumeArgs(input.resume.id) : ['exec']),
-      '--json',
-      '--skip-git-repo-check',
-      ...(input.character.autoApprove
-        ? ['--dangerously-bypass-approvals-and-sandbox']
-        : input.resume
-          ? []
-          : ['--sandbox', 'read-only']),
-    ]
-    const model = input.character.model.trim()
-    if (model) args.push('--model', model)
-    args.push(input.prompt)
+    const args = buildCodexArgs({
+      argsPrefix: spec.argsPrefix,
+      resumeId: input.resume?.id,
+      autoApprove: input.character.autoApprove,
+      model: input.character.model,
+      prompt: input.prompt,
+    })
 
     const agentMessages: string[] = []
     let sessionId: string | undefined

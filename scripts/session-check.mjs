@@ -7,15 +7,20 @@
  * Layers:
  *   P1  incremental prompt (pure): post-cursor messages only, pre-cursor
  *       absent, no-new-messages copy, since=0 ≡ full, resumed title note,
- *       default call unchanged, cursor helper (7)
+ *       default call unchanged, same-millisecond tiebreak, cursor helper (9)
  *   P2  db isolation & invalidation: two rooms never cross sessions;
- *       delete character / clear messages / harness drift / delete room
- *       each sweep the row (9)
+ *       delete character / clear messages / harness drift / model drift /
+ *       delete room each sweep the row (11)
  *   P3  resume argv (pure): every declared adapter's resumeArgs('abc')
- *       asserted exactly (order included); undeclared adapters undefined (8)
+ *       asserted exactly (order included); undeclared adapters undefined;
+ *       full assembled argv for claude/codex/opencode/cannbot — flags and
+ *       positions pinned, the codex resume sandbox parity lives here (17)
  *   P4  integration: two mock rounds → sessions.turns=2, 2nd message
  *       meta.resume=true, RESUME-OK line count proves old messages stayed
  *       OUT of the prompt (7)
+ *   P4b mid-round message: a message posted while the round-1 CLI is still
+ *       streaming must ship in round 2's increment — locks the cursor
+ *       against Date.now()-style regressions (7)
  *   P5  fallback: preseeded bogus session → resume dies → silent full
  *       rerun, no user-facing failure message, session row replaced (5)
  *   P6  kill switch: AC_SESSION_RESUME=0 → adapter gets no resume, no
@@ -36,6 +41,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import { buildClaudeArgs } from '../server/harnesses/claude.ts'
+import { buildCodexArgs } from '../server/harnesses/codex.ts'
+import { buildOpencodeLikeArgs } from '../server/harnesses/opencodeLike.ts'
 import { getAdapter } from '../server/harnesses/index.ts'
 import { buildTurnPrompt, nextSessionCursor } from '../server/prompt.ts'
 import { DEFAULT_TRIGGERS } from '../server/types.ts'
@@ -167,6 +175,57 @@ async function waitIdle(port, roomId, timeoutMs = 30_000) {
   return state !== null
 }
 
+/**
+ * Live SSE subscription (P4b): streaming events as they arrive, same frame
+ * parsing as sop-check's S9b watcher. The first `delta` of kind 'text' is
+ * the deterministic "the turn's prompt snapshot has already been taken"
+ * signal — adapter.run() only starts after db.listMessages, so a message
+ * posted after that delta can never leak into the running turn's prompt.
+ */
+async function sseWatch(port, roomId) {
+  const controller = new AbortController()
+  const events = []
+  const response = await fetch(`http://127.0.0.1:${port}/api/rooms/${roomId}/events`, {
+    signal: controller.signal,
+  })
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  const drain = (async () => {
+    let buffer = ''
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let index
+        while ((index = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, index)
+          buffer = buffer.slice(index + 2)
+          const lines = frame.split('\n')
+          const event = lines.find((line) => line.startsWith('event: '))?.slice('event: '.length)
+          const dataLine = lines.find((line) => line.startsWith('data: '))
+          if (!event || !dataLine) continue
+          try {
+            events.push({ event, data: JSON.parse(dataLine.slice('data: '.length)) })
+          } catch {
+            /* partial frame; the next chunk completes it */
+          }
+        }
+      }
+    } catch {
+      /* aborted */
+    }
+  })()
+  return {
+    events,
+    stop: async () => {
+      await sleep(300) // let buffered frames land before tearing down
+      controller.abort()
+      await drain
+    },
+  }
+}
+
 /* ------------------------------------------------------------------ sqlite */
 
 function withDb(dataDir, fn) {
@@ -225,7 +284,7 @@ function scenarioIncrementalPrompt() {
     harness: 'mock', model: 'mock', persona: '测试人设', cwd: '', triggers: DEFAULT_TRIGGERS,
     commandTemplate: '', autoApprove: true, enabled: true, identityId: null, presetId: null, createdAt: 0,
   }
-  const msg = (id, content, at, authorType = 'user') => ({
+  const msg = (id, content, at, seq, authorType = 'user') => ({
     id,
     roomId: 'r1',
     authorType,
@@ -236,24 +295,33 @@ function scenarioIncrementalPrompt() {
     content,
     meta: null,
     createdAt: at,
+    seq,
   })
   const messages = [
-    msg('m1', '旧消息：第一轮需求是红鲱鱼方案', 100),
-    msg('m2', '甲的旧回复：收到', 200, 'character'),
-    msg('m3', '新消息：第二轮指令是蓝鲸号方案', 300),
+    msg('m1', '旧消息：第一轮需求是红鲱鱼方案', 100, 11),
+    msg('m2', '甲的旧回复：收到', 200, 12, 'character'),
+    msg('m3', '新消息：第二轮指令是蓝鲸号方案', 300, 13),
+    // Same-millisecond siblings of m3 (P0-1 review): a bare createdAt cursor
+    // swallows exactly these — seq is the tiebreaker.
+    msg('m4', '同毫秒第一条：海豚号', 300, 14),
+    msg('m5', '同毫秒第二条：海鸥号', 300, 15),
   ]
   const build = (opts) =>
     buildTurnPrompt({ room, character, characters: [character], messages, cwd: 'D:/tmp', ...opts })
 
-  const resumed = build({ since: 200, resumed: true })
-  check('P1 游标后的新消息进入 prompt', resumed.includes('蓝鲸号'))
+  const resumed = build({ since: { at: 200, seq: 0 }, resumed: true })
+  check(
+    'P1 游标后的新消息进入 prompt',
+    resumed.includes('蓝鲸号') && resumed.includes('海豚号') && resumed.includes('海鸥号'),
+    resumed.slice(-200),
+  )
   check('P1 游标前的旧消息不进入 prompt', !resumed.includes('红鲱鱼'))
   check('P1 续传标题注明增量语义', resumed.includes('（以下是你上次发言之后的新消息；更早内容已在同一会话上下文中）'))
 
-  const empty = build({ since: 300, resumed: true })
+  const empty = build({ since: { at: 300, seq: 15 }, resumed: true })
   check('P1 无新消息时写（无新消息）', empty.includes('（无新消息）'), empty.slice(-200))
 
-  const since0 = build({ since: 0, resumed: true })
+  const since0 = build({ since: { at: 0, seq: 0 }, resumed: true })
   check('P1 since=0 等价全量（全部消息可见）', since0.includes('红鲱鱼') && since0.includes('蓝鲸号'))
 
   const full = build({})
@@ -262,11 +330,27 @@ function scenarioIncrementalPrompt() {
     full.includes('红鲱鱼') && full.includes('蓝鲸号') && !full.includes('上次发言之后的新消息'),
   )
 
+  // The same-millisecond regression (P0-1 review): cursor exactly at m3
+  // (seq 13) — the old bare createdAt filter would skip BOTH m4 and m5.
+  const afterM3 = build({ since: { at: 300, seq: 13 }, resumed: true })
+  check(
+    'P1 同毫秒后到的消息不被裸时间游标吞掉',
+    afterM3.includes('海豚号') && afterM3.includes('海鸥号') && !afterM3.includes('蓝鲸号'),
+    afterM3.slice(-200),
+  )
+  // Cursor at m4: only m5 stays visible — the tiebreak is per-message.
+  const afterM4 = build({ since: { at: 300, seq: 14 }, resumed: true })
+  check(
+    'P1 游标在同毫秒内精确到该条之后',
+    afterM4.includes('海鸥号') && !afterM4.includes('海豚号') && !afterM4.includes('蓝鲸号'),
+    afterM4.slice(-200),
+  )
+
   check(
     'P1 nextSessionCursor 取最新可见消息、空表回落游标',
-    nextSessionCursor(messages, 200) === 300 &&
-      nextSessionCursor(messages, 0) === 300 &&
-      nextSessionCursor([], 200) === 200,
+    JSON.stringify(nextSessionCursor(messages, { at: 200, seq: 0 })) === JSON.stringify({ at: 300, seq: 15 }) &&
+      JSON.stringify(nextSessionCursor(messages, { at: 0, seq: 0 })) === JSON.stringify({ at: 300, seq: 15 }) &&
+      JSON.stringify(nextSessionCursor([], { at: 200, seq: 0 })) === JSON.stringify({ at: 200, seq: 0 }),
   )
 }
 
@@ -319,6 +403,24 @@ async function scenarioIsolation() {
   await req(port, `/api/rooms/${room2.id}/clear`, { method: 'POST' })
   check('P2 清空消息 → 房间全部 session 行消失', sessionRows(dir, 'room_id = ?', room2.id).length === 0)
 
+  // Model drift (P0-1 review): same harness, different brain — the row must
+  // go, exactly like harness drift.
+  await req(port, `/api/characters/${a1.id}`, { method: 'PATCH', body: JSON.stringify({ model: 'drifted-model' }) })
+  check(
+    'P2 model 变化 → session 行消失',
+    sessionRows(dir, 'room_id = ? and character_id = ?', room1.id, a1.id).length === 0,
+  )
+
+  // Re-establish a row so the harness-drift check below still proves
+  // CLEARING (the re-run itself doubles as a full-replay exercise — there is
+  // no row to resume after the model drift).
+  await postMessage(port, room1.id, '甲一请再报一次')
+  await waitIdle(port, room1.id, 40_000)
+  check(
+    'P2 漂移清行后重跑恢复 session 行（全量重放成功）',
+    sessionRows(dir, 'room_id = ? and character_id = ?', room1.id, a1.id).length === 1,
+  )
+
   // Harness drift: the stored session belongs to a different agent now.
   await req(port, `/api/characters/${a1.id}`, { method: 'PATCH', body: JSON.stringify({ harness: 'dsh' }) })
   check('P2 harness 变化 → session 行消失', sessionRows(dir, 'room_id = ? and character_id = ?', room1.id, a1.id).length === 0)
@@ -354,6 +456,70 @@ function scenarioResumeArgs() {
   for (const id of ['dsh', 'hermes', 'custom']) {
     check(`P3 ${id} 未声明 resume 能力（返回 undefined）`, getAdapter(id).resumeArgs === undefined)
   }
+}
+
+/**
+ * Full assembled argv, not just the resume fragment (P0-1 review): the
+ * codex resume branch dropping its read-only sandbox slipped through every
+ * fragment assertion — the assembly point itself is what has to be pinned,
+ * flags and positions included.
+ */
+function scenarioFullArgv() {
+  const P = 'PROMPT-样例'
+  const WD = 'D:/work'
+  const eq = (name, actual, expected) =>
+    check(name, JSON.stringify(actual) === JSON.stringify(expected), `实际 ${JSON.stringify(actual)}`)
+
+  // codex — 2×2 matrix (fresh/resume × autoApprove) + empty model.
+  eq(
+    'P3 codex 全量 argv（只读沙箱，argsPrefix 前置）',
+    buildCodexArgs({ argsPrefix: ['node', 'wrap.js'], autoApprove: false, model: 'gpt-5', prompt: P }),
+    ['node', 'wrap.js', 'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '--model', 'gpt-5', P],
+  )
+  eq(
+    'P3 codex 续传 argv 保住只读沙箱（-c 通道，非 autoApprove）',
+    buildCodexArgs({ argsPrefix: [], resumeId: 'sid-9', autoApprove: false, model: 'gpt-5', prompt: P }),
+    ['exec', 'resume', 'sid-9', '--json', '--skip-git-repo-check', '-c', 'sandbox_mode=read-only', '--model', 'gpt-5', P],
+  )
+  eq(
+    'P3 codex 全量 argv（autoApprove 走 bypass，无沙箱）',
+    buildCodexArgs({ argsPrefix: [], autoApprove: true, model: 'gpt-5', prompt: P }),
+    ['exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5', P],
+  )
+  eq(
+    'P3 codex 续传 argv（autoApprove 走 bypass，无 -c）',
+    buildCodexArgs({ argsPrefix: [], resumeId: 'sid-9', autoApprove: true, model: 'gpt-5', prompt: P }),
+    ['exec', 'resume', 'sid-9', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5', P],
+  )
+  eq(
+    'P3 codex 空 model 不产 --model',
+    buildCodexArgs({ argsPrefix: [], autoApprove: false, model: '  ', prompt: P }),
+    ['exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', P],
+  )
+
+  // claude
+  eq(
+    'P3 claude 全量 argv（默认权限模式）',
+    buildClaudeArgs({ argsPrefix: [], autoApprove: false, model: 'sonnet', prompt: P }),
+    ['-p', P, '--output-format', 'stream-json', '--verbose', '--model', 'sonnet', '--permission-mode', 'default'],
+  )
+  eq(
+    'P3 claude 续传 argv（skip-permissions）',
+    buildClaudeArgs({ argsPrefix: [], resumeId: 'sid-7', autoApprove: true, model: 'sonnet', prompt: P }),
+    ['-p', P, '--output-format', 'stream-json', '--verbose', '--resume', 'sid-7', '--model', 'sonnet', '--dangerously-skip-permissions'],
+  )
+
+  // opencode-like — one adapter, two auto-approve flags.
+  eq(
+    'P3 opencode 续传 argv（--session，非 autoApprove 无额外旗标）',
+    buildOpencodeLikeArgs({ argsPrefix: [], resumeId: 'sid-3', autoApprove: false, autoApproveFlag: '--auto', model: 'qwen3-max', cwd: WD, prompt: P }),
+    ['run', '--format', 'json', '--session', 'sid-3', '--model', 'qwen3-max', '--dir', WD, P],
+  )
+  eq(
+    'P3 cannbot 续传 argv（--session + 其 bypass 旗标）',
+    buildOpencodeLikeArgs({ argsPrefix: [], resumeId: 'sid-3', autoApprove: true, autoApproveFlag: '--dangerously-skip-permissions', model: '', cwd: WD, prompt: P }),
+    ['run', '--format', 'json', '--session', 'sid-3', '--dangerously-skip-permissions', '--dir', WD, P],
+  )
 }
 
 /* ------------------------------------------ P4 integration: two mock rounds */
@@ -396,6 +562,68 @@ async function scenarioIntegration() {
   check('P4 增量 prompt 只带游标后的消息（新消息 2 条而非 3 条）', second?.content.includes('新消息 2 条'), second?.content)
   const row2 = sessionRows(dir, 'room_id = ?', room.id)[0]
   check('P4 第二轮后 sessions.turns=2', row2 && row2.turns === 2, JSON.stringify(row2))
+}
+
+/* ---------------------------- P4b integration: message during a running turn */
+
+/**
+ * Mid-round message (P0-1 review): round 1 rides the slow mock seam (~4.8s)
+ * so a second human message can be posted strictly INSIDE the turn. The
+ * cursor round 1 leaves behind must be the newest message ITS prompt
+ * actually carried (msg1 only) — a Date.now()-style regression would set it
+ * past the mid-round message and round 2's increment would come up empty.
+ * The first streamed `delta` is the deterministic injection point: the
+ * harness only starts after the turn's message snapshot, so the mid-round
+ * message can never leak into round 1's own prompt.
+ */
+async function scenarioMidRoundMessage() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-session-p4b-'))
+  tempDirs.push(dir)
+  const work = mkdtempSync(join(tmpdir(), 'ac-session-p4bw-'))
+  tempDirs.push(work)
+
+  const server = await bootServer(dir)
+  const port = server.port
+  const room = await makeRoom(port, 'p4b-运行中插话', work)
+  await makeCharacter(port, room.id, '甲', 'MOCK-续传')
+
+  const watch = await sseWatch(port, room.id)
+  await postMessage(port, room.id, '第一轮：模拟慢速，先建立会话')
+  const sawStream = await (async () => {
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      if (watch.events.some((frame) => frame.event === 'delta' && frame.data?.kind === 'text')) return true
+      await sleep(100)
+    }
+    return false
+  })()
+  check('P4b 第一轮流式输出已开始（prompt 快照已过）', sawStream)
+  await postMessage(port, room.id, '中途插话：暗号是蓝鲸号二')
+  await waitIdle(port, room.id, 60_000)
+  await watch.stop()
+
+  const messages = (await req(port, `/api/rooms/${room.id}/messages?limit=200`)).messages
+  const replies = characterMessages(messages, '甲')
+  check(
+    'P4b 消息 seq 随插入单调递增（rowid tiebreaker 在位）',
+    messages.every((message, index) => index === 0 || message.seq > messages[index - 1].seq),
+    messages.map((message) => message.seq).join(','),
+  )
+  check('P4b 两轮各 1 条回复（中途消息接力出第二轮）', replies.length === 2, `实际 ${replies.length}`)
+  const second = replies[1]
+  check('P4b 第二轮为续传轮（meta.resume=true）', second?.meta?.resume === true)
+  check(
+    'P4b 中途消息未被游标吞掉（增量 prompt 带上它）',
+    Boolean(second) && second.content.includes('蓝鲸号二'),
+    second?.content,
+  )
+  check(
+    'P4b 增量恰 2 条（慢速回复 + 中途消息）',
+    Boolean(second) && second.content.includes('新消息 2 条'),
+    second?.content,
+  )
+  const row = sessionRows(dir, 'room_id = ?', room.id)[0]
+  check('P4b sessions.turns=2', row && row.turns === 2, JSON.stringify(row))
 }
 
 /* -------------------------------------------- P5 fallback: bogus session row */
@@ -477,8 +705,10 @@ async function scenarioKillSwitch() {
 try {
   scenarioIncrementalPrompt()
   scenarioResumeArgs()
+  scenarioFullArgv()
   await scenarioIsolation()
   await scenarioIntegration()
+  await scenarioMidRoundMessage()
   await scenarioFallback()
   await scenarioKillSwitch()
 } catch (error) {

@@ -227,6 +227,15 @@ export interface Message {
   content: string
   meta: MessageMeta | null
   createdAt: number
+  /**
+   * Insertion sequence = the messages table's rowid (P0-1 review): monotonic
+   * with insert order, and together with `createdAt` the same total order the
+   * messages query itself sorts by. The session cursor carries it as the
+   * same-millisecond tiebreaker — a bare createdAt cursor would permanently
+   * skip any sibling message written within the same ms (scripted clients
+   * double-post that fast).
+   */
+  seq: number
 }
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'error' | 'stopped'
@@ -313,8 +322,13 @@ export interface Session {
   model: string
   /** The CLI's own session/thread identifier. */
   sessionId: string
-  /** createdAt of the newest message already delivered into the session. */
+  /**
+   * Cursor of the messages already delivered into the session: createdAt of
+   * the newest one, plus its seq as the same-millisecond tiebreaker (see
+   * Message.seq — the pair is what "already delivered" compares on).
+   */
   consumedAt: number
+  consumedSeq: number
   /** How many successful turns have ridden (re)written this row. */
   turns: number
   createdAt: number

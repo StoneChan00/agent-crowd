@@ -855,14 +855,14 @@ async function pump(roomId: string): Promise<void> {
       process.env.AC_SESSION_RESUME !== '0' &&
       session.harness === character.harness &&
       session.model === character.model
-    const since = useResume && session ? session.consumedAt : 0
-    // The cursor the NEXT turn resumes from: the newest message this prompt
-    // actually carries (newest always survives the budget). Never Date.now()
-    // — messages arriving mid-turn must stay newer than the cursor or they
-    // would be skipped forever. The cursor FILTER itself lives in
-    // buildTurnPrompt (single source: prompt.ts owns what a resumed prompt
-    // renders, this only computes where it leaves off).
-    const consumedAt = nextSessionCursor(messages, since)
+    const since = useResume && session ? { at: session.consumedAt, seq: session.consumedSeq } : { at: 0, seq: 0 }
+    // The cursor the NEXT turn resumes from: the (createdAt, seq) of the
+    // newest message this prompt actually carries (newest always survives
+    // the budget). Never Date.now() — messages arriving mid-turn must stay
+    // AFTER the cursor or they would be skipped forever. The cursor FILTER
+    // itself lives in buildTurnPrompt (single source: prompt.ts owns what a
+    // resumed prompt renders, this only computes where it leaves off).
+    const consumedCursor = nextSessionCursor(messages, since)
     const prompt = buildTurnPrompt({
       room,
       character,
@@ -1116,12 +1116,12 @@ async function pump(roomId: string): Promise<void> {
       }
     }
     // Session continuity (P0-1): a clean turn that surfaced a CLI session id
-    // (re)writes the row; consumedAt is what this prompt actually consumed.
-    // Errored and stopped turns never advance the cursor — the next run
-    // re-sends rather than silently skipping (duplication is recoverable, a
-    // skip is not). Rows are written even under AC_SESSION_RESUME=0: the
-    // switch disables the RIDE, not the bookkeeping, so flipping it back on
-    // resumes seamlessly.
+    // (re)writes the row; the cursor is what this prompt actually consumed,
+    // (createdAt, seq) of the newest message it carried. Errored and stopped
+    // turns never advance the cursor — the next run re-sends rather than
+    // silently skipping (duplication is recoverable, a skip is not). Rows are
+    // written even under AC_SESSION_RESUME=0: the switch disables the RIDE,
+    // not the bookkeeping, so flipping it back on resumes seamlessly.
     if (!output.error && output.sessionId) {
       db.setSession({
         roomId,
@@ -1129,7 +1129,8 @@ async function pump(roomId: string): Promise<void> {
         harness: character.harness,
         model: character.model,
         sessionId: output.sessionId,
-        consumedAt,
+        consumedAt: consumedCursor.at,
+        consumedSeq: consumedCursor.seq,
       })
     }
     enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null)

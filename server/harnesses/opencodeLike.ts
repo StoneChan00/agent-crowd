@@ -53,6 +53,29 @@ export interface OpencodeLikeOptions {
  */
 const sessionArgs = (id: string): string[] => ['--session', id]
 
+/**
+ * Pure argv assembly for one opencode/cannbot turn (exported for
+ * session-check P3): full assembled argv asserted, not just the resume
+ * fragment — the assembly point is where a dropped flag would slip through
+ * silently (same class of hole as codex's resume sandbox, P0-1 review).
+ */
+export function buildOpencodeLikeArgs(input: {
+  argsPrefix: string[]
+  resumeId?: string
+  autoApprove: boolean
+  autoApproveFlag: string
+  model: string
+  cwd: string
+  prompt: string
+}): string[] {
+  const args = [...input.argsPrefix, 'run', '--format', 'json']
+  if (input.resumeId) args.push(...sessionArgs(input.resumeId))
+  if (input.model.trim()) args.push('--model', input.model.trim())
+  if (input.autoApprove) args.push(input.autoApproveFlag)
+  args.push('--dir', input.cwd, input.prompt)
+  return args
+}
+
 export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): HarnessAdapter {
   return {
     id: options.id,
@@ -64,11 +87,15 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
       if (!spec) throw new Error(options.missingHint)
 
       const started = Date.now()
-      const args = [...spec.argsPrefix, 'run', '--format', 'json']
-      if (input.resume) args.push(...sessionArgs(input.resume.id))
-      if (input.character.model.trim()) args.push('--model', input.character.model.trim())
-      if (input.character.autoApprove) args.push(options.autoApproveFlag)
-      args.push('--dir', input.cwd, input.prompt)
+      const args = buildOpencodeLikeArgs({
+        argsPrefix: spec.argsPrefix,
+        resumeId: input.resume?.id,
+        autoApprove: input.character.autoApprove,
+        autoApproveFlag: options.autoApproveFlag,
+        model: input.character.model,
+        cwd: input.cwd,
+        prompt: input.prompt,
+      })
 
       const textParts: { id: string; text: string }[] = []
       const toolStarted = new Map<string, { name: string; at: number }>()

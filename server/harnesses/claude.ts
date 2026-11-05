@@ -44,6 +44,32 @@ const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku']
 const claudeResumeArgs = (id: string): string[] => ['--resume', id]
 
 /**
+ * Pure argv assembly for one claude turn (exported for session-check P3):
+ * the full assembled argv is asserted, not just the resume fragment — the
+ * assembly point is where a dropped permission flag would slip through
+ * silently (same class of hole as codex's resume sandbox, P0-1 review).
+ */
+export function buildClaudeArgs(input: {
+  argsPrefix: string[]
+  resumeId?: string
+  autoApprove: boolean
+  model: string
+  prompt: string
+}): string[] {
+  const args = [...input.argsPrefix, '-p', input.prompt, '--output-format', 'stream-json', '--verbose']
+  if (input.resumeId) args.push(...claudeResumeArgs(input.resumeId))
+  const model = input.model.trim()
+  if (model) args.push('--model', model)
+  // Mirror codex's read-only fallback: without an explicit mode the global
+  // ~/.claude/settings.json defaultMode "acceptEdits" keeps letting a
+  // "no auto-approve" character edit files. "default" denies every
+  // permission-requiring tool in headless mode (no interactive prompt).
+  if (input.autoApprove) args.push('--dangerously-skip-permissions')
+  else args.push('--permission-mode', 'default')
+  return args
+}
+
+/**
  * Claude Code adapter: `claude -p <prompt> --output-format stream-json --verbose`.
  * Same stream-json lineage Hermes speaks (system/assistant/user/result), so the
  * parsing mirrors hermes.ts with Claude-specific fields: reply text arrives as
@@ -66,16 +92,13 @@ export const claudeAdapter: HarnessAdapter = {
     }
 
     const started = Date.now()
-    const args = [...spec.argsPrefix, '-p', input.prompt, '--output-format', 'stream-json', '--verbose']
-    if (input.resume) args.push(...claudeResumeArgs(input.resume.id))
-    const model = input.character.model.trim()
-    if (model) args.push('--model', model)
-    // Mirror codex's read-only fallback: without an explicit mode the global
-    // ~/.claude/settings.json defaultMode "acceptEdits" keeps letting a
-    // "no auto-approve" character edit files. "default" denies every
-    // permission-requiring tool in headless mode (no interactive prompt).
-    if (input.character.autoApprove) args.push('--dangerously-skip-permissions')
-    else args.push('--permission-mode', 'default')
+    const args = buildClaudeArgs({
+      argsPrefix: spec.argsPrefix,
+      resumeId: input.resume?.id,
+      autoApprove: input.character.autoApprove,
+      model: input.character.model,
+      prompt: input.prompt,
+    })
 
     let streamed = ''
     let finalText = ''

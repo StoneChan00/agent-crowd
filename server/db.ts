@@ -111,6 +111,7 @@ db.exec(`
     model text not null default '',
     session_id text not null,
     consumed_at integer not null,
+    consumed_seq integer not null default 0,
     turns integer not null default 0,
     created_at integer not null,
     updated_at integer not null,
@@ -196,6 +197,10 @@ addColumnIfMissing('turns', 'is_round_summary', 'is_round_summary integer not nu
 addColumnIfMissing('rooms', 'verify_command', "verify_command text not null default ''")
 addColumnIfMissing('turns', 'round_id', 'round_id text')
 addColumnIfMissing('turns', 'changed', 'changed text')
+// Session continuity (P0-1 review): the cursor's same-millisecond tiebreaker.
+// Old rows default to seq 0 — a same-ms sibling of such a cursor re-ships once
+// (re-send, never skip), which is exactly the safe direction.
+addColumnIfMissing('sessions', 'consumed_seq', 'consumed_seq integer not null default 0')
 
 const now = () => Date.now()
 
@@ -618,12 +623,17 @@ function mapMessage(row: Record<string, unknown>): Message {
     content: String(row.content),
     meta: parseMeta(row.meta),
     createdAt: Number(row.created_at),
+    // rowid: monotonic with insert order — the same-ms tiebreaker the session
+    // cursor compares on (see Message.seq).
+    seq: Number(row.seq ?? row.rowid ?? 0),
   }
 }
 
 export function listMessages(roomId: string, limit = 200): Message[] {
   const rows = db
-    .prepare('select * from messages where room_id = ? order by created_at desc, rowid desc limit ?')
+    .prepare(
+      'select rowid as seq, * from messages where room_id = ? order by created_at desc, rowid desc limit ?',
+    )
     .all(roomId, Math.min(2000, Math.max(1, limit)))
   return rows.map(mapMessage).reverse()
 }
@@ -656,22 +666,28 @@ export function addMessage(input: {
     content: input.content,
     meta: input.meta ?? null,
     createdAt: now(),
+    // Placeholder until the insert below reports the real rowid.
+    seq: 0,
   }
-  db.prepare(
-    `insert into messages (id, room_id, author_type, character_id, author_name, author_avatar, color, content, meta, created_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    message.id,
-    message.roomId,
-    message.authorType,
-    message.characterId,
-    message.authorName,
-    message.authorAvatar,
-    message.color,
-    message.content,
-    message.meta ? JSON.stringify(message.meta) : null,
-    message.createdAt,
-  )
+  const inserted = db
+    .prepare(
+      `insert into messages (id, room_id, author_type, character_id, author_name, author_avatar, color, content, meta, created_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      message.id,
+      message.roomId,
+      message.authorType,
+      message.characterId,
+      message.authorName,
+      message.authorAvatar,
+      message.color,
+      message.content,
+      message.meta ? JSON.stringify(message.meta) : null,
+      message.createdAt,
+    )
+  // rowid = insertion sequence, the same-ms tiebreaker (Message.seq).
+  message.seq = Number(inserted.lastInsertRowid)
   return message
 }
 
@@ -984,6 +1000,7 @@ function mapSession(row: Record<string, unknown>): Session {
     model: String(row.model ?? ''),
     sessionId: String(row.session_id),
     consumedAt: Number(row.consumed_at),
+    consumedSeq: Number(row.consumed_seq ?? 0),
     turns: Number(row.turns ?? 0),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
@@ -1000,9 +1017,9 @@ export function getSession(roomId: string, characterId: string): Session | undef
  * Persist (or replace) a character's CLI session row (session continuity,
  * P0-1). Upsert keyed on (room, character): `turns` counts up on replace, so
  * session-check can assert two rode turns end-to-end. The caller passes the
- * cursor the successful prompt actually consumed — never Date.now() (a
- * message arriving mid-turn must stay NEWER than the cursor or the next
- * turn would silently skip it).
+ * cursor the successful prompt actually consumed — (createdAt, seq) of the
+ * newest message it carried, never Date.now() (a message arriving mid-turn
+ * must stay AFTER the cursor or the next turn would silently skip it).
  */
 export function setSession(input: {
   roomId: string
@@ -1011,16 +1028,18 @@ export function setSession(input: {
   model: string
   sessionId: string
   consumedAt: number
+  consumedSeq: number
 }): Session {
   const at = now()
   db.prepare(
-    `insert into sessions (room_id, character_id, harness, model, session_id, consumed_at, turns, created_at, updated_at)
-     values (?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `insert into sessions (room_id, character_id, harness, model, session_id, consumed_at, consumed_seq, turns, created_at, updated_at)
+     values (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
      on conflict(room_id, character_id) do update set
        harness = excluded.harness,
        model = excluded.model,
        session_id = excluded.session_id,
        consumed_at = excluded.consumed_at,
+       consumed_seq = excluded.consumed_seq,
        turns = sessions.turns + 1,
        updated_at = excluded.updated_at`,
   ).run(
@@ -1030,6 +1049,7 @@ export function setSession(input: {
     input.model,
     input.sessionId,
     input.consumedAt,
+    input.consumedSeq,
     at,
     at,
   )

@@ -52,6 +52,23 @@ function memoryLine(memory: Memory): string {
 }
 
 /**
+ * Session cursor (P0-1): the (createdAt, seq) of the newest message already
+ * delivered into a CLI session. `seq` (the messages table's rowid) is the
+ * same-millisecond tiebreaker — `createdAt` alone is not a total order, and a
+ * bare `>` on it would permanently skip a sibling message written within the
+ * same millisecond (scripted clients double-post that fast; review round 2).
+ */
+export interface SessionCursor {
+  at: number
+  seq: number
+}
+
+/** Lexicographic (createdAt, seq): the same order the messages query sorts by. */
+function isAfterCursor(message: Message, cursor: SessionCursor): boolean {
+  return message.createdAt > cursor.at || (message.createdAt === cursor.at && message.seq > cursor.seq)
+}
+
+/**
  * Compose the single prompt that carries room context + persona into a
  * harness one-shot run. Kept deliberately explicit: every harness sees the same
  * "you are a chat member" contract.
@@ -66,11 +83,11 @@ export function buildTurnPrompt(input: {
   /** Long-term memory: the character's cross-room identity notes + this room's shared notes. */
   memories?: { identity: Memory[]; room: Memory[] }
   /**
-   * Session cursor (P0-1): with `resumed`, only messages strictly newer
-   * than this land in the transcript — the CLI's own session already
-   * carries the older context. 0 / undefined = everything.
+   * Session cursor (P0-1): with `resumed`, only messages strictly after this
+   * cursor land in the transcript — the CLI's own session already carries
+   * the older context. Undefined / {at: 0, seq: 0} = everything.
    */
-  since?: number
+  since?: SessionCursor
   /** True when this turn rides the character's persisted CLI session (P0-1). */
   resumed?: boolean
 }): string {
@@ -78,11 +95,13 @@ export function buildTurnPrompt(input: {
   const others = input.characters.filter((member) => member.id !== character.id)
 
   // Session continuity (P0-1): a resumed turn ships ONLY what arrived after
-  // the cursor. The budget still fills newest-first, so the cursor computed
-  // by `nextSessionCursor` over the same list always points at a message
-  // the prompt actually carries.
-  const since = input.since ?? 0
-  const visible = input.resumed ? input.messages.filter((message) => message.createdAt > since) : input.messages
+  // the cursor. The comparison is (createdAt, seq) — a bare createdAt filter
+  // would swallow same-millisecond siblings of the cursor message. The budget
+  // still fills newest-first, so the cursor computed by `nextSessionCursor`
+  // over the same list always points at a message the prompt actually
+  // carries.
+  const since: SessionCursor = input.since ?? { at: 0, seq: 0 }
+  const visible = input.resumed ? input.messages.filter((message) => isAfterCursor(message, since)) : input.messages
 
   const recent: string[] = []
   let used = 0
@@ -182,16 +201,16 @@ export function buildTurnPrompt(input: {
 
 /**
  * The cursor a resumed prompt built from `messages` + `since` leaves behind:
- * the createdAt of the NEWEST message the prompt actually carries. Newest
- * messages always survive the budget (it fills newest-first), so this never
- * points past something the prompt dropped. Messages that arrive DURING the
- * run stay newer than the cursor and re-ship on the next turn — computing
- * the cursor from `Date.now()` instead would silently swallow them forever.
+ * the (createdAt, seq) of the NEWEST message the prompt actually carries.
+ * Newest messages always survive the budget (it fills newest-first), so this
+ * never points past something the prompt dropped. Messages that arrive DURING
+ * the run stay after the cursor and re-ship on the next turn — computing the
+ * cursor from `Date.now()` instead would silently swallow them forever.
  */
-export function nextSessionCursor(messages: Message[], since: number): number {
-  let cursor = since
+export function nextSessionCursor(messages: Message[], since: SessionCursor): SessionCursor {
+  let cursor: SessionCursor = since
   for (const message of messages) {
-    if (message.createdAt > cursor) cursor = message.createdAt
+    if (isAfterCursor(message, cursor)) cursor = { at: message.createdAt, seq: message.seq }
   }
   return cursor
 }
