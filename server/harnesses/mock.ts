@@ -67,6 +67,23 @@ export const mockAdapter: HarnessAdapter = {
       }
       return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
+    // Test seam for queue-check: the 【现在轮到你】 instruction carries the
+    // override a steer persisted on the turn row. When it carries the marker,
+    // echo it verbatim so the override's hard-kill → restore round-trip can
+    // be asserted from the reply alone (the transcript's user line knows
+    // nothing about it).
+    const instruction = input.prompt.split('【现在轮到你】\n')[1]?.trimEnd() ?? ''
+    if (instruction.includes('回显指令')) {
+      const reply = `（mock 模式）指令回显：${instruction}`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        if (input.signal.aborted) {
+          return { text: reply, exitCode: 130, durationMs: Date.now() - started, error: '已停止' }
+        }
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(25)
+      }
+      return { text: reply, exitCode: 0, durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
     const reply = [
       `（mock 模式）我是 **${input.character.name}**，收到任务：${lastUser.slice(0, 120) || '（群聊上下文）'}`,
       '',

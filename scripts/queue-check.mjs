@@ -15,14 +15,21 @@
  *       not resurrect the silenced round.
  *   Q3  Persisted scheduling flags round-trip: hop=2 against maxHops=1 is
  *       stopped by the relay budget (hop not zeroed by the restore); a
- *       retry=1 turn fails once with no second auto-retry.
+ *       retry=1 turn fails once with no second auto-retry; an override
+ *       persisted like a steer re-aim rides the reboot into the restored
+ *       turn's 【现在轮到你】 (asserted via the mock's echo seam).
  *   Q4  An old-schema DB migrates in place (hop/override/retry/
  *       is_round_summary columns appear via addColumnIfMissing) and the boot
  *       still comes up healthy; a queued row for a deleted room is swept to
  *       stopped, not restored.
  *   Q5  A second reboot of the same DATA_DIR re-runs nothing already
  *       terminal (idempotent restore).
- *   Q6  Regression = the rest of `pnpm test` + `pnpm typecheck`: this script
+ *   Q6  The restored round fires NO round-end summary: a queued row inserted
+ *       for a QUIET runner while the room also holds an onRoundEnd
+ *       summarizer, reboot → the runner speaks, the summarizer stays silent
+ *       and no is_round_summary row is created (restoreQueues owns no
+ *       `rounds` entry — the reboot already cut that round).
+ *   Q7  Regression = the rest of `pnpm test` + `pnpm typecheck`: this script
  *       is one suite in that chain, not a re-run of the others.
  *
  * Turn rows are read/written through node:sqlite against the temp DB (Q3's
@@ -325,11 +332,14 @@ async function scenarioFlagsRoundTrip() {
   const s1 = await bootServer(dir)
   const r3 = await makeRoom(s1.port, 'q3-接力上限', 1, dir)
   const r4 = await makeRoom(s1.port, 'q3-重试守卫', 4, dir)
+  const r5 = await makeRoom(s1.port, 'q3-override往返', 4, dir)
   // Messages land while the rooms have no characters yet → nothing enqueues.
   const msg3 = await postMessage(s1.port, r3.id, '这次请模拟失败')
   const msg4 = await postMessage(s1.port, r4.id, '这次请模拟失败')
+  const msg5 = await postMessage(s1.port, r5.id, '恢复后正常回复')
   const man3 = await makeCharacter(s1.port, r3.id, '慢三', QUIET)
   const man4 = await makeCharacter(s1.port, r4.id, '慢四', QUIET)
+  const wu = await makeCharacter(s1.port, r5.id, '戊', QUIET)
   await hardKill(s1.proc)
 
   withDb(dir, (handle) => {
@@ -337,12 +347,15 @@ async function scenarioFlagsRoundTrip() {
       `insert into turns
          (id, room_id, character_id, status, trigger_message_id, output, error,
           hop, override, retry, is_round_summary, started_at, ended_at, pid)
-       values (?, ?, ?, 'queued', ?, '', null, ?, null, ?, ?, ?, null, null)`,
+       values (?, ?, ?, 'queued', ?, '', null, ?, ?, ?, ?, ?, null, null)`,
     )
     // hop=2 / retry=1 / is_round_summary=1 — one row carrying all three flags.
-    insert.run('qc3-hop', r3.id, man3.id, msg3.id, 2, 1, 1, Date.now())
+    insert.run('qc3-hop', r3.id, man3.id, msg3.id, 2, null, 1, 1, Date.now())
     // retry=1 on the failure seam: the loop guard must survive the reboot.
-    insert.run('qc3-retry', r4.id, man4.id, msg4.id, 1, 1, 0, Date.now())
+    insert.run('qc3-retry', r4.id, man4.id, msg4.id, 1, null, 1, 0, Date.now())
+    // An override shaped like a steer re-aim: it must ride the reboot into
+    // the restored turn's 【现在轮到你】 (steer depends on exactly this).
+    insert.run('qc3-override', r5.id, wu.id, msg5.id, 1, '跨重启补充指令：请回显指令', 0, 0, Date.now())
   })
 
   const s2 = await bootServer(dir)
@@ -377,6 +390,16 @@ async function scenarioFlagsRoundTrip() {
     'Q3 retry=1 turn 恰 1 行且 error',
     man4Turns.length === 1 && man4Turns[0].status === 'error',
     JSON.stringify(man4Turns.map((row) => row.status)),
+  )
+
+  // The override round-trip: the restored turn's 【现在轮到你】 carried the
+  // persisted override into the prompt, and the mock's echo seam proves it.
+  const echoed = await waitMessages(s2.port, r5.id, (messages) => characterMessages(messages, '戊').length > 0, 20_000)
+  const wuContent = echoed ? characterMessages(echoed, '戊')[0].content : ''
+  check(
+    'Q3 override 跨重启存活（回显进入回复）',
+    wuContent.includes('跨重启补充指令'),
+    wuContent ? `回复不含 override：${wuContent.slice(0, 80)}` : '20s 内戊未发言',
   )
 }
 
@@ -424,6 +447,64 @@ async function scenarioOldSchemaMigration() {
   )
 }
 
+/**
+ * Q6. The restored round fires NO round-end summary. The room holds a QUIET
+ * runner plus an onRoundEnd summarizer; a queued row inserted while the
+ * server is down reboots into a running turn. When it drains, the summarizer
+ * must stay silent and no is_round_summary row may appear — restoreQueues
+ * deliberately creates no `rounds` entry (regression: it used to, and the
+ * first restored turn flipped hadTurn back to true, firing the summary).
+ */
+async function scenarioNoSummaryAfterRestore() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-queue-q6-'))
+  tempDirs.push(dir)
+  const s1 = await bootServer(dir)
+  const room = await makeRoom(s1.port, 'q6-恢复轮不总结', 4, dir)
+  // The user message lands while the room has no characters yet → nothing
+  // enqueues and no round state exists: the queued row below is the only
+  // thing a hard kill leaves behind, which is exactly the "pre-reboot round
+  // cut by the reboot" shape.
+  const msg = await postMessage(s1.port, room.id, '恢复后正常回复')
+  const runner = await makeCharacter(s1.port, room.id, '跑者', QUIET)
+  const summarizer = await makeCharacter(s1.port, room.id, '总结王', { ...QUIET, onRoundEnd: true })
+  await hardKill(s1.proc)
+
+  withDb(dir, (handle) => {
+    handle
+      .prepare(
+        `insert into turns
+           (id, room_id, character_id, status, trigger_message_id, output, error,
+            hop, override, retry, is_round_summary, started_at, ended_at, pid)
+         values ('qc6-run', ?, ?, 'queued', ?, '', null, 1, null, 0, 0, ?, null, null)`,
+      )
+      .run(room.id, runner.id, msg.id, Date.now())
+  })
+
+  const s2 = await bootServer(dir)
+  const ran = await waitMessages(s2.port, room.id, (messages) => characterMessages(messages, '跑者').length > 0, 20_000)
+  check('Q6 恢复的排队回合跑完（跑者发言）', Boolean(ran), '20s 内跑者未发言')
+  // The summary decision is made in the pump cycle that drains the queue
+  // (the runner's row turning 'done'); a buggy summary would be RUNNING
+  // right after, so waiting for full idle guarantees any such summary has
+  // already landed its message before the assertions read the room.
+  await waitTurn(dir, "id = 'qc6-run'", (row) => row.status === 'done', 10_000)
+  await waitState(s2.port, room.id, (state) => !state.busy && state.queuedCharacterIds.length === 0, 20_000)
+  await sleep(1_000)
+  const messages = (await req(s2.port, `/api/rooms/${room.id}/messages?limit=200`)).messages
+  const summaryMsgs = characterMessages(messages, '总结王')
+  check(
+    'Q6 总结角色 0 条消息（恢复轮不触发轮末总结）',
+    summaryMsgs.length === 0,
+    `实际 ${summaryMsgs.length} 条`,
+  )
+  const summaryRows = turnRowsWhere(dir, 'room_id = ? and is_round_summary = 1', room.id)
+  check(
+    'Q6 无 is_round_summary=1 的 turn 行',
+    summaryRows.length === 0,
+    `实际 ${summaryRows.length} 行`,
+  )
+}
+
 /* ------------------------------------------------------------------- main */
 
 try {
@@ -431,6 +512,7 @@ try {
   await scenarioStopSurvivesReboot()
   await scenarioFlagsRoundTrip()
   await scenarioOldSchemaMigration()
+  await scenarioNoSummaryAfterRestore()
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

@@ -278,10 +278,15 @@ export function stopRoom(roomId: string): void {
  * waiting) are swept to 'stopped' instead of restored — no resurrecting
  * runs the live system would have refused to start.
  *
- * The restored round starts with `hadTurn: false` on purpose: the reboot
- * already interrupted the round these items belonged to, so when they drain
- * there is nothing new to summarize — no summary is fired for pre-restart
- * activity.
+ * The restored round belongs to no round at all: this function deliberately
+ * creates NO `rounds` entry (review fix — the old hadTurn:false entry was
+ * flipped back to true by pump() the moment the first restored turn started,
+ * so the summary fired anyway). Both pump()'s hadTurn flip and
+ * maybeStartRoundSummary()'s no-entry early return no-op on a room without
+ * an entry, so pre-restart activity never earns a summary: the reboot
+ * already cut that round, and summarizing its remains is noise. A human
+ * message or manual run while the restored queue is still draining starts a
+ * fresh entry as usual, and only turns after that count toward its summary.
  */
 export function restoreQueues(turns: Turn[]): void {
   const byRoom = new Map<string, Turn[]>()
@@ -322,8 +327,9 @@ export function restoreQueues(turns: Turn[]): void {
     }
     if (queue.length === 0) continue
     queues.set(roomId, queue)
+    // No `rounds` entry here — see the docblock above: a restored round must
+    // drain without a round-end summary (queue-check Q6 pins this).
     chains.set(roomId, { limitNoticeSent: false })
-    rounds.set(roomId, { hadTurn: false, summarizing: false, endReason: 'completed' })
     broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
     void pump(roomId)
   }

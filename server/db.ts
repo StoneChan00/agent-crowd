@@ -740,19 +740,32 @@ export function claimTurn(id: string): boolean {
 
 /**
  * Re-aim a still-queued turn at a new trigger/override (steer hitting a
- * waiting item). No-op once the turn has been claimed or ended — the steer
- * path then falls back to queueing a fresh turn.
+ * waiting item). True patch semantics: only fields present on the object are
+ * written — the old `?? null` coerced a one-field patch into wiping the
+ * other (a steer re-aiming only the trigger would have blanked an override
+ * persisted earlier). An empty patch changes nothing and reports false.
+ * No-op once the turn has been claimed or ended — the steer path then falls
+ * back to queueing a fresh turn.
  */
 export function updateQueuedTurn(
   id: string,
   patch: { triggerMessageId?: string | null; override?: string | null },
 ): boolean {
-  const triggerMessageId = patch.triggerMessageId ?? null
-  const override = patch.override ?? null
+  const sets: string[] = []
+  const args: (string | null)[] = []
+  if (patch.triggerMessageId !== undefined) {
+    sets.push('trigger_message_id = ?')
+    args.push(patch.triggerMessageId)
+  }
+  if (patch.override !== undefined) {
+    sets.push('override = ?')
+    args.push(patch.override)
+  }
+  if (sets.length === 0) return false
   return (
     db
-      .prepare("update turns set trigger_message_id = ?, override = ? where id = ? and status = 'queued'")
-      .run(triggerMessageId, override, id).changes === 1
+      .prepare(`update turns set ${sets.join(', ')} where id = ? and status = 'queued'`)
+      .run(...args, id).changes === 1
   )
 }
 
