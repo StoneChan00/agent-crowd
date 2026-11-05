@@ -21,29 +21,57 @@ export const TRANSCRIPT_CHAR_BUDGET = 18_000
 /** Hard ceiling for the whole prompt; see the overflow guard at the bottom. */
 export const MAX_TOTAL_PROMPT = 32_000
 
+/**
+ * Fold budget (B01): when a resumed turn's increment overflows the
+ * transcript budget, the messages the newest-first fill leaves out ride
+ * along as a deterministic fold summary (count + oldest-first excerpts, no
+ * model call) instead of being dropped silently — a dropped increment is a
+ * permanent skip, because the session cursor advances past whatever the
+ * prompt represented. Capped so the fold can never crowd out rendered lines.
+ */
+const FOLD_BUDGET = 800
+/** The fold's absolute floor: the one-line count marker always fits. */
+const FOLD_MIN_BUDGET = 96
+/** Excerpt body per folded message. */
+const FOLD_EXCERPT_CHARS = 80
+/**
+ * Floor for the transcript budget under the 32k guard: one max-length
+ * message plus its fold marker. A head (persona/roster/memory) so big that
+ * even this doesn't fit is what the last-resort head slice is for — the
+ * transcript is the one part the guard never cuts.
+ */
+const MIN_TRANSCRIPT_BUDGET = 4_600
+
 /** `provider/model` for model strings; plain ids keep the room's default provider. */
 export function describeModel(character: Character): string {
   return character.model.trim() || '默认模型'
 }
 
-function transcriptLine(message: Message): string {
-  const clock = new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour12: false })
-  const body = truncate(message.content.trim(), MAX_MESSAGE_CHARS)
+function clockOf(message: Message): string {
+  return new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour12: false })
+}
+
+/** The speaker part of a transcript line, shared by render and fold excerpts. */
+function speakerLabel(message: Message): string {
   if (message.authorType === 'user') {
     const steer = message.meta?.steer
-    const who = steer ? `用户（中途补充给 ${steer.targetName}）` : '用户'
-    return `[${clock}] ${who}: ${body}`
+    return steer ? `用户（中途补充给 ${steer.targetName}）` : '用户'
   }
-  if (message.authorType === 'system') return `[${clock}] 系统: ${body}`
+  if (message.authorType === 'system') return '系统'
   const tag = message.meta?.harness ? ` (${message.meta.harness})` : ''
+  return `${message.authorName}${tag}`
+}
+
+function transcriptLine(message: Message): string {
+  const body = truncate(message.content.trim(), MAX_MESSAGE_CHARS)
   // Change evidence (SOP gate, P0-3 3a): reviewers see what a turn touched
   // without leaving the transcript. Five paths max — the full list lives on
   // the message meta, this is the reviewer's glance line.
-  const changed = message.meta?.changed ?? []
+  const changed = message.authorType === 'character' ? (message.meta?.changed ?? []) : []
   const changedTag = changed.length
     ? ` [改动: ${changed.slice(0, 5).join('、')}${changed.length > 5 ? ` 等 ${changed.length} 个文件` : ''}]`
     : ''
-  return `[${clock}] ${message.authorName}${tag}: ${body}${changedTag}`
+  return `[${clockOf(message)}] ${speakerLabel(message)}: ${body}${changedTag}`
 }
 
 function memoryLine(memory: Memory): string {
@@ -68,12 +96,130 @@ function isAfterCursor(message: Message, cursor: SessionCursor): boolean {
   return message.createdAt > cursor.at || (message.createdAt === cursor.at && message.seq > cursor.seq)
 }
 
+/** Fold header marker — also what the mock smoke seam greps the count from. */
+const FOLD_MARK = '〔已折叠'
+
+/**
+ * Deterministic fold summary (B01) for increment messages the newest-first
+ * render leaves out: count, time range, per-speaker counts, then
+ * oldest-first excerpts until the room runs out. No model, no clock drift —
+ * same input, same block. `overflow` counts messages older than the fetch
+ * window (a pathological flood); they are represented by count only, which
+ * is still enough for the cursor to advance honestly.
+ */
+function foldBlock(dropped: Message[], room: number, overflow: number): string[] {
+  if (dropped.length === 0 && overflow === 0) return []
+  const total = dropped.length + overflow
+  if (dropped.length === 0) return [`${FOLD_MARK} ${total} 条较早的新消息，均在取回窗口之外，仅计数〕`]
+  const first = dropped[0]
+  const last = dropped[dropped.length - 1]
+  const counts = new Map<string, number>()
+  for (const message of dropped) counts.set(speakerLabel(message), (counts.get(speakerLabel(message)) ?? 0) + 1)
+  const speakers = [...counts.entries()].map(([name, count]) => `${name}×${count}`).join('、')
+  const header =
+    `${FOLD_MARK} ${total} 条较早的新消息（${clockOf(first)} → ${clockOf(last)}，发言：${speakers}` +
+    `${overflow > 0 ? `，另有 ${overflow} 条在取回窗口之外仅计数` : ''}）；以下为最旧几条的开头摘录，其余仅计数不展开〕`
+  if (header.length + 1 > room) {
+    // Squeezed budget: the count marker alone still represents every dropped
+    // message — an excerpt-less fold beats a silent drop.
+    return [`${FOLD_MARK} ${total} 条较早的新消息，因长度预算未逐条展开〕`]
+  }
+  const lines = [header]
+  let used = header.length + 1
+  let excerpted = 0
+  for (const message of dropped) {
+    const line = `[${clockOf(message)}] ${speakerLabel(message)}: ${truncate(message.content.trim(), FOLD_EXCERPT_CHARS)}`
+    if (used + line.length > room) break
+    lines.push(line)
+    used += line.length + 1
+    excerpted += 1
+  }
+  const rest = dropped.length - excerpted + overflow
+  if (rest > 0) lines.push(`…（其余 ${rest} 条未摘录，仅计入上述总数）`)
+  return lines
+}
+
+interface TranscriptPlan {
+  /** Fold block (when one was needed) + rendered lines, in display order. */
+  lines: string[]
+  /** Messages shown verbatim. */
+  rendered: Message[]
+  /**
+   * Everything the prompt represents, verbatim or folded — the only messages
+   * the session cursor may advance past. Fresh turns trim silently (a cold
+   * start's recency window: nothing trimmed there ever rode the session), so
+   * for them `represented` is just the rendered suffix.
+   */
+  represented: Message[]
+}
+
+/** Newest-first fill: the index rendered starts at (0 = everything fit). */
+function fillNewestFirst(visible: Message[], budget: number): { dropIndex: number; used: number } {
+  let used = 0
+  for (let index = visible.length - 1; index >= 0; index -= 1) {
+    const line = transcriptLine(visible[index])
+    if (used + line.length > budget) return { dropIndex: index + 1, used }
+    used += line.length + 1
+  }
+  return { dropIndex: 0, used }
+}
+
+function planTranscript(visible: Message[], budget: number, fold: boolean, overflow: number): TranscriptPlan {
+  if (visible.length === 0 && overflow === 0) return { lines: [], rendered: [], represented: [] }
+  // The newest message (this turn's trigger) always renders; when a fold is
+  // possible, its count marker reserves room too. A budget below this floor
+  // is a mis-sized budget, not a license to drop the trigger.
+  const newestLen = visible.length ? transcriptLine(visible[visible.length - 1]).length : 0
+  const effective = Math.max(budget, newestLen + (fold ? FOLD_MIN_BUDGET : 0) + 2)
+  const plainIndex = (fill: { dropIndex: number }): number =>
+    visible.length === 0 ? 0 : fill.dropIndex >= visible.length ? visible.length - 1 : fill.dropIndex
+  const pass1 = fillNewestFirst(visible, effective)
+  if (!fold || (pass1.dropIndex === 0 && overflow === 0)) {
+    // Everything fits — or a fresh turn, where the trim is the cold start's
+    // recency window, not a skip.
+    const rendered = visible.slice(plainIndex(pass1))
+    return { lines: rendered.map(transcriptLine), rendered, represented: rendered }
+  }
+  // Overflow on a resumed turn (B01): re-fill with the fold budget reserved,
+  // then fold everything older into the deterministic summary above. Nothing
+  // is dropped silently, so the cursor may advance to the newest the prompt
+  // carries — represented = rendered + folded, never more.
+  const reserve = Math.min(FOLD_BUDGET, Math.max(FOLD_MIN_BUDGET, Math.floor(effective / 8)))
+  const renderBudget = Math.max(effective - reserve, newestLen + 1)
+  const pass2 = fillNewestFirst(visible, renderBudget)
+  const start = plainIndex(pass2)
+  const rendered = visible.slice(start)
+  const dropped = visible.slice(0, start)
+  const foldRoom = Math.min(FOLD_BUDGET, Math.max(FOLD_MIN_BUDGET, effective - pass2.used - 2))
+  const block = foldBlock(dropped, foldRoom, overflow)
+  return {
+    lines: [...block, ...rendered.map(transcriptLine)],
+    rendered,
+    represented: block.length > 0 ? [...dropped, ...rendered] : rendered,
+  }
+}
+
+/**
+ * buildTurnPrompt's result (B01): the prompt text plus what it represented.
+ */
+export interface TurnPromptBuild {
+  prompt: string
+  /**
+   * Cursor over everything the prompt represented — rendered or folded. The
+   * orchestrator persists THIS (never "newest of what was fetched"): a
+   * cursor past a message the prompt didn't represent is a permanent skip.
+   */
+  nextCursor: SessionCursor
+  /** Increment messages carried only as fold-summary counts/excerpts. */
+  foldedCount: number
+}
+
 /**
  * Compose the single prompt that carries room context + persona into a
- * harness one-shot run. Kept deliberately explicit: every harness sees the same
- * "you are a chat member" contract.
+ * harness one-shot run, and report what it represented. Kept deliberately
+ * explicit: every harness sees the same "you are a chat member" contract.
  */
-export function buildTurnPrompt(input: {
+export function buildTurnPromptDetailed(input: {
   room: Room
   character: Character
   characters: Character[]
@@ -90,27 +236,22 @@ export function buildTurnPrompt(input: {
   since?: SessionCursor
   /** True when this turn rides the character's persisted CLI session (P0-1). */
   resumed?: boolean
-}): string {
+  /**
+   * B01: messages older than the resumed fetch window (a pathological flood
+   * — more than the orchestrator's fetch limit arrived in one gap). They are
+   * folded by COUNT only; the alternative (fetching newest-only and
+   * advancing the cursor regardless) would skip them without even a count.
+   */
+  foldOverflow?: number
+}): TurnPromptBuild {
   const { room, character, cwd } = input
   const others = input.characters.filter((member) => member.id !== character.id)
 
   // Session continuity (P0-1): a resumed turn ships ONLY what arrived after
   // the cursor. The comparison is (createdAt, seq) — a bare createdAt filter
-  // would swallow same-millisecond siblings of the cursor message. The budget
-  // still fills newest-first, so the cursor computed by `nextSessionCursor`
-  // over the same list always points at a message the prompt actually
-  // carries.
+  // would swallow same-millisecond siblings of the cursor message.
   const since: SessionCursor = input.since ?? { at: 0, seq: 0 }
   const visible = input.resumed ? input.messages.filter((message) => isAfterCursor(message, since)) : input.messages
-
-  const recent: string[] = []
-  let used = 0
-  for (let index = visible.length - 1; index >= 0; index -= 1) {
-    const line = transcriptLine(visible[index])
-    if (used + line.length > TRANSCRIPT_CHAR_BUDGET) break
-    recent.unshift(line)
-    used += line.length + 1
-  }
 
   const displayName = (member: Character): string => {
     const extras = member.aliases.length ? `（可 @别名：${member.aliases.join('、')}）` : ''
@@ -141,7 +282,17 @@ export function buildTurnPrompt(input: {
     )
   }
 
-  const header = [
+  // Session continuity (P0-1): a resumed turn tells the agent why the
+  // transcript starts where it does — the older messages are not lost,
+  // they live in the CLI's own session context this run continues.
+  const transcriptTitle = input.resumed
+    ? '【最近的群聊记录】（以下是你上次发言之后的新消息；更早内容已在同一会话上下文中）'
+    : '【最近的群聊记录】'
+
+  // The head is everything but the transcript body (B01): when the 32k
+  // guard must cut, it cuts HERE — the old layout put the transcript at the
+  // header's tail, so the slice ate exactly the newest lines.
+  const headText = [
     '【群聊环境】',
     `房间：${room.name}${room.topic ? ` —— ${room.topic}` : ''}`,
     `你的群昵称：${nickname}`,
@@ -170,13 +321,6 @@ export function buildTurnPrompt(input: {
         ]
       : []),
     '',
-    // Session continuity (P0-1): a resumed turn tells the agent why the
-    // transcript starts where it does — the older messages are not lost,
-    // they live in the CLI's own session context this run continues.
-    input.resumed
-      ? '【最近的群聊记录】（以下是你上次发言之后的新消息；更早内容已在同一会话上下文中）'
-      : '【最近的群聊记录】',
-    recent.join('\n') || (input.resumed ? '（无新消息）' : '（空）'),
     '',
   ].join('\n')
 
@@ -191,21 +335,45 @@ export function buildTurnPrompt(input: {
     override || `现在轮到你（${character.name}）发言。请直接给出你要发到群里的那条消息。`
 
   const tail = `\n【现在轮到你】\n${instruction}\n`
-  const prompt = header + tail
-  if (prompt.length <= MAX_TOTAL_PROMPT) return prompt
-  // Last-resort guard (a giant persona, an exploding roster): cut the header —
-  // never the tail. The "now it's your turn" instruction is the one part the
-  // agent cannot act without, so it must survive even the overflow path.
-  return header.slice(0, Math.max(0, MAX_TOTAL_PROMPT - tail.length)) + '\n…（上下文过长已截断）' + tail
+
+  // Transcript budget (B01): the 18k default, squeezed down when the fixed
+  // parts (head + title + tail) crowd the 32k ceiling — and never below the
+  // floor (one max-length message + fold marker). Only a head that crowds
+  // out even the floor triggers the last-resort slice below; the transcript
+  // is the LAST thing to shrink and the one thing never cut.
+  const fixed = headText.length + transcriptTitle.length + 2 + tail.length
+  const budget = Math.max(Math.min(TRANSCRIPT_CHAR_BUDGET, MAX_TOTAL_PROMPT - fixed), MIN_TRANSCRIPT_BUDGET)
+  const plan = planTranscript(visible, budget, input.resumed === true, input.foldOverflow ?? 0)
+  const bodyText = plan.lines.join('\n') || (input.resumed ? '（无新消息）' : '（空）')
+  const section = `${transcriptTitle}\n${bodyText}`
+
+  let prompt = headText + section + '\n' + tail
+  if (prompt.length > MAX_TOTAL_PROMPT) {
+    // Last-resort guard (a giant persona, an exploding roster): cut the head —
+    // never the transcript (the trigger and the fold live there, B01) and
+    // never the tail (the "now it's your turn" instruction is the one part
+    // the agent cannot act without).
+    const cut = '\n…（上下文过长已截断）\n'
+    const headRoom = Math.max(0, MAX_TOTAL_PROMPT - tail.length - section.length - cut.length)
+    prompt = headText.slice(0, headRoom) + cut + section + tail
+  }
+  return {
+    prompt,
+    nextCursor: nextSessionCursor(plan.represented, since),
+    foldedCount: plan.represented.length - plan.rendered.length,
+  }
+}
+
+/** The one-string entry point (pure-layer tests keep their old shape). */
+export function buildTurnPrompt(input: Parameters<typeof buildTurnPromptDetailed>[0]): string {
+  return buildTurnPromptDetailed(input).prompt
 }
 
 /**
- * The cursor a resumed prompt built from `messages` + `since` leaves behind:
- * the (createdAt, seq) of the NEWEST message the prompt actually carries.
- * Newest messages always survive the budget (it fills newest-first), so this
- * never points past something the prompt dropped. Messages that arrive DURING
- * the run stay after the cursor and re-ship on the next turn — computing the
- * cursor from `Date.now()` instead would silently swallow them forever.
+ * The max (createdAt, seq) over `messages` — used by the prompt layer to
+ * compute the cursor a build leaves behind (see buildTurnPromptDetailed:
+ * the orchestrator persists that value, computed over what the prompt
+ * REPRESENTED, never over what was merely fetched).
  */
 export function nextSessionCursor(messages: Message[], since: SessionCursor): SessionCursor {
   let cursor: SessionCursor = since

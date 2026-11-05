@@ -8,6 +8,11 @@
  *   P1  incremental prompt (pure): post-cursor messages only, pre-cursor
  *       absent, no-new-messages copy, since=0 ≡ full, resumed title note,
  *       default call unchanged, same-millisecond tiebreak, cursor helper (9)
+ *   P1b overflow fold (pure, B01): newest increment always renders, the
+ *       rest ride along as a deterministic fold (count + oldest excerpts,
+ *       no model), the cursor advances over what was represented — next
+ *       round's increment is empty; the 32k guard squeezes the transcript
+ *       budget instead of slicing the transcript away (11)
  *   P2  db isolation & invalidation: two rooms never cross sessions;
  *       delete character / clear messages / harness drift / model drift /
  *       delete room each sweep the row (11)
@@ -21,6 +26,10 @@
  *   P4b mid-round message: a message posted while the round-1 CLI is still
  *       streaming must ship in round 2's increment — locks the cursor
  *       against Date.now()-style regressions (7)
+ *   P4c integration (B01): resumed turns fetch by cursor — >80 increments
+ *       all reach the prompt, 4k floods fold end-to-end, floods beyond the
+ *       fetch window ride along as a fold count while the cursor still
+ *       advances (8)
  *   P5  fallback: preseeded bogus session → resume dies → silent full
  *       rerun, no user-facing failure message, session row replaced (5)
  *   P6  kill switch: AC_SESSION_RESUME=0 → adapter gets no resume, no
@@ -45,7 +54,13 @@ import { buildClaudeArgs } from '../server/harnesses/claude.ts'
 import { buildCodexArgs } from '../server/harnesses/codex.ts'
 import { buildOpencodeLikeArgs } from '../server/harnesses/opencodeLike.ts'
 import { getAdapter } from '../server/harnesses/index.ts'
-import { buildTurnPrompt, nextSessionCursor } from '../server/prompt.ts'
+import {
+  buildTurnPrompt,
+  buildTurnPromptDetailed,
+  MAX_TOTAL_PROMPT,
+  nextSessionCursor,
+  TRANSCRIPT_CHAR_BUDGET,
+} from '../server/prompt.ts'
 import { DEFAULT_TRIGGERS } from '../server/types.ts'
 
 const ROOT = join(import.meta.dirname, '..')
@@ -354,6 +369,103 @@ function scenarioIncrementalPrompt() {
   )
 }
 
+/* --------------------------- P1b fold: overflowing increments (pure, B01) */
+
+function scenarioFoldPrompt() {
+  const room = {
+    id: 'r2', name: '折叠测试', topic: '', workingDir: 'D:/tmp', maxHops: 6, verifyCommand: '', createdAt: 0,
+  }
+  const character = {
+    id: 'c1', roomId: 'r2', name: '甲', aliases: [], avatar: '', color: '',
+    harness: 'mock', model: 'mock', persona: '测试人设', cwd: '', triggers: DEFAULT_TRIGGERS,
+    commandTemplate: '', autoApprove: true, enabled: true, identityId: null, presetId: null, createdAt: 0,
+  }
+  const mark = (tag) => `⟪${tag}⟫`
+  const msg = (id, content, at, seq) => ({
+    id, roomId: 'r2', authorType: 'user', characterId: null, authorName: '我', authorAvatar: '', color: '',
+    content, meta: null, createdAt: at, seq,
+  })
+  // 5 × ~4k increment messages (B01): the 18k budget admits four — the fifth
+  // used to be dropped by a bare `break` while the cursor still advanced to
+  // the newest, a permanent skip on the resume chain.
+  const big = (i, at, seq) => msg(`f${i}`, `${mark(`FOLD-${i}`)}${'x'.repeat(3_900)}`, at, seq)
+  const messages = [big(0, 1_000, 20), big(1, 1_100, 21), big(2, 1_200, 22), big(3, 1_300, 23), big(4, 1_400, 24)]
+  const build = (opts) =>
+    buildTurnPromptDetailed({ room, character, characters: [character], messages, cwd: 'D:/tmp', ...opts })
+
+  const since = { at: 900, seq: 0 }
+  const built = build({ since, resumed: true })
+  check('P1b 溢出增量：最新消息完整在场（触发不被挤出）', built.prompt.includes(mark('FOLD-4')), built.prompt.slice(-300))
+  check(
+    'P1b 溢出增量：放不下的旧增量进确定性折叠（计数 1）',
+    built.prompt.includes('〔已折叠 1 条'),
+    built.prompt.slice(-900),
+  )
+  check('P1b 溢出增量：折叠带最旧消息的开头摘录', built.prompt.includes(mark('FOLD-0')), built.prompt.slice(-900))
+  check(
+    'P1b 溢出增量：游标推到最新（折叠消费，不跳过）',
+    JSON.stringify(built.nextCursor) === JSON.stringify({ at: 1_400, seq: 24 }) && built.foldedCount === 1,
+    JSON.stringify(built.nextCursor),
+  )
+  const sectionStart = built.prompt.indexOf('【最近的群聊记录】')
+  const sectionEnd = built.prompt.indexOf('\n【现在轮到你】')
+  const bodyLen = built.prompt.slice(sectionStart, sectionEnd).split('\n').slice(1).join('\n').length
+  check(
+    'P1b 溢出增量：折叠+渲染不超 transcript 预算',
+    bodyLen <= TRANSCRIPT_CHAR_BUDGET,
+    `body=${bodyLen}`,
+  )
+  const next = build({ since: built.nextCursor, resumed: true })
+  check(
+    'P1b 溢出增量：下轮增量为空（折叠已消费，不重复膨胀）',
+    next.prompt.includes('（无新消息）') && !next.prompt.includes('〔已折叠') && !next.prompt.includes(mark('FOLD-0')),
+    next.prompt.slice(-200),
+  )
+
+  // 32k squeeze (B01, same root cause as the review's non-blocking 3): a
+  // giant-but-fitting persona shrinks the transcript budget instead of
+  // triggering the slice — newest + fold stay, no truncation marker.
+  const squeezed = buildTurnPromptDetailed({
+    room,
+    character: { ...character, persona: 'P'.repeat(20_000) },
+    characters: [{ ...character, persona: 'P'.repeat(20_000) }],
+    messages,
+    cwd: 'D:/tmp',
+    since,
+    resumed: true,
+  })
+  check(
+    'P1b 32k 挤压：预算收缩而不是截断',
+    squeezed.prompt.length <= MAX_TOTAL_PROMPT + 30 && !squeezed.prompt.includes('…（上下文过长已截断）'),
+    `len=${squeezed.prompt.length}`,
+  )
+  check('P1b 32k 挤压：最新消息仍在（触发不丢）', squeezed.prompt.includes(mark('FOLD-4')))
+  check('P1b 32k 挤压：收缩放不下的进折叠', /〔已折叠 [1-9]\d* 条/.test(squeezed.prompt), squeezed.prompt.slice(-600))
+
+  // 32k extreme: a persona at the ceiling itself forces the last-resort
+  // slice — which now cuts the HEAD, never the transcript. The old slice
+  // took the header tail, i.e. exactly the newest transcript lines.
+  const extreme = buildTurnPromptDetailed({
+    room,
+    character: { ...character, persona: 'P'.repeat(MAX_TOTAL_PROMPT) },
+    characters: [{ ...character, persona: 'P'.repeat(MAX_TOTAL_PROMPT) }],
+    messages,
+    cwd: 'D:/tmp',
+    since,
+    resumed: true,
+  })
+  check(
+    'P1b 32k 极端：截断兜底仍不超上限',
+    extreme.prompt.length <= MAX_TOTAL_PROMPT + 30 && extreme.prompt.includes('…（上下文过长已截断）'),
+    `len=${extreme.prompt.length}`,
+  )
+  check(
+    'P1b 32k 极端：截断保住最新消息与折叠（不再切 transcript 尾部）',
+    extreme.prompt.includes(mark('FOLD-4')) && /〔已折叠 [1-9]\d* 条/.test(extreme.prompt),
+    extreme.prompt.slice(-600),
+  )
+}
+
 /* --------------------------------------- P2 db isolation & invalidation (server) */
 
 async function scenarioIsolation() {
@@ -626,6 +738,127 @@ async function scenarioMidRoundMessage() {
   check('P4b sessions.turns=2', row && row.turns === 2, JSON.stringify(row))
 }
 
+/* --------------- P4c integration: after-cursor fetch + fold end-to-end (B01) */
+
+/**
+ * The old recent-80 fetch window and the bare-`break` transcript fill (B01):
+ * (a) 92 post-cursor messages — the window only ever loaded 80, so the
+ *     oldest increments never even reached memory, fold or no fold;
+ * (b) six 4k floods — overflow reaches the fold through the real server;
+ * (c) 1005 floods — beyond the 1000-message fetch window, the overflow must
+ *     ride along as a fold COUNT and the cursor must still advance (a
+ *     silent skip or a frozen cursor would both strand them).
+ * Floods go straight into sqlite: through the API each would wake the
+ * character and start a turn.
+ */
+async function scenarioIncrementalFetch() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-session-p4c-'))
+  tempDirs.push(dir)
+  const work = mkdtempSync(join(tmpdir(), 'ac-session-p4cw-'))
+  tempDirs.push(work)
+
+  const server = await bootServer(dir)
+  const port = server.port
+
+  // Flood timestamps must sit BETWEEN the cursor (round-1 trigger) and the
+  // round-2 trigger's real wall-clock time: past-dated relative to the
+  // anchor (+10ms, 4 per ms), never in the future — a future-dated flood
+  // sorts AFTER the round-2 trigger and both the render order and the
+  // "newest 200" API window bury the trigger mid-list.
+  const flood = (roomId, anchorAt, prefix, count, body) =>
+    withDb(dir, (handle) => {
+      const insert = handle.prepare(
+        'insert into messages (id, room_id, author_type, character_id, author_name, content, created_at) values (?, ?, ?, null, ?, ?, ?)',
+      )
+      for (let i = 0; i < count; i += 1) {
+        insert.run(`${prefix}-${i}`, roomId, 'user', '用户', body(i), anchorAt + 10 + Math.floor(i / 4))
+      }
+    })
+
+  // --- a) >80 short increments: everything must reach the prompt.
+  const roomA = await makeRoom(port, 'p4c-增量取回', work)
+  await makeCharacter(port, roomA.id, '甲', 'MOCK-续传')
+  await postMessage(port, roomA.id, '第一轮：建立会话')
+  await waitIdle(port, roomA.id, 40_000)
+  const anchorA = (await req(port, `/api/rooms/${roomA.id}/messages?limit=200`)).messages.find((message) =>
+    message.content.includes('第一轮：建立会话'),
+  )
+  flood(roomA.id, anchorA.createdAt, 'flood-a', 90, (i) => `洪水消息${i}：暗号UFO-${i}`)
+  await postMessage(port, roomA.id, '第二轮：请汇报最新情况')
+  await waitIdle(port, roomA.id, 60_000)
+  const messagesA = (await req(port, `/api/rooms/${roomA.id}/messages?limit=200`)).messages
+  const secondA = characterMessages(messagesA, '甲')[1]
+  check('P4c 超量增量轮为续传轮', secondA?.meta?.resume === true)
+  check(
+    'P4c 超过 80 条增量全部进入 prompt（旧窗口只看得到 80）',
+    Boolean(secondA) && secondA.content.includes('新消息 92 条'),
+    secondA?.content.slice(0, 220),
+  )
+  check(
+    'P4c 短消息总量在预算内，折叠不误触发',
+    Boolean(secondA) && secondA.content.includes('折叠 0 条'),
+    secondA?.content.slice(0, 220),
+  )
+  const triggerA = messagesA.find((message) => message.content.includes('第二轮：请汇报最新情况'))
+  const rowA = sessionRows(dir, 'room_id = ?', roomA.id)[0]
+  check(
+    'P4c 游标推到最新（92 条全部消费，无滞留）',
+    Boolean(rowA) && rowA.consumed_seq === triggerA?.seq && rowA.turns === 2,
+    JSON.stringify({ row: rowA, triggerSeq: triggerA?.seq }),
+  )
+
+  // --- b) six 4k floods: the fold engages through the whole server chain.
+  const roomB = await makeRoom(port, 'p4c-折叠', work)
+  await makeCharacter(port, roomB.id, '乙', 'MOCK-续传')
+  await postMessage(port, roomB.id, '第一轮：建立会话')
+  await waitIdle(port, roomB.id, 40_000)
+  const anchorB = (await req(port, `/api/rooms/${roomB.id}/messages?limit=200`)).messages.find((message) =>
+    message.content.includes('第一轮：建立会话'),
+  )
+  flood(roomB.id, anchorB.createdAt, 'big-b', 6, (i) => `⟪BIG-${i}⟫${'B'.repeat(3_992)}`)
+  await postMessage(port, roomB.id, '第二轮：请汇报最新情况')
+  await waitIdle(port, roomB.id, 60_000)
+  const secondB = characterMessages((await req(port, `/api/rooms/${roomB.id}/messages?limit=200`)).messages, '乙')[1]
+  check(
+    'P4c 4k 增量溢出走折叠（服务端全链）',
+    Boolean(secondB) && secondB.content.includes('折叠 2 条'),
+    secondB?.content.slice(0, 220),
+  )
+
+  // --- c) 1005 floods: beyond the fetch window, counted not skipped.
+  const roomC = await makeRoom(port, 'p4c-窗口溢出', work)
+  await makeCharacter(port, roomC.id, '丙', 'MOCK-续传')
+  await postMessage(port, roomC.id, '第一轮：建立会话')
+  await waitIdle(port, roomC.id, 40_000)
+  const anchorC = (await req(port, `/api/rooms/${roomC.id}/messages?limit=200`)).messages.find((message) =>
+    message.content.includes('第一轮：建立会话'),
+  )
+  flood(roomC.id, anchorC.createdAt, 'flood-c', 1_005, (i) => `洪${String(i).padStart(5, '0')}`)
+  await postMessage(port, roomC.id, '第二轮：请汇报最新情况')
+  await waitIdle(port, roomC.id, 120_000)
+  // 1009 rows in this room — the default newest-200 window buries 丙's
+  // round-1 reply (older createdAt than the flood block), so pull them all.
+  const messagesC = (await req(port, `/api/rooms/${roomC.id}/messages?limit=1200`)).messages
+  const secondC = characterMessages(messagesC, '丙')[1]
+  check(
+    'P4c 窗口溢出：折叠计数在场',
+    Boolean(secondC) && /折叠 [1-9]\d* 条/.test(secondC.content),
+    secondC?.content.slice(0, 220),
+  )
+  check(
+    'P4c 窗口溢出：窗口外条数以计数披露（不静默跳过）',
+    Boolean(secondC) && secondC.content.includes('含取回窗口外计数'),
+    secondC?.content.slice(0, 220),
+  )
+  const triggerC = messagesC.find((message) => message.content.includes('第二轮：请汇报最新情况'))
+  const rowC = sessionRows(dir, 'room_id = ?', roomC.id)[0]
+  check(
+    'P4c 窗口溢出：游标仍推进到最新（按计数消费，不冻结）',
+    Boolean(rowC) && rowC.consumed_seq === triggerC?.seq,
+    JSON.stringify({ row: rowC, triggerSeq: triggerC?.seq }),
+  )
+}
+
 /* -------------------------------------------- P5 fallback: bogus session row */
 
 async function scenarioFallback() {
@@ -709,6 +942,8 @@ try {
   await scenarioIsolation()
   await scenarioIntegration()
   await scenarioMidRoundMessage()
+  await scenarioFoldPrompt()
+  await scenarioIncrementalFetch()
   await scenarioFallback()
   await scenarioKillSwitch()
 } catch (error) {

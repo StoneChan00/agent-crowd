@@ -119,7 +119,12 @@ export const mockAdapter: HarnessAdapter = {
       const newLines = section
         .split('\n')
         .filter((line) => line.trim() && !line.startsWith('【')).length
-      const reply = `（mock 模式）RESUME-OK：续传会话 ${input.resume.id}，本轮新消息 ${newLines} 条，最新用户消息：${lastUser.slice(0, 80)}`
+      // Fold observability (B01): the resumed prompt folds increment
+      // messages the budget couldn't render — the count (and whether any sat
+      // beyond the fetch window) is what the check asserts on.
+      const foldTotal = Number(section.match(/〔已折叠 (\d+) 条/)?.[1] ?? 0)
+      const beyondWindow = section.includes('取回窗口之外')
+      const reply = `（mock 模式）RESUME-OK：续传会话 ${input.resume.id}，本轮新消息 ${newLines} 条（其中折叠 ${foldTotal} 条${beyondWindow ? '，含取回窗口外计数' : ''}），最新用户消息：${lastUser.slice(0, 80)}`
       for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
         input.emit({ kind: 'text', text: chunk })
         await sleep(10)

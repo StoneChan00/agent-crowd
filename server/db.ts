@@ -638,6 +638,41 @@ export function listMessages(roomId: string, limit = 200): Message[] {
   return rows.map(mapMessage).reverse()
 }
 
+/**
+ * After-cursor fetch for resumed turns (B01): strictly newer than the
+ * (createdAt, seq) cursor, newest-first window reversed to ascending. The
+ * old "recent 80" listMessages window stranded older increments outside
+ * memory before the prompt's fold could even see them — one scripted flood
+ * of 90 messages lost the oldest 10 outright. Saturation (rows === limit)
+ * means older increments exist beyond the window; the caller folds those by
+ * count (countMessagesAfter) instead of skipping them.
+ */
+export function listMessagesAfter(
+  roomId: string,
+  cursor: { at: number; seq: number },
+  limit = 1_000,
+): Message[] {
+  const rows = db
+    .prepare(
+      `select rowid as seq, * from messages
+       where room_id = ? and (created_at > ? or (created_at = ? and rowid > ?))
+       order by created_at desc, rowid desc
+       limit ?`,
+    )
+    .all(roomId, cursor.at, cursor.at, cursor.seq, Math.min(2_000, Math.max(1, limit)))
+  return rows.map(mapMessage).reverse()
+}
+
+/** How many messages sit strictly after the cursor — the fold's beyond-window count. */
+export function countMessagesAfter(roomId: string, cursor: { at: number; seq: number }): number {
+  const row = db
+    .prepare(
+      'select count(*) as c from messages where room_id = ? and (created_at > ? or (created_at = ? and rowid > ?))',
+    )
+    .get(roomId, cursor.at, cursor.at, cursor.seq) as { c: number } | undefined
+  return Number(row?.c ?? 0)
+}
+
 export function countMessages(roomId: string): number {
   const row = db.prepare('select count(*) as c from messages where room_id = ?').get(roomId) as
     | { c: number }

@@ -7,7 +7,7 @@ import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure } from './harnesses/process.ts'
 import { changedPathsBetween, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
-import { buildTurnPrompt, nextSessionCursor } from './prompt.ts'
+import { buildTurnPromptDetailed } from './prompt.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
@@ -156,6 +156,14 @@ const REPLAY_TEXT_CAP = 200_000
 
 /** Verification command budget (SOP gate, P0-3): a room verify must answer within 5 minutes. */
 const VERIFY_TIMEOUT_MS = 300_000
+/**
+ * Fetch limit for a resumed turn's increment (B01). Beyond it (a pathological
+ * flood — >1000 messages between two turns of one character) the fetch
+ * saturates: the overflow rides along as a fold COUNT (never a silent skip)
+ * and a non-user-visible log line, because the user already sees every
+ * message in the room.
+ */
+const RESUME_FETCH_LIMIT = 1_000
 /** Rolling output window kept while the command runs; the tail is where a failure explains itself. */
 const VERIFY_OUTPUT_CHARS = 4_000
 /** Output tail kept for the round_checks row and the gate notice (a TRUE tail — see `tail()`). */
@@ -833,7 +841,6 @@ async function pump(roomId: string): Promise<void> {
     // repo root (see gitstate.ts) — the room cwd is usually a subdirectory.
     // Unjudgeable worktrees simply leave the turn's `changed` null.
     const before = await snapshotWorktree(cwd)
-    const messages = db.listMessages(roomId, 80)
     const characters = db.listCharacters(roomId)
     // Long-term memory rides along on every turn: the character's cross-room
     // identity memories plus this room's shared notes, both hard-budgeted so
@@ -856,24 +863,44 @@ async function pump(roomId: string): Promise<void> {
       session.harness === character.harness &&
       session.model === character.model
     const since = useResume && session ? { at: session.consumedAt, seq: session.consumedSeq } : { at: 0, seq: 0 }
-    // The cursor the NEXT turn resumes from: the (createdAt, seq) of the
-    // newest message this prompt actually carries (newest always survives
-    // the budget). Never Date.now() — messages arriving mid-turn must stay
-    // AFTER the cursor or they would be skipped forever. The cursor FILTER
-    // itself lives in buildTurnPrompt (single source: prompt.ts owns what a
-    // resumed prompt renders, this only computes where it leaves off).
-    const consumedCursor = nextSessionCursor(messages, since)
-    const prompt = buildTurnPrompt({
+    // B01: a resumed turn fetches BY CURSOR — the old recent-80 window left
+    // older increments stranded outside memory, where neither the render nor
+    // the fold could see them. Fresh turns keep the cold-start recency
+    // window: nothing older ever rode the new session.
+    const fetched = useResume
+      ? db.listMessagesAfter(room.id, since, RESUME_FETCH_LIMIT)
+      : db.listMessages(roomId, 80)
+    // Pathological flood beyond the fetch window: the overflow is folded by
+    // COUNT (never silently skipped); the log line is the only trace because
+    // the user already sees every message in the room.
+    const foldOverflow =
+      useResume && fetched.length >= RESUME_FETCH_LIMIT
+        ? Math.max(0, db.countMessagesAfter(room.id, since) - fetched.length)
+        : 0
+    if (foldOverflow > 0) {
+      console.warn(
+        `[agent-crowd] ${room.name}/${character.name}: 新消息超过取回窗口（${RESUME_FETCH_LIMIT} 条），${foldOverflow} 条仅以计数进入折叠摘要`,
+      )
+    }
+    // The prompt layer owns both the text and what it represented (B01): the
+    // cursor below is computed from the messages the prompt actually carries
+    // (rendered or folded), never from what was merely fetched — a cursor
+    // past an unrepresented message would skip it forever. Messages arriving
+    // DURING the run stay after the cursor and re-ship next turn; computing
+    // it from `Date.now()` instead would swallow them silently.
+    const built = buildTurnPromptDetailed({
       room,
       character,
       characters,
-      messages,
+      messages: fetched,
       cwd,
       override: item.override,
       memories,
       since,
       resumed: useResume,
+      foldOverflow,
     })
+    const prompt = built.prompt
     db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))
 
     const output = await adapter.run({
@@ -1116,12 +1143,13 @@ async function pump(roomId: string): Promise<void> {
       }
     }
     // Session continuity (P0-1): a clean turn that surfaced a CLI session id
-    // (re)writes the row; the cursor is what this prompt actually consumed,
-    // (createdAt, seq) of the newest message it carried. Errored and stopped
-    // turns never advance the cursor — the next run re-sends rather than
-    // silently skipping (duplication is recoverable, a skip is not). Rows are
-    // written even under AC_SESSION_RESUME=0: the switch disables the RIDE,
-    // not the bookkeeping, so flipping it back on resumes seamlessly.
+    // (re)writes the row; the cursor is what this prompt actually represented
+    // — rendered or folded (B01), computed by the prompt layer over the
+    // messages it carried. Errored and stopped turns never advance the
+    // cursor — the next run re-sends rather than silently skipping
+    // (duplication is recoverable, a skip is not). Rows are written even
+    // under AC_SESSION_RESUME=0: the switch disables the RIDE, not the
+    // bookkeeping, so flipping it back on resumes seamlessly.
     if (!output.error && output.sessionId) {
       db.setSession({
         roomId,
@@ -1129,8 +1157,8 @@ async function pump(roomId: string): Promise<void> {
         harness: character.harness,
         model: character.model,
         sessionId: output.sessionId,
-        consumedAt: consumedCursor.at,
-        consumedSeq: consumedCursor.seq,
+        consumedAt: built.nextCursor.at,
+        consumedSeq: built.nextCursor.seq,
       })
     }
     enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null)

@@ -13,8 +13,9 @@
  *   2. bound    — a pathological dump is still capped, with the … marker;
  *   3. budget   — the transcript keeps the NEWEST messages within budget
  *                 (four max-length messages: the closing loop must fit);
- *   4. ceiling  — when the total-prompt guard fires, only the header is cut:
- *                 the "【现在轮到你】" instruction always survives.
+ *   4. ceiling  — when the total-prompt guard fires, only the head is cut:
+ *                 the "【现在轮到你】" instruction and (B01) the newest
+ *                 transcript line always survive;
  *   5. override — a steer/manual override is capped like one message before
  *                 it rides the guard-protected tail: a 40k override must not
  *                 slip the ceiling and blow the CLI's 32_767-char argv limit.
@@ -130,7 +131,9 @@ const mark = (tag) => `⟪${tag}⟫`
 
 {
   // A persona this huge blows the total ceiling: the guard must fire, and the
-  // header — never the "【现在轮到你】" tail — is what gets cut.
+  // head — never the "【现在轮到你】" tail, and since B01 never the transcript
+  // either (the old header-tail slice ate exactly the newest lines) — is
+  // what gets cut.
   const huge = { ...baseCharacter, persona: 'P'.repeat(MAX_TOTAL_PROMPT) }
   const prompt = build([msg('m1', '正常长度的消息', 1)], huge)
   check('overflow guard fires with its marker', prompt.includes('…（上下文过长已截断）'))
@@ -138,6 +141,7 @@ const mark = (tag) => `⟪${tag}⟫`
     'the turn instruction survives the overflow cut',
     prompt.trimEnd().endsWith('请直接给出你要发到群里的那条消息。'),
   )
+  check('the overflow cut keeps the newest transcript line (B01)', prompt.includes('正常长度的消息'))
 }
 
 // ---- 5. oversized override cannot blow the argv ceiling ---------------------------
