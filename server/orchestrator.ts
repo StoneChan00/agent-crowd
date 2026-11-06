@@ -1287,19 +1287,23 @@ async function pump(roomId: string): Promise<void> {
     // line), the round's cumulative changed paths INCLUDING this turn's, and
     // the task card's why/acceptance when this round executes a card. No
     // gate conclusions — the gate runs at queue-drain, not here.
+    // Round guard on EVERY round-sourced input (B06 review 5): a new human
+    // message while the followers sit queued replaces the live round —
+    // falling back to the NEW round's delivery/verify state would describe
+    // a relay this handoff never inherited.
+    const ownRound = round && round.roundId === item.roundId ? round : null
     const handoff =
       followers.length > 0
         ? buildHandoff({
-            lastDelivery: episodeDelivery(content) || round?.lastDelivery || '',
-            changedPaths: [
-              ...(round && round.roundId === item.roundId ? round.changedPaths : []),
-              ...(changedPaths ?? []),
-            ],
+            lastDelivery: episodeDelivery(content) || ownRound?.lastDelivery || '',
+            changedPaths: [...(ownRound?.changedPaths ?? []), ...(changedPaths ?? [])],
             taskId: item.taskId ?? null,
             taskWhy: item.taskId ? (db.getTask(item.taskId)?.why ?? null) : null,
             taskAcceptance: item.taskId ? (db.getTask(item.taskId)?.acceptance ?? null) : null,
             verifyConfigured: room.verifyCommand.trim().length > 0,
-            verifyPending: round?.verifyState === 'none',
+            // No own round at settle time (replaced mid-flight / restored
+            // turn) = its verify never ran → pending, the conservative truth.
+            verifyPending: (ownRound?.verifyState ?? 'none') === 'none',
           })
         : null
 

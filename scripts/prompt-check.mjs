@@ -543,6 +543,58 @@ const mark = (tag) => `⟪${tag}⟫`
     verifyPending: false,
   })
   check('H4b 改动路径只取前 5 条（去重）', paths7.what.includes('改动：a、b、c、d、e') && !paths7.what.includes('f、g'), paths7.what)
+  // B06 review 1: the orchestrator concatenates the round's folded paths
+  // with this turn's — re-edited files arrive twice. The list AND the
+  // 「等 N 个」count must speak the deduplicated truth.
+  const dupPaths = buildHandoff({
+    lastDelivery: '',
+    changedPaths: ['a', 'b', 'c', 'd', 'e', 'a', 'b', 'h'],
+    taskId: null,
+    taskWhy: null,
+    taskAcceptance: null,
+    verifyConfigured: false,
+    verifyPending: false,
+  })
+  check(
+    'H4c 重复路径不再多报（5 唯一 + 2 重复 + 1 新 = 等 6 个，非 8）',
+    dupPaths.what.includes('改动：a、b、c、d、e 等 6 个'),
+    dupPaths.what,
+  )
+  const reEdited = buildHandoff({
+    lastDelivery: '',
+    changedPaths: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'c.ts'],
+    taskId: null,
+    taskWhy: null,
+    taskAcceptance: null,
+    verifyConfigured: false,
+    verifyPending: false,
+  })
+  check('H4c 修复回合重编辑同一文件不产生幽灵计数', reEdited.what === '改动：a.ts、b.ts、c.ts、d.ts、e.ts', reEdited.what)
+
+  // B06 review 3: an empty What renders as an omitted line — never a bare
+  // `- What：` with nothing after the colon.
+  const emptyWhat = buildHandoff({
+    lastDelivery: '',
+    changedPaths: [],
+    taskId: null,
+    taskWhy: null,
+    taskAcceptance: null,
+    verifyConfigured: false,
+    verifyPending: false,
+  })
+  const emptyWhatPrompt = buildTurnPrompt({
+    room,
+    character: baseCharacter,
+    characters: [baseCharacter],
+    messages: [msg('m1', '正文', 1)],
+    cwd: 'D:/tmp',
+    handoff: emptyWhat,
+  })
+  check(
+    'H6 What 为空时整行省略（只渲染标题 + Next Action）',
+    emptyWhatPrompt.includes('【交接】') && emptyWhatPrompt.includes('- Next Action：') && !emptyWhatPrompt.includes('- What：'),
+    '',
+  )
 
   // Prompt rendering layer.
   const withHandoff = buildTurnPrompt({

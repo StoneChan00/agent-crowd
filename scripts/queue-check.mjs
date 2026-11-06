@@ -535,6 +535,21 @@ async function scenarioRelayHandoff() {
     method: 'POST',
     body: JSON.stringify({ name: '甲', harness: 'mock', model: 'mock', persona: 'MOCK-写文件', triggers: ON_USER_ONLY }),
   })
+  // B06 review 2: 丙 also follows 甲 and is created BEFORE 乙 — it runs
+  // between 甲 and 乙, so the LATEST message when 乙 starts is 丙's plain
+  // reply (no handoff of its own: it has no followers). The injection must
+  // still read 甲's message via triggerMessageId; a "read the newest"
+  // implementation would hand 乙 NO-HANDOFF.
+  await req(s1.port, `/api/rooms/${room.id}/characters`, {
+    method: 'POST',
+    body: JSON.stringify({
+      name: '丙',
+      harness: 'mock',
+      model: 'mock',
+      persona: '普通角色（不带交接）',
+      triggers: { ...QUIET, onCharacterNames: ['甲'] },
+    }),
+  })
   await req(s1.port, `/api/rooms/${room.id}/characters`, {
     method: 'POST',
     body: JSON.stringify({
@@ -552,7 +567,12 @@ async function scenarioRelayHandoff() {
   const messages = (await req(s1.port, `/api/rooms/${room.id}/messages?limit=200`)).messages
   const aReply = characterMessages(messages, '甲')[0]
   const bReply = characterMessages(messages, '乙')[0]
-  check('Q8 接力链跑通（甲乙各 1 条，回合排空）', Boolean(drained) && Boolean(aReply) && Boolean(bReply), `drained=${drained}`)
+  const cReply = characterMessages(messages, '丙')[0]
+  check(
+    'Q8 接力链跑通（甲丙乙各 1 条，回合排空）',
+    Boolean(drained) && Boolean(aReply) && Boolean(bReply) && Boolean(cReply),
+    `drained=${drained}`,
+  )
 
   const { buildHandoff } = await import('../server/handoff.ts')
   const { episodeDelivery } = await import('../server/memory.ts')
@@ -572,6 +592,11 @@ async function scenarioRelayHandoff() {
     JSON.stringify({ actual: aReply.meta?.handoff, expected }),
   )
   check(
+    'Q8 无 follower 的丙回复不挂交接（没有可交接对象）',
+    cReply && cReply.meta?.handoff === undefined,
+    JSON.stringify(cReply?.meta?.handoff ?? null),
+  )
+  check(
     'Q8 乙的 prompt 带【交接】段（seam 报告 What 与 Next Action 行）',
     Boolean(bReply) && bReply.content.includes('HANDOFF-BEGIN') && bReply.content.includes('- What：') && bReply.content.includes('- Next Action：'),
     bReply?.content.slice(0, 160),
@@ -580,6 +605,14 @@ async function scenarioRelayHandoff() {
     'Q8 乙的 prompt 无 Why / Open Questions 行（无卡无验证，整行省略）',
     Boolean(bReply) && !bReply.content.includes('- Why：') && !bReply.content.includes('- Open Questions：'),
     bReply?.content.slice(0, 160),
+  )
+  // trigger-vs-latest (B06 review 2): 丙's reply was the LATEST message
+  // when 乙 started — the What line must still carry 甲's delivery (from
+  // 甲's meta.handoff via triggerMessageId), not 丙's anything.
+  check(
+    'Q8 乙的 What 来自甲那棒（triggerMessageId 而非最新一条；丙的回复在场却不可见）',
+    Boolean(bReply) && bReply.content.includes('- What：') && bReply.content.includes(delivery.slice(0, 20)),
+    JSON.stringify({ delivery: delivery.slice(0, 40), excerpt: bReply?.content.slice(0, 200) }),
   )
 }
 

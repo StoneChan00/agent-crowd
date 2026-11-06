@@ -49,28 +49,15 @@ function cap(text: string): string {
   return text.length > HANDOFF_FIELD_MAX ? `${text.slice(0, HANDOFF_FIELD_MAX - 1)}…` : text
 }
 
-/** Total budget: shave the overflow (deterministically, from `what` first). */
-function enforceTotal(handoff: Handoff): Handoff {
-  const order: Array<keyof Omit<Handoff, 'tradeoff'>> = ['what', 'openQuestions', 'why', 'nextAction']
-  let total = order.reduce((sum, key) => sum + handoff[key].length, 0)
-  let over = total - HANDOFF_TOTAL_MAX
-  if (over <= 0) return handoff
-  const next = { ...handoff }
-  for (const key of order) {
-    if (over <= 0) break
-    const room = next[key].length
-    const cut = Math.min(room, over)
-    next[key] = cap(next[key].slice(0, room - cut))
-    over -= cut
-  }
-  return next
-}
-
 export function buildHandoff(input: HandoffInput): Handoff {
-  // What: delivery + paths (dedup, first 5 listed verbatim, rollover note).
-  const paths = [...new Set(input.changedPaths)].slice(0, HANDOFF_PATHS_LISTED)
+  // Dedupe FIRST (B06 review 1): the orchestrator concatenates the round's
+  // folded paths with this turn's — a file re-edited in a fix-up turn
+  // appears twice, and "等 N 个" counted the RAW length, reporting ghosts.
+  // The list and the count both speak the deduplicated truth.
+  const unique = [...new Set(input.changedPaths)]
+  const paths = unique.slice(0, HANDOFF_PATHS_LISTED)
   const pathText = paths.length
-    ? `改动：${paths.join('、')}${input.changedPaths.length > HANDOFF_PATHS_LISTED ? ` 等 ${input.changedPaths.length} 个` : ''}`
+    ? `改动：${paths.join('、')}${unique.length > HANDOFF_PATHS_LISTED ? ` 等 ${unique.length} 个` : ''}`
     : ''
   const what = cap([input.lastDelivery.trim(), pathText].filter(Boolean).join('；'))
 
@@ -93,5 +80,11 @@ export function buildHandoff(input: HandoffInput): Handoff {
     input.taskId ? (input.taskAcceptance ?? '').trim() || GENERIC_NEXT : GENERIC_NEXT,
   )
 
-  return enforceTotal({ what, why, tradeoff, openQuestions, nextAction })
+  // Total budget is arithmetic, not a pass (B06 review 4): at most four
+  // fields ever render (what / why / openQuestions / nextAction — tradeoff
+  // has no source), each capped at HANDOFF_FIELD_MAX by `cap`, so the sum
+  // is ≤ 4 × 200 = HANDOFF_TOTAL_MAX. The old shave-the-overflow pass was
+  // unreachable dead code. If tradeoff ever gains a source, raise
+  // HANDOFF_FIELD_MAX awareness here first — 5 × 200 > 800.
+  return { what, why, tradeoff, openQuestions, nextAction }
 }

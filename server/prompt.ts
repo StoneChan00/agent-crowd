@@ -326,7 +326,11 @@ export function buildTurnPromptDetailed(input: {
   if (input.handoff) {
     handoffSection.push(
       '【交接】（上一棒交给你的现场；接力事实，接手前先读）',
-      `- What：${input.handoff.what}`,
+      // Every field is an omitted line when empty (B06 review 3): a
+      // verdict-only relay with no prior round delivery renders just the
+      // header + Next Action — never a bare `- What：` with nothing after
+      // the colon.
+      ...(input.handoff.what ? [`- What：${input.handoff.what}`] : []),
       ...(input.handoff.why ? [`- Why：${input.handoff.why}`] : []),
       ...(input.handoff.tradeoff ? [`- Tradeoff：${input.handoff.tradeoff}`] : []),
       ...(input.handoff.openQuestions ? [`- Open Questions：${input.handoff.openQuestions}`] : []),
