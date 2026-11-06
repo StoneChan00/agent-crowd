@@ -680,6 +680,8 @@ function gateBlockNotice(
       return `REVIEW: PASS 来自实现者本人（${nameOf(round.verdictAuthor)}），自审无效，本轮不做轮末总结。`
     case 'wrong-reviewer':
       return `REVIEW: PASS 非指定 reviewer（应为 ${reviewer ? reviewer.name : '（已删除角色）'}，实际 ${nameOf(round.verdictAuthor)}），本轮不做轮末总结。`
+    case 'reviewer-ineligible':
+      return `指定 reviewer（${reviewer ? reviewer.name : '（已删除角色）'}）已停用或为轮末总结角色，无法给出有效 PASS；请到「房间设置」重新指定 reviewer（或启用该角色），本轮不做轮末总结。`
     case 'same-harness':
       return `reviewer 与实现者同一 harness（${round.changedAuthor?.harness ?? '未知'}），同一模型家族不构成独立判断，本轮不做轮末总结。`
     case 'no-author':
@@ -805,7 +807,12 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
   if (round.changedPaths.length > 0) {
     // B05: the room's designated reviewer, when one is configured. A stale id
     // (deleted character) reads as no designation — the hard rule still holds.
+    // B05b-4: a DISABLED or summarizer-only reviewer is kept (not silently
+    // cleared) and the gate blocks with an actionable reason instead.
     const reviewerCharacter = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
+    const reviewerEligible = reviewerCharacter
+      ? reviewerCharacter.enabled && !reviewerCharacter.triggers.onRoundEnd
+      : true
     const decision = gateDecision({
       changed: round.changedPaths.length,
       verifyRequired: room.verifyCommand.trim().length > 0,
@@ -814,6 +821,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
       verdictAuthor: round.verdictAuthor,
       changedAuthor: round.changedAuthor,
       reviewer: reviewerCharacter ? { id: reviewerCharacter.id, harness: reviewerCharacter.harness } : null,
+      reviewerEligible,
     })
     if (decision.action === 'block') {
       if (!round.gateNoticeSent) {

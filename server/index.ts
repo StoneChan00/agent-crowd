@@ -324,6 +324,16 @@ app.patch('/api/rooms/:id', (req, res) => {
     if (!reviewer || reviewer.roomId !== req.params.id) {
       return fail(res, 400, '指定 reviewer 必须是本房间的角色')
     }
+    // B05b-4: the reviewer must be able to actually speak mid-round — a
+    // disabled character or a round-end summarizer can never deliver the
+    // PASS the gate waits for; refusing at save time beats an unexplained
+    // block on every changed round.
+    if (!reviewer.enabled) {
+      return fail(res, 400, `指定 reviewer「${reviewer.name}」已停用，请先启用或另选他人`)
+    }
+    if (reviewer.triggers.onRoundEnd) {
+      return fail(res, 400, `指定 reviewer「${reviewer.name}」是轮末总结角色（收尾时才发言），无法给出有效 PASS，请另选他人`)
+    }
   }
   const room = db.updateRoom(req.params.id, {
     ...(typeof name === 'string' ? { name: name.trim() } : {}),

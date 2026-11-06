@@ -212,14 +212,39 @@ export function RoomSettings({ room, characters, canDelete, onClose, onSave, onD
       {room && characters.length > 0 && (
         <div className="field">
           <label>指定 reviewer（禁止自审）</label>
-          <select className="input" value={reviewerCharacterId} onChange={(event) => setReviewerCharacterId(event.target.value)}>
-            <option value="">不指定（任何非实现者角色的 PASS 都可收尾）</option>
-            {characters.map((character) => (
-              <option key={character.id} value={character.id}>
-                {character.name}（{character.harness}）
-              </option>
-            ))}
-          </select>
+          {/* B05b-4: only ELIGIBLE members are offered (enabled + not a
+              round-end summarizer — the same rule the server enforces on
+              save). The currently designated-but-ineligible value stays
+              visible, explicitly marked, so a stale designation is never
+              silently hidden. */}
+          {(() => {
+            const eligible = characters.filter((character) => character.enabled && !character.triggers.onRoundEnd)
+            const current = characters.find((character) => character.id === reviewerCharacterId)
+            const currentIneligible =
+              current !== undefined && (!current.enabled || current.triggers.onRoundEnd)
+            return (
+              <>
+                <select className="input" value={reviewerCharacterId} onChange={(event) => setReviewerCharacterId(event.target.value)}>
+                  <option value="">不指定（任何非实现者角色的 PASS 都可收尾）</option>
+                  {eligible.map((character) => (
+                    <option key={character.id} value={character.id}>
+                      {character.name}（{character.harness}）
+                    </option>
+                  ))}
+                  {currentIneligible && (
+                    <option value={current.id}>
+                      {current.name}（{current.harness}）— 已停用/总结角色（不可用）
+                    </option>
+                  )}
+                </select>
+                {currentIneligible && (
+                  <span className="field-hint reviewer-ineligible-hint">
+                    ⚠ 当前指定的「{current.name}」已停用或为轮末总结角色，无法给出有效 PASS——本轮改动会被门禁拦下。请另选他人（或先启用该角色）。
+                  </span>
+                )}
+              </>
+            )
+          })()}
           <span className="field-hint">
             指定后：REVIEW: PASS 必须来自该角色，且它与实现者不能是同一 harness（同一模型家族不算独立判断）。无论如何，实现者本人的自审 PASS 一律无效。
           </span>

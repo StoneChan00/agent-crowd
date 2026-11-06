@@ -423,6 +423,14 @@ function scenarioGateTable() {
       'close',
       '指定异构 reviewer 的 PASS → 收尾',
     ],
+    // B05b-4: designated reviewer present but ineligible (disabled /
+    // summarizer) — actionable block BEFORE the identity checks.
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer, reviewer: customReviewer, reviewerEligible: false },
+      'block',
+      '指定 reviewer 资格失效（停用/总结角色）→ 可操作阻断',
+      'reviewer-ineligible',
+    ],
     // B05b-2: the OTHER fail-closed half — verdict present, implementer
     // author missing. Real wiring cannot produce this state (changedAuthor
     // is recorded on every changed turn), but the branch exists in the
@@ -977,10 +985,13 @@ async function scenarioEndToEnd() {
     const roomE = await makeRoom(port, 's11e-非指定', repo, 'exit 0')
     await makeCharacter(port, roomE.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
     await makeCharacter(port, roomE.id, '评审乙', FOLLOWS_DEV, 'MOCK-评审通过')
-    const summarizerE = await makeCharacter(port, roomE.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+    // B05b-4: the designated reviewer must be an ELIGIBLE member (the save
+    // validation refuses disabled/summarizer designations) — a silent
+    // eligible 评审甲 that never speaks makes 评审乙's PASS a wrong-reviewer.
+    const silentReviewerE = await makeCharacter(port, roomE.id, '评审甲', ON_USER_ONLY, 'MOCK-评审通过')
     await req(port, `/api/rooms/${roomE.id}`, {
       method: 'PATCH',
-      body: JSON.stringify({ reviewerCharacterId: summarizerE.id }),
+      body: JSON.stringify({ reviewerCharacterId: silentReviewerE.id }),
     })
     const messagesE = await runRoundAndDrain(port, roomE.id)
     check('S11e PASS 非指定 reviewer → 阻断', characterMessages(messagesE, '总结丙').length === 0, '总结丙发言了')
@@ -989,6 +1000,58 @@ async function scenarioEndToEnd() {
       systemNotices(messagesE, '非指定 reviewer').length === 1,
       `实际 ${systemNotices(messagesE, '非指定 reviewer').length}`,
     )
+
+    /* S11f (B05b-4): save-time eligibility validation. */
+    {
+      const room = await makeRoom(port, 's11f-校验', repo, 'exit 0')
+      const dev = await makeCharacter(port, room.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
+      const reviewer = await makeCharacter(port, room.id, '评审乙', FOLLOWS_DEV, 'MOCK-评审通过')
+      const summarizer = await makeCharacter(port, room.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+      const patch = (assignee) =>
+        fetch(`http://127.0.0.1:${port}/api/rooms/${room.id}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ reviewerCharacterId: assignee }),
+        }).then((r) => r.status)
+      check('S11f 指定总结角色 → 400', (await patch(summarizer.id)) === 400)
+      await req(port, `/api/characters/${reviewer.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: false }) })
+      check('S11f 指定已停用角色 → 400', (await patch(reviewer.id)) === 400)
+      await req(port, `/api/characters/${reviewer.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: true }) })
+      check('S11f 指定合法角色 → 200', (await patch(reviewer.id)) === 200)
+      check('S11f null 清空指定 → 200', (await patch(null)) === 200)
+      check('S11f 开发者本人可被指定（资格与自审是两回事）', (await patch(dev.id)) === 200)
+    }
+
+    /* S11g (B05b-4): an already-designated reviewer that becomes ineligible
+     * blocks with an actionable reason — never a silent fail-open, never
+     * silently cleared. */
+    {
+      const room = await makeRoom(port, 's11g-资格失效', repo, 'exit 0')
+      await makeCharacter(port, room.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
+      await makeCharacter(port, room.id, '评审甲', FOLLOWS_DEV, 'MOCK-评审通过')
+      const designated = await makeCharacter(port, room.id, '评审乙', ON_USER_ONLY, 'MOCK-评审通过')
+      await req(port, `/api/rooms/${room.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ reviewerCharacterId: designated.id }),
+      })
+      await req(port, `/api/characters/${designated.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: false }) })
+      const messages = await runRoundAndDrain(port, room.id)
+      check(
+        'S11g reviewer 资格失效后改动轮仍被拦截（不静默放行）',
+        characterMessages(messages, '总结丙').length === 0,
+        '总结丙发言了',
+      )
+      check(
+        'S11g 通知点名「已停用或为轮末总结角色」并指向设置页',
+        systemNotices(messages, '已停用或为轮末总结角色').length === 1 &&
+          systemNotices(messages, '重新指定 reviewer').length === 1,
+        `实际 ${systemNotices(messages, '已停用或为轮末总结角色').length} 条`,
+      )
+      // The designation itself survives (kept, not cleared) — re-enabling
+      // restores the original contract without re-designating.
+      const roomRow = (await req(port, '/api/bootstrap')).rooms.find((r) => r.id === room.id)
+      check('S11g 指定保留（不自动清空，重启用即恢复）', roomRow && roomRow.reviewerCharacterId === designated.id)
+    }
   }
 
   /* S12 (B05 incident, 2026-11-06): a fired restart must pass the

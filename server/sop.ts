@@ -252,6 +252,14 @@ export interface GateInput {
   changedAuthor?: GateAuthor | null
   /** The room's designated reviewer (B05); null = no designation. */
   reviewer?: GateAuthor | null
+  /**
+   * B05b-4: whether the designated reviewer is ELIGIBLE — enabled and not a
+   * round-end summarizer (the same eligibility the room settings enforce on
+   * save). An ineligible designated reviewer is kept (not silently cleared):
+   * the gate blocks with `reviewer-ineligible` and the notice tells the user
+   * to re-designate — never a silent fail-open.
+   */
+  reviewerEligible?: boolean
 }
 
 /** Why a gate blocked, for the notice text. null = not blocked. */
@@ -259,6 +267,7 @@ export type GateBlockReason =
   | 'self-review'
   | 'wrong-reviewer'
   | 'same-harness'
+  | 'reviewer-ineligible'
   | 'no-author'
   | 'changes'
   | 'verify-fail'
@@ -310,6 +319,13 @@ export function gateDecision(input: GateInput): GateOutcome {
     return { action: 'block', reason: 'self-review' }
   }
   if (input.reviewer) {
+    // B05b-4: an ineligible designated reviewer (disabled, or a round-end
+    // summarizer that can never speak mid-round) blocks with an actionable
+    // reason BEFORE the identity checks — comparing identities against a
+    // reviewer that cannot run turns would only mislead.
+    if (input.reviewerEligible === false) {
+      return { action: 'block', reason: 'reviewer-ineligible' }
+    }
     if (input.verdictAuthor.id !== input.reviewer.id) {
       return { action: 'block', reason: 'wrong-reviewer' }
     }
