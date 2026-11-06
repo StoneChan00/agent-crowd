@@ -290,9 +290,9 @@ const mark = (tag) => `⟪${tag}⟫`
         ]) === '最后一条' &&
         mem.memoryQueryFromMessages([]) === '',
     )
-    // Table-driven cross-check against the gate itself (B04 review 3/4): for
-    // every verdict shape, the gate seeing a verdict must coincide with the
-    // stripper removing exactly that line — expectations derive from
+    // Table-driven cross-check against the gate itself (B04 review 3/4/5):
+    // for every verdict shape, the gate seeing a verdict must coincide with
+    // the stripper changing the text — expectations derive from
     // parseReviewVerdict, not from a hand-listed subset that can drift.
     // SAMPLE DISCIPLINE (review non-blocking 1): keep every sample short
     // enough that its verdict sits inside the gate's trailing-5-lines window
@@ -312,6 +312,11 @@ const mark = (tag) => `⟪${tag}⟫`
         '- `REVIEW: PASS`',
         '1. REVIEW: PASS',
         '- 复核\n\n    REVIEW: PASS',
+        // Multi-line inlineCode (B04 review 5): mdast keeps the newlines in
+        // the value — the shared extractor must split them the same way the
+        // gate does, in BOTH directions:
+        '`REVIEW: PASS\n说明`', // under-strip: gate sees the verdict line
+        '`REVIEW:\nPASS`', // over-strip: gate sees NO whole verdict line
         '> REVIEW: PASS',
         '| 门禁 | REVIEW: PASS |',
         'REVIEW: PASSED',
@@ -337,6 +342,14 @@ const mark = (tag) => `⟪${tag}⟫`
     check(
       'R-pure 剥离覆盖反引号整行 code span（交付保留正文）',
       mem.episodeDelivery('完成\n`REVIEW: PASS`') === '完成' && mem.episodeDelivery('完成\n``REVIEW: PASS``') === '完成',
+    )
+    check(
+      'R-pure 多行 inline code 的 verdict 整段剥除（交付不含 REVIEW）',
+      mem.episodeDelivery('`REVIEW: PASS\n说明`') === '' && mem.episodeDelivery('前置\n`REVIEW: PASS\n说明`') === '前置',
+    )
+    check(
+      'R-pure 门禁不认的多行 code span 不误删（REVIEW: 无 pass/changes 结尾）',
+      mem.episodeDelivery('`REVIEW:\nPASS`').includes('REVIEW:'),
     )
     check(
       'R-pure 剥离覆盖列表项形态（无序/有序/嵌 code span/列表续行）',

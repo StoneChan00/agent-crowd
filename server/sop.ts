@@ -44,25 +44,48 @@ export function isVerdictProtocolLine(line: string): boolean {
 }
 
 /**
- * A paragraph's extracted lines, each mapped back to the RAW source lines it
- * came from (B04 review 4). Mirrors paragraphLines' inline walk exactly —
- * same parts, same order — while tracking positions: text nodes advance one
- * raw line per embedded newline; an inlineCode node spans start..end raw
- * lines but yields ONE extracted line (mdast normalizes its internal
- * newlines to spaces); break nodes end the current extracted line. The
- * lines array is therefore always identical to paragraphLines' output.
+ * A paragraph's verdict-source lines with the raw source span each one came
+ * from (B04 review 5). THE line extractor — verdictSourceLines (the gate)
+ * and stripVerdictLines (the episode delivery) both go through here, so the
+ * two can never disagree about where lines break again. The drift this
+ * replaced: mdast keeps newlines inside inlineCode values, and a second
+ * hand-rolled split read them differently from the gate's join-then-split.
+ *
+ * Line semantics = a plain join-then-split: text and inlineCode values both
+ * break lines at embedded newlines; break nodes end lines. Spans: a line
+ * from ordinary text maps to its raw line(s); a line built from a
+ * MULTI-LINE inlineCode carries that node's WHOLE start..end range — a
+ * verdict inside a code span deletes the entire span, because deleting half
+ * of one strands its backticks.
  */
 function paragraphLineSpans(paragraph: MdNode): { lines: string[]; spans: Array<{ start: number; end: number }> } {
   let raw = paragraph.position?.start.line ?? 1
   let current = ''
   let lineStart = raw
+  let widen: { start: number; end: number } | null = null
   const lines: string[] = []
   const spans: Array<{ start: number; end: number }> = []
   const finishLine = (): void => {
     lines.push(current)
-    spans.push({ start: lineStart, end: raw })
+    spans.push(
+      widen
+        ? { start: Math.min(lineStart, widen.start), end: Math.max(raw, widen.end) }
+        : { start: lineStart, end: raw },
+    )
     current = ''
+    widen = null
     lineStart = raw
+  }
+  const appendSplit = (value: string, whole?: { start: number; end: number }): void => {
+    value.split('\n').forEach((segment, index) => {
+      if (index > 0) {
+        finishLine()
+        raw += 1
+        lineStart = raw
+      }
+      if (whole) widen = whole
+      current += segment
+    })
   }
   const walk = (node: MdNode): void => {
     if (node.type === 'break') {
@@ -74,24 +97,21 @@ function paragraphLineSpans(paragraph: MdNode): { lines: string[]; spans: Array<
       return
     }
     if (NOT_A_CALL.has(node.type)) {
-      if (node.type === 'inlineCode' && node.value) current += node.value
+      if (node.type === 'inlineCode' && node.value) {
+        const start = node.position?.start.line ?? raw
+        const end = node.position?.end.line ?? raw
+        // Multi-line code span: its value splits into several extracted
+        // lines, and each carries the WHOLE node range for deletion.
+        appendSplit(node.value, end > start ? { start, end } : undefined)
+        raw = Math.max(raw, end)
+        return
+      }
       const end = node.position?.end.line
       if (end && end > raw) raw = end
       return
     }
     if (node.type === 'text') {
-      const value = node.value ?? ''
-      // Soft breaks live INSIDE text values in this mdast build (probe:
-      // 'a\nb' is one text node) — each embedded newline ends the extracted
-      // line and advances the raw line, exactly like a break node would.
-      value.split('\n').forEach((segment, index) => {
-        if (index > 0) {
-          finishLine()
-          raw += 1
-          lineStart = raw
-        }
-        current += segment
-      })
+      appendSplit(node.value ?? '')
       const end = node.position?.end.line
       if (end && end > raw) raw = end
       return
@@ -152,36 +172,6 @@ interface MdNode {
 }
 
 /**
- * The visible text of ONE paragraph with soft line breaks preserved (they
- * live inside text values; `break` nodes map to `\n`). Code spans are the
- * deliberate exception to the opaque set: their content flows into the
- * line, so a whole line that is just `` `REVIEW: PASS` `` still reads as a
- * verdict — agents copy rule 9's example text into backticks — while
- * `先看 `REVIEW: PASS` 这行` keeps its framing text and matches nothing.
- * Link labels, images and inline html stay invisible exactly like mentions.
- */
-function paragraphLines(paragraph: MdNode): string[] {
-  const parts: string[] = []
-  const walk = (node: MdNode): void => {
-    if (node.type === 'break') {
-      parts.push('\n')
-      return
-    }
-    if (NOT_A_CALL.has(node.type)) {
-      if (node.type === 'inlineCode' && node.value) parts.push(node.value)
-      return
-    }
-    if (node.type === 'text') {
-      if (node.value) parts.push(node.value)
-      return
-    }
-    for (const child of node.children ?? []) walk(child)
-  }
-  for (const child of paragraph.children ?? []) walk(child)
-  return parts.join('').split('\n')
-}
-
-/**
  * The lines a verdict may live on, in document order: the author's own
  * prose. Top-level paragraphs contribute their lines; list items contribute
  * their (possibly nested) paragraphs' lines. Quoted shapes — blockquotes,
@@ -190,12 +180,17 @@ function paragraphLines(paragraph: MdNode): string[] {
  * into the tail-lines budget (review round 3: `> REVIEW: PASS` and
  * `| 门禁 | REVIEW: PASS |` both parsed as live verdicts when the extractor
  * only preserved block boundaries and dropped the quoting marks).
+ *
+ * B04 review 5: the line extraction itself is paragraphLineSpans — the ONE
+ * implementation, shared with stripVerdictLines. A second hand-rolled
+ * line-split (paragraphLines, deleted) read multi-line inlineCode values
+ * differently and let the gate and the delivery stripper drift.
  */
 function verdictSourceLines(content: string): string[] {
   const lines: string[] = []
   const collect = (node: MdNode): void => {
     if (node.type === 'paragraph') {
-      lines.push(...paragraphLines(node))
+      lines.push(...paragraphLineSpans(node).lines)
       return
     }
     if (node.type === 'list' || node.type === 'listItem') {
