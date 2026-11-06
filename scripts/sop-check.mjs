@@ -420,10 +420,24 @@ function scenarioGateTable() {
       'close',
       '指定异构 reviewer 的 PASS → 收尾',
     ],
+    // B05b-2: the OTHER fail-closed half — verdict present, implementer
+    // author missing. Real wiring cannot produce this state (changedAuthor
+    // is recorded on every changed turn), but the branch exists in the
+    // single decision table, so it must be pinned like every other row.
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: null },
+      'block',
+      '改动作者缺失 → fail closed 阻断',
+      'no-author',
+    ],
   ]
-  for (const [input, expected, label] of rows) {
+  for (const [input, expected, label, expectReason] of rows) {
     const actual = gateDecision(input)
-    check(`S2 ${label}`, actual.action === expected, `实际 ${actual.action}(${actual.reason})`)
+    check(
+      `S2 ${label}`,
+      actual.action === expected && (!expectReason || actual.reason === expectReason),
+      `实际 ${actual.action}(${actual.reason})`,
+    )
   }
 }
 
