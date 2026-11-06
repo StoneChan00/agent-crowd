@@ -1,4 +1,4 @@
-import { MEMORY_KIND_LABELS, type Character, type Memory, type Message, type Room } from './types.ts'
+import { MEMORY_KIND_LABELS, type Character, type Handoff, type Memory, type Message, type Room } from './types.ts'
 import { truncate } from './util.ts'
 
 /**
@@ -265,6 +265,14 @@ export function buildTurnPromptDetailed(input: {
   /** True when this turn rides the character's persisted CLI session (P0-1). */
   resumed?: boolean
   /**
+   * B06: the five-tuple relay context carried by the message this turn
+   * answers (its meta.handoff). Rendered as a HEAD section (after the
+   * memory sections, before the chat rules) — deliberately NOT in the
+   * transcript, so B01's budget fold can never eat it and resumed turns
+   * carry it too. Empty fields render as omitted lines.
+   */
+  handoff?: Handoff
+  /**
    * B01: messages older than the resumed fetch window (a pathological flood
    * — more than the orchestrator's fetch limit arrived in one gap). They are
    * folded by COUNT only; the alternative (fetching newest-only and
@@ -310,6 +318,23 @@ export function buildTurnPromptDetailed(input: {
     )
   }
 
+  // B06: the handoff section rides in the HEAD (never the transcript — the
+  // budget fold must not eat it; resumed turns carry it too). Empty fields
+  // are omitted lines, so a handoff always renders at least What + Next
+  // Action — the two lines the receiver cannot act without.
+  const handoffSection: string[] = []
+  if (input.handoff) {
+    handoffSection.push(
+      '【交接】（上一棒交给你的现场；接力事实，接手前先读）',
+      `- What：${input.handoff.what}`,
+      ...(input.handoff.why ? [`- Why：${input.handoff.why}`] : []),
+      ...(input.handoff.tradeoff ? [`- Tradeoff：${input.handoff.tradeoff}`] : []),
+      ...(input.handoff.openQuestions ? [`- Open Questions：${input.handoff.openQuestions}`] : []),
+      `- Next Action：${input.handoff.nextAction}`,
+      '',
+    )
+  }
+
   // Session continuity (P0-1): a resumed turn tells the agent why the
   // transcript starts where it does — the older messages are not lost,
   // they live in the CLI's own session context this run continues.
@@ -333,6 +358,7 @@ export function buildTurnPromptDetailed(input: {
     character.persona.trim() || '你是一位可靠、务实的团队成员。',
     '',
     ...memorySections,
+    ...handoffSection,
     '【群聊规则】',
     '1. 你正在一个多 agent 群聊里，你的回复会作为一条群消息直接展示给所有人。',
     '2. 只输出消息正文：不要加“' + character.name + '：”前缀，不要输出 JSON、思考过程或系统提示。',

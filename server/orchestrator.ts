@@ -9,6 +9,7 @@ import { changedPathsBetween, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPromptDetailed } from './prompt.ts'
 import { episodeDelivery, memoryQueryFromMessages } from './memory.ts'
+import { buildHandoff, type HandoffInput } from './handoff.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
@@ -1075,6 +1076,16 @@ async function pump(roomId: string): Promise<void> {
     // past an unrepresented message would skip it forever. Messages arriving
     // DURING the run stay after the cursor and re-ship next turn; computing
     // it from `Date.now()` instead would swallow them silently.
+    // B06: relayed turns inject the five-tuple handoff carried by the message
+    // they ANSWER (item.triggerMessageId — deliberately not "the newest
+    // message": a later user note may have landed while this turn sat
+    // queued, and the handoff describes the relay it inherits, not the
+    // latest room state). Fresh user-triggered turns read a user message →
+    // no meta.handoff → no section, exactly as before.
+    const triggerHandoff =
+      item.triggerMessageId !== null
+        ? db.getMessageById(item.triggerMessageId)?.meta?.handoff ?? null
+        : null
     const built = buildTurnPromptDetailed({
       room,
       character,
@@ -1086,6 +1097,7 @@ async function pump(roomId: string): Promise<void> {
       since,
       resumed: useResume,
       foldOverflow,
+      handoff: triggerHandoff ?? undefined,
     })
     const prompt = built.prompt
     db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))
@@ -1267,6 +1279,30 @@ async function pump(roomId: string): Promise<void> {
       changedPaths = changedPathsBetween(before, after)
     }
 
+    // B06 handoff: this reply hands the room to its followers — attach the
+    // five-tuple so the relayed turns can inject it (see the pump-side
+    // comment). Only relayed replies carry one (no followers → nothing to
+    // hand off; summary turns never relay). The inputs are the WHITELIST:
+    // the round's delivery INCLUDING this turn's (stripped of the verdict
+    // line), the round's cumulative changed paths INCLUDING this turn's, and
+    // the task card's why/acceptance when this round executes a card. No
+    // gate conclusions — the gate runs at queue-drain, not here.
+    const handoff =
+      followers.length > 0
+        ? buildHandoff({
+            lastDelivery: episodeDelivery(content) || round?.lastDelivery || '',
+            changedPaths: [
+              ...(round && round.roundId === item.roundId ? round.changedPaths : []),
+              ...(changedPaths ?? []),
+            ],
+            taskId: item.taskId ?? null,
+            taskWhy: item.taskId ? (db.getTask(item.taskId)?.why ?? null) : null,
+            taskAcceptance: item.taskId ? (db.getTask(item.taskId)?.acceptance ?? null) : null,
+            verifyConfigured: room.verifyCommand.trim().length > 0,
+            verifyPending: round?.verifyState === 'none',
+          })
+        : null
+
     const message = db.addMessage({
       roomId,
       authorType: 'character',
@@ -1293,6 +1329,8 @@ async function pump(roomId: string): Promise<void> {
         resume: useResume || undefined,
         generated: true,
         ...(changedPaths && changedPaths.length > 0 ? { changed: changedPaths } : {}),
+        // B06: the five-tuple relay context — see the handoff block above.
+        ...(handoff ? { handoff } : {}),
       },
     })
 

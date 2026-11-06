@@ -184,6 +184,28 @@ export interface SteerMeta {
   targetName: string
 }
 
+/**
+ * B06 handoff tuple: the structured relay context attached to an assistant
+ * message that hands off (meta.handoff) and injected into the next relayed
+ * turn's prompt as the 【交接】 head section. Built by the pure
+ * `buildHandoff` (server/handoff.ts) from a strict whitelist — no invented
+ * fields; empty fields render as omitted lines. Pre-truncated (200
+ * chars/field, total ≤ 800) at build time.
+ */
+export interface Handoff {
+  /** What was done: the round's delivery line + up to 5 changed paths. */
+  what: string
+  /** Why it matters — sourced only from a task card's why. */
+  why: string
+  /** Trade-offs made — no data source yet, permanently empty. */
+  tradeoff: string
+  /** Open questions — only from known pending states (card unaccepted /
+   *  verify configured but not yet run). */
+  openQuestions: string
+  /** The single next action for the handoff receiver. */
+  nextAction: string
+}
+
 export interface MessageMeta {
   harness?: HarnessKind
   model?: string
@@ -222,6 +244,8 @@ export interface MessageMeta {
   resume?: boolean
   /** Task card this system message carries (B03 approval / re-dispatch). */
   taskId?: string
+  /** B06: five-tuple relay context this assistant message hands off. */
+  handoff?: Handoff
 }
 
 export type AuthorType = 'user' | 'character' | 'system'

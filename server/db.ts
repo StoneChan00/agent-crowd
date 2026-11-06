@@ -769,6 +769,17 @@ export function listMessages(roomId: string, limit = 200): Message[] {
 }
 
 /**
+ * Single-message fetch by id (B06): relayed turns inject the handoff carried
+ * by the message they answer (item.triggerMessageId) — NOT the newest
+ * message, which a later user note may have replaced. Reads through the same
+ * meta-parsing mapper so meta.handoff round-trips.
+ */
+export function getMessageById(id: string): Message | undefined {
+  const row = db.prepare('select rowid as seq, * from messages where id = ?').get(id)
+  return row ? mapMessage(row) : undefined
+}
+
+/**
  * After-cursor fetch for resumed turns (B01): strictly newer than the
  * (createdAt, seq) cursor, newest-first window reversed to ascending. The
  * old "recent 80" listMessages window stranded older increments outside

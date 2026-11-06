@@ -41,7 +41,7 @@
    - 用户 abort → turn `stopped`，半截文本保留为角色消息，`meta.error='已停止'`。
    - `error && 无正文` → turn `error` + 系统警告消息；瞬态失败（`isTransientFailure`：死得快）自动重试**恰好一次**（`item.retry` 循环守卫）。
    - 有正文（可能带 `meta.error`）→ 以角色消息落库，meta 携带 harness/model/turnId/durationMs/exitCode/pid/sessionId/tokens/thinking/tools。
-7. **接力**：`!output.error` 时 `enqueueFollowers(hop+1)`；带 error/截断的回合**不接龙**（半成品传给下游比沉默更糟）。
+ 7. **接力**：`!output.error` 时 `enqueueFollowers(hop+1)`；带 error/截断的回合**不接龙**（半成品传给下游比沉默更糟）。接力时把五元组交接（B06）挂在被接力的 assistant 消息上（`meta.handoff`，纯函数 `buildHandoff` 零模型、数据白名单：What=轮交付线+前 5 改动路径、Why/Next Action 仅在有任务卡时取卡上的 why/acceptance、Tradeoff 永久留空、Open Questions 只认已知未决态——卡未验收/验证命令未跑；**不写门禁结论**，门禁在队列排空时才跑，接力时刻写它是臆测）；被接力的回合注入【交接】段（head 位置在记忆之后、群聊规则之前，**不进 transcript**——不会被 B01 的折叠裁掉，续传轮也带），注入按 `triggerMessageId` 取交接而非"最新一条"（排队期间可能又有新消息）。字段在构建时截断（200/字段、总 ≤800），meta 与注入永不失配。契约由 prompt-check H1–H5 与 queue-check Q8（A→B 接力：meta deepEqual + seam 报告 prompt 段）锁定。
 8. **收尾**：队列排空时先过 SOP 门禁（见下节）——无改动轮直接进轮末总结（`onRoundEnd` 角色）；有改动轮必须 review 结论为 PASS 且（若配置了验证命令）服务端自跑验证通过，否则发一条门禁说明后丢弃本轮状态、不总结也不重排队。三处正常收尾汇入 `closeRoundNormally`（B04）：结算任务卡 → **干净收尾且有改动的轮写一条 room-scope `episode` 记忆**（路径/结论/验证/交付一句话，`sha256` 去重，best-effort）→ 删 round；blocked/error/stopped/纯聊天不写。
 
 ## DB（`db.ts`，node:sqlite 单文件，WAL）

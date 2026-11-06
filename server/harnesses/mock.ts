@@ -216,6 +216,20 @@ export const mockAdapter: HarnessAdapter = {
       }
       return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
+    // Test seam for queue-check (B06, Q8): reports the 【交接】 handoff
+    // section verbatim (or its absence) so the relayed turn's prompt can be
+    // asserted from the reply alone.
+    if (input.character.persona.includes('MOCK-交接')) {
+      const start = input.prompt.indexOf('【交接】')
+      const end = start < 0 ? -1 : input.prompt.indexOf('\n【', start + 1)
+      const section = start >= 0 ? input.prompt.slice(start, end < 0 ? undefined : end).trim() : 'NO-HANDOFF'
+      const reply = `HANDOFF-BEGIN\n${section}\nHANDOFF-END`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
     // Test seam (B04 review 4, S10g-c): a reviewer that concludes in a LIST
     // ITEM — the gate accepts "- REVIEW: PASS" (listItem paragraphs are
     // verdict sources). The bullet must not become the delivery either.

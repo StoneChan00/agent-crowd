@@ -31,6 +31,9 @@
  *       `rounds` entry — the reboot already cut that round).
  *   Q7  Regression = the rest of `pnpm test` + `pnpm typecheck`: this script
  *       is one suite in that chain, not a re-run of the others.
+ *   Q8  B06 relay handoff: A (MOCK-写文件) → B (MOCK-交接) — A's reply
+ *       carries meta.handoff (deepEqual against buildHandoff over the same
+ *       inputs), B's prompt carries the 【交接】 section (seam-reported).
  *
  * Turn rows are read/written through node:sqlite against the temp DB (Q3's
  * rows are inserted while the server is down — never concurrently).
@@ -507,12 +510,86 @@ async function scenarioNoSummaryAfterRestore() {
 
 /* ------------------------------------------------------------------- main */
 
+/**
+ * Q8 (B06): the relay handoff. A (MOCK-写文件) answers a user message and
+ * relays to B (MOCK-交接, follows A). A's reply carries meta.handoff (the
+ * five-tuple built at relay time) and B's prompt carries the 【交接】
+ * section — asserted from B's seam reply AND by deepEqual of A's persisted
+ * meta.handoff against buildHandoff over the same known inputs (delivery =
+ * episodeDelivery of A's known reply, changed paths = the file A wrote).
+ */
+async function scenarioRelayHandoff() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-queue-q8-'))
+  tempDirs.push(dir)
+  // A git repo so A's file write lands in the round's change evidence.
+  const repo = mkdtempSync(join(tmpdir(), 'ac-queue-q8repo-'))
+  tempDirs.push(repo)
+  const { execFileSync } = await import('node:child_process')
+  execFileSync('git', ['-C', repo, 'init'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, '-c', 'user.name=q', '-c', 'user.email=q@t', 'commit', '-m', 'seed', '--allow-empty'], { stdio: 'ignore' })
+
+  const s1 = await bootServer(dir)
+  const room = await makeRoom(s1.port, 'q8-交接', 4, repo)
+  const a = await req(s1.port, `/api/rooms/${room.id}/characters`, {
+    method: 'POST',
+    body: JSON.stringify({ name: '甲', harness: 'mock', model: 'mock', persona: 'MOCK-写文件', triggers: ON_USER_ONLY }),
+  })
+  await req(s1.port, `/api/rooms/${room.id}/characters`, {
+    method: 'POST',
+    body: JSON.stringify({
+      name: '乙',
+      harness: 'mock',
+      model: 'mock',
+      persona: 'MOCK-交接',
+      triggers: { ...QUIET, onCharacterNames: ['甲'] },
+    }),
+  })
+
+  await postMessage(s1.port, room.id, '请开始干活，完成后交review')
+  const drained = await waitState(s1.port, room.id, (state) => !state.busy && state.queuedCharacterIds.length === 0, 40_000)
+  await sleep(600)
+  const messages = (await req(s1.port, `/api/rooms/${room.id}/messages?limit=200`)).messages
+  const aReply = characterMessages(messages, '甲')[0]
+  const bReply = characterMessages(messages, '乙')[0]
+  check('Q8 接力链跑通（甲乙各 1 条，回合排空）', Boolean(drained) && Boolean(aReply) && Boolean(bReply), `drained=${drained}`)
+
+  const { buildHandoff } = await import('../server/handoff.ts')
+  const { episodeDelivery } = await import('../server/memory.ts')
+  const delivery = episodeDelivery(aReply.content)
+  const expected = buildHandoff({
+    lastDelivery: delivery,
+    changedPaths: aReply.meta?.changed ?? [],
+    taskId: null,
+    taskWhy: null,
+    taskAcceptance: null,
+    verifyConfigured: false,
+    verifyPending: true,
+  })
+  check(
+    'Q8 甲的回复落 meta.handoff 且与 buildHandoff(同源输入) deepEqual',
+    JSON.stringify(aReply.meta?.handoff) === JSON.stringify(expected),
+    JSON.stringify({ actual: aReply.meta?.handoff, expected }),
+  )
+  check(
+    'Q8 乙的 prompt 带【交接】段（seam 报告 What 与 Next Action 行）',
+    Boolean(bReply) && bReply.content.includes('HANDOFF-BEGIN') && bReply.content.includes('- What：') && bReply.content.includes('- Next Action：'),
+    bReply?.content.slice(0, 160),
+  )
+  check(
+    'Q8 乙的 prompt 无 Why / Open Questions 行（无卡无验证，整行省略）',
+    Boolean(bReply) && !bReply.content.includes('- Why：') && !bReply.content.includes('- Open Questions：'),
+    bReply?.content.slice(0, 160),
+  )
+}
+
 try {
   await scenarioRestoreAndIdempotent()
   await scenarioStopSurvivesReboot()
   await scenarioFlagsRoundTrip()
   await scenarioOldSchemaMigration()
   await scenarioNoSummaryAfterRestore()
+  await scenarioRelayHandoff()
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

@@ -476,6 +476,125 @@ const mark = (tag) => `⟪${tag}⟫`
   }
 }
 
+/* ------------------------------------------- handoff tuple (B06, H1-H5) */
+{
+  // B06: the five-tuple relay context. buildHandoff is PURE — the data
+  // whitelist is enforced there (no invented fields), and the prompt renders
+  // it as a head section (never in the transcript, so B01's fold can't eat
+  // it; carried on resumed turns too).
+  const { buildHandoff, HANDOFF_FIELD_MAX, HANDOFF_TOTAL_MAX } = await import('../server/handoff.ts')
+
+  const full = buildHandoff({
+    lastDelivery: '修复了续传游标丢失的问题',
+    changedPaths: ['server/a.ts', 'server/b.ts', 'server/c.ts'],
+    taskId: 't1',
+    taskWhy: '生产在飞回合被杀',
+    taskAcceptance: 'session-check 全绿',
+    verifyConfigured: true,
+    verifyPending: true,
+  })
+  check(
+    'H1 五元组白名单：what=交付+改动路径、why/acceptance 仅来自卡、tradeoff 恒空、openQuestions 只认已知未决',
+    full.what.includes('修复了续传游标丢失的问题') &&
+      full.what.includes('改动：server/a.ts、server/b.ts、server/c.ts') &&
+      full.why === '生产在飞回合被杀' &&
+      full.tradeoff === '' &&
+      full.openQuestions.includes('任务卡尚未验收') &&
+      full.openQuestions.includes('验证命令尚未运行') &&
+      full.nextAction === 'session-check 全绿',
+    JSON.stringify(full),
+  )
+  const noCard = buildHandoff({
+    lastDelivery: '交付了一版',
+    changedPaths: ['x.ts'],
+    taskId: null,
+    taskWhy: null,
+    taskAcceptance: null,
+    verifyConfigured: false,
+    verifyPending: false,
+  })
+  check(
+    'H3 无卡无验证：why/openQuestions 整行省略，nextAction 用通用指引',
+    noCard.why === '' && noCard.openQuestions === '' && noCard.nextAction === '接手本轮并给出 REVIEW 结论',
+    JSON.stringify(noCard),
+  )
+  const long = buildHandoff({
+    lastDelivery: 'x'.repeat(500),
+    changedPaths: [],
+    taskId: 't2',
+    taskWhy: 'y'.repeat(500),
+    taskAcceptance: 'z'.repeat(500),
+    verifyConfigured: true,
+    verifyPending: true,
+  })
+  const lens = [long.what, long.why, long.tradeoff, long.openQuestions, long.nextAction].map((f) => f.length)
+  check(
+    'H4 超长截断：单字段 ≤ 200 且总长 ≤ 800',
+    lens.every((n) => n <= HANDOFF_FIELD_MAX) && lens.reduce((s, n) => s + n, 0) <= HANDOFF_TOTAL_MAX,
+    JSON.stringify(lens),
+  )
+  const paths7 = buildHandoff({
+    lastDelivery: '',
+    changedPaths: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+    taskId: null,
+    taskWhy: null,
+    taskAcceptance: null,
+    verifyConfigured: false,
+    verifyPending: false,
+  })
+  check('H4b 改动路径只取前 5 条（去重）', paths7.what.includes('改动：a、b、c、d、e') && !paths7.what.includes('f、g'), paths7.what)
+
+  // Prompt rendering layer.
+  const withHandoff = buildTurnPrompt({
+    room,
+    character: baseCharacter,
+    characters: [baseCharacter],
+    messages: [msg('m1', '正文', 1)],
+    cwd: 'D:/tmp',
+    handoff: full,
+  })
+  const h1 = withHandoff.indexOf('【交接】')
+  check(
+    'H1 【交接】段：位置在记忆之后、群聊规则之前；四行标签在场，Tradeoff 留空省略',
+    h1 > withHandoff.indexOf('【你的人物设定】') &&
+      h1 < withHandoff.indexOf('【群聊规则】') &&
+      withHandoff.includes('- What：') &&
+      withHandoff.includes('- Why：') &&
+      withHandoff.includes('- Open Questions：') &&
+      withHandoff.includes('- Next Action：') &&
+      !withHandoff.includes('- Tradeoff：'),
+    '',
+  )
+  check(
+    'H2 无 handoff 输入不出现【交接】段',
+    !buildTurnPrompt({ room, character: baseCharacter, characters: [baseCharacter], messages: [msg('m1', '正文', 1)], cwd: 'D:/tmp' }).includes('【交接】'),
+  )
+  const changesOnly = buildTurnPrompt({
+    room,
+    character: baseCharacter,
+    characters: [baseCharacter],
+    messages: [msg('m1', '正文', 1)],
+    cwd: 'D:/tmp',
+    handoff: noCard,
+  })
+  check(
+    'H3 渲染层：Why / Open Questions 行省略（只有改动时）',
+    changesOnly.includes('- What：') && changesOnly.includes('- Next Action：') && !changesOnly.includes('- Why：') && !changesOnly.includes('- Open Questions：'),
+    '',
+  )
+  const resumed = buildTurnPrompt({
+    room,
+    character: baseCharacter,
+    characters: [baseCharacter],
+    messages: [msg('m1', '正文', 1)],
+    cwd: 'D:/tmp',
+    since: { at: 999_999, seq: 99 },
+    resumed: true,
+    handoff: full,
+  })
+  check('H5 续传轮也带【交接】（head 段，不随增量裁剪）', resumed.includes('【交接】') && resumed.includes('- Next Action：'))
+}
+
 if (failed) {
   console.log(`\n${failed} case(s) failed`)
   process.exitCode = 1
