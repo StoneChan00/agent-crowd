@@ -33,6 +33,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as db from './db.ts'
 import { broadcast } from './events.ts'
+import { DATA_DIR } from './paths.ts'
 // Circular with orchestrator (it calls maybeRestartNow, we call isBusy /
 // gateActive): safe under ESM late binding - both sides only call functions
 // at runtime, never at module top level.
@@ -179,6 +180,28 @@ const shellWord = (s: string): string => (/[ \t]/.test(s) ? `"${s}"` : s)
  * for. After the launch, the server STAYS UP (still serving traffic) until
  * the script's phase 2 kills it together with the whole watch chain.
  */
+/**
+ * The WMI command line for the restart script (exported for sop-check S12:
+ * the replacement MUST inherit this server's data dir — a test-triggered
+ * restart used to spawn a PROD-data zombie whose boot sweep killed the live
+ * production's in-flight turns, 2026-11-06).
+ */
+export function restartScriptArgs(options: RestartOptions): string[] {
+  const args = [
+    POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass',
+    '-File', SCRIPT,
+    '-Port', String(PORT),
+    '-TakeoverPid', String(process.pid),
+    // The data dir travels the whole chain: here -> the script ->
+    // start-server.ps1 -> AC_DATA_DIR.
+    '-DataDir', DATA_DIR,
+  ]
+  if (options.excludeRoom) args.push('-ExcludeRoom', options.excludeRoom)
+  if (options.notifyRoom) args.push('-NotifyRoom', options.notifyRoom)
+  if (options.drainSeconds) args.push('-DrainSeconds', String(options.drainSeconds))
+  return args
+}
+
 export function maybeRestartNow(): void {
   const options = pending
   if (!options) return
@@ -222,16 +245,8 @@ export function maybeRestartNow(): void {
   // POWERSHELL, never a bare 'powershell.exe': the first CommandLine token
   // is resolved by WmiPrvSE, not by us - same absolute-path rule as the
   // spawn() call that runs the launcher itself.
-  const scriptArgs = [
-    POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', SCRIPT,
-    '-Port', String(PORT),
-    '-TakeoverPid', String(process.pid),
-  ]
-  if (options.excludeRoom) scriptArgs.push('-ExcludeRoom', options.excludeRoom)
-  if (options.notifyRoom) scriptArgs.push('-NotifyRoom', options.notifyRoom)
-  if (options.drainSeconds) scriptArgs.push('-DrainSeconds', String(options.drainSeconds))
-  const commandLine = scriptArgs.map(shellWord).join(' ')
+  const scriptArgs = restartScriptArgs(options).map(shellWord)
+  const commandLine = scriptArgs.join(' ')
 
   // One-shot launcher (a ~1s child of this process - it is dead long before
   // phase 2, and it kills nothing): WMI-creates the real script. -EncodedCommand

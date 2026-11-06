@@ -12,7 +12,7 @@ import { episodeDelivery, memoryQueryFromMessages } from './memory.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
-import { gateDecision, parseReviewVerdict } from './sop.ts'
+import { gateDecision, parseReviewVerdict, type GateAuthor, type GateBlockReason } from './sop.ts'
 import type { Character, HarnessKind, Message, Room, Task, ToolTrace, Turn } from './types.ts'
 import { tail, truncate } from './util.ts'
 
@@ -112,6 +112,10 @@ interface RoundState {
   changedPaths: string[]
   /** Latest REVIEW: verdict seen in this round's character messages (3b). */
   verdict: 'none' | 'pass' | 'changes'
+  /** Author of that verdict (B05) — the self-review ban needs WHO passed. */
+  verdictAuthor?: GateAuthor | null
+  /** Author of the round's last turn that changed the worktree (B05). */
+  changedAuthor?: GateAuthor | null
   /** Verification command outcome for this round (3c); 'running' guards re-entry. */
   verifyState: 'none' | 'running' | 'pass' | 'fail'
   /** The gate notice fires at most once per round — repeat blocks stay silent. */
@@ -657,6 +661,39 @@ function sendGateNotice(roomId: string, content: string): void {
 }
 
 /**
+ * Render a gate block reason as notice text (B05). RENDERING only — the
+ * decision itself lives in sop.ts's gateDecision, the one place. Names are
+ * best-effort: a deleted character shows as its id's placeholder.
+ */
+function gateBlockNotice(
+  reason: GateBlockReason,
+  round: RoundState,
+  reviewer: ReturnType<typeof db.getCharacter>,
+): string {
+  const nameOf = (author: GateAuthor | null | undefined): string => {
+    if (!author) return '（未知）'
+    const character = db.getCharacter(author.id)
+    return character ? character.name : '（已删除角色）'
+  }
+  switch (reason) {
+    case 'self-review':
+      return `REVIEW: PASS 来自实现者本人（${nameOf(round.verdictAuthor)}），自审无效，本轮不做轮末总结。`
+    case 'wrong-reviewer':
+      return `REVIEW: PASS 非指定 reviewer（应为 ${reviewer ? reviewer.name : '（已删除角色）'}，实际 ${nameOf(round.verdictAuthor)}），本轮不做轮末总结。`
+    case 'same-harness':
+      return `reviewer 与实现者同一 harness（${round.changedAuthor?.harness ?? '未知'}），同一模型家族不构成独立判断，本轮不做轮末总结。`
+    case 'no-author':
+      return `REVIEW: PASS 缺少作者信息（内部状态异常，宁可拦截），本轮不做轮末总结。`
+    case 'changes':
+      return '最后一条 review 结论为 REVIEW: CHANGES，本轮不做轮末总结。'
+    case 'verify-fail':
+      return '验证命令未通过，本轮不做轮末总结。'
+    default:
+      return '本轮有代码改动，但没有 review 结论（需要 review 角色单独一行给出 REVIEW: PASS）。'
+  }
+}
+
+/**
  * Task-card settlement (B03): write the card's state back when the round it
  * opened closes. Round identity first (the P0-3 discipline): only the round
  * CURRENTLY registered under this room may settle — a replaced entry (new
@@ -766,24 +803,28 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
 
   // ---- SOP gate (P0-3 3c): only rounds that changed the worktree pass through.
   if (round.changedPaths.length > 0) {
+    // B05: the room's designated reviewer, when one is configured. A stale id
+    // (deleted character) reads as no designation — the hard rule still holds.
+    const reviewerCharacter = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
     const decision = gateDecision({
       changed: round.changedPaths.length,
       verifyRequired: room.verifyCommand.trim().length > 0,
       verify: round.verifyState === 'pass' || round.verifyState === 'fail' ? round.verifyState : 'none',
       verdict: round.verdict,
+      verdictAuthor: round.verdictAuthor,
+      changedAuthor: round.changedAuthor,
+      reviewer: reviewerCharacter ? { id: reviewerCharacter.id, harness: reviewerCharacter.harness } : null,
     })
-    if (decision === 'block') {
+    if (decision.action === 'block') {
       if (!round.gateNoticeSent) {
         round.gateNoticeSent = true
-        const reason =
-          round.verifyState === 'fail'
-            ? `验证命令未通过，本轮不做轮末总结。`
-            : round.verdict === 'changes'
-              ? '最后一条 review 结论为 REVIEW: CHANGES，本轮不做轮末总结。'
-              : '本轮有代码改动，但没有 review 结论（需要 review 角色单独一行给出 REVIEW: PASS）。'
+        // A block always carries a reason (close/run-verify carry null).
+        const reasonText = decision.reason
+          ? gateBlockNotice(decision.reason, round, reviewerCharacter)
+          : '本轮被门禁拦截。'
         sendGateNotice(
           roomId,
-          `🚧 SOP 门禁：${reason}改动文件：${round.changedPaths.slice(0, 5).join('、')}${round.changedPaths.length > 5 ? ` 等 ${round.changedPaths.length} 个` : ''}。请继续处理，处理完成后重新给出 review 结论即可收尾。`,
+          `🚧 SOP 门禁：${reasonText}改动文件：${round.changedPaths.slice(0, 5).join('、')}${round.changedPaths.length > 5 ? ` 等 ${round.changedPaths.length} 个` : ''}。请继续处理，处理完成后重新给出 review 结论即可收尾。`,
         )
       }
       // No summary, no re-queue: the next human/character message starts the
@@ -794,7 +835,7 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
       rounds.delete(roomId)
       return false
     }
-    if (decision === 'run-verify') {
+    if (decision.action === 'run-verify') {
       round.verifyState = 'running'
       const result = await runVerifyCommand(room)
       // The round the verify belonged to may have been replaced while the
@@ -1293,13 +1334,29 @@ async function pump(roomId: string): Promise<void> {
           detail: verdict === 'pass' ? 'REVIEW: PASS' : 'REVIEW: CHANGES',
         })
       }
-      if (round && round.roundId === item.roundId) round.verdict = verdict
+      // Summary turns are not reviews (B05): they run AFTER the gate passed;
+      // letting them overwrite the verdict (or pose as its author) could
+      // flip a settled round's judgment.
+      if (round && round.roundId === item.roundId && !item.isRoundSummary) {
+        round.verdict = verdict
+        round.verdictAuthor = { id: character.id, harness: character.harness }
+      }
     }
     // Fold this turn's changes into the round's evidence (3a): the gate at
     // close time judges the round's CUMULATIVE footprint, not per-turn.
-    if (round && round.roundId === item.roundId && changedPaths) {
+    // changedPathsBetween returns an EMPTY ARRAY for a no-change turn — a
+    // truthiness check here would overwrite changedAuthor on every reply
+    // (the B05 probe: the reviewer became the "implementer" and its PASS read
+    // as self-review). Length, not truthiness.
+    if (round && round.roundId === item.roundId && changedPaths && changedPaths.length > 0) {
       for (const path of changedPaths) {
         if (!round.changedPaths.includes(path)) round.changedPaths.push(path)
+      }
+      // B05: the "implementer" the PASS must not come from — the author of
+      // the round's LAST turn that changed the worktree. Summary turns are
+      // excluded (they are the round's closing act, not its work).
+      if (!item.isRoundSummary) {
+        round.changedAuthor = { id: character.id, harness: character.harness }
       }
     }
     // Session continuity (P0-1): a clean turn that surfaced a CLI session id

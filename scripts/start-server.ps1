@@ -21,7 +21,12 @@ param(
   [int]$Port = 8787,
   # Where node.exe lives on THIS machine; prepended to PATH so detached /
   # scheduled processes can still resolve node & pnpm. Override freely.
-  [string]$NodeDir = 'D:\1_Sotfware\Nodejs'
+  [string]$NodeDir = 'D:\1_Sotfware\Nodejs',
+  # Data dir of the server this one REPLACES (restart flow). Without it the
+  # replacement boots on the repo default — for a test-triggered restart
+  # that spawns a PROD-data zombie whose boot sweep kills the live
+  # production's in-flight turns (2026-11-06 incident). Empty = repo default.
+  [string]$DataDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +37,7 @@ foreach ($dir in @($NodeDir, "$env:APPDATA\npm")) {
   if ($dir -and (Test-Path $dir)) { $env:Path = "$dir;$env:Path" }
 }
 $env:AC_PORT = "$Port"
+if ($DataDir) { $env:AC_DATA_DIR = "$DataDir" }
 if (-not $env:AC_TURN_TIMEOUT_MS) { $env:AC_TURN_TIMEOUT_MS = '60m' }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

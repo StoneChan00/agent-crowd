@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
-import type { Memory, Room } from '../types'
+import type { Character, Memory, Room } from '../types'
 import { api } from '../lib/api'
 import { Modal } from './Modal'
 
 interface RoomSettingsProps {
   room: Room | null
+  characters: Character[]
   canDelete: boolean
   onClose: () => void
   onSave: (draft: {
@@ -13,6 +14,7 @@ interface RoomSettingsProps {
     workingDir: string
     maxHops: number
     verifyCommand: string
+    reviewerCharacterId: string | null
   }) => Promise<void>
   onDelete?: () => Promise<void>
 }
@@ -23,12 +25,14 @@ const MEMORY_KINDS: { value: string; label: string }[] = [
   { value: 'preference', label: '约定' },
 ]
 
-export function RoomSettings({ room, canDelete, onClose, onSave, onDelete }: RoomSettingsProps) {
+export function RoomSettings({ room, characters, canDelete, onClose, onSave, onDelete }: RoomSettingsProps) {
   const [name, setName] = useState(room?.name ?? '')
   const [topic, setTopic] = useState(room?.topic ?? '')
   const [workingDir, setWorkingDir] = useState(room?.workingDir ?? '')
   const [maxHops, setMaxHops] = useState(room?.maxHops ?? 6)
   const [verifyCommand, setVerifyCommand] = useState(room?.verifyCommand ?? '')
+  /** B05 self-review ban: the room's designated reviewer (empty = unrestricted). */
+  const [reviewerCharacterId, setReviewerCharacterId] = useState(room?.reviewerCharacterId ?? '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   /** Team memory (room scope): shared context every member sees in their prompt. */
@@ -109,7 +113,14 @@ export function RoomSettings({ room, canDelete, onClose, onSave, onDelete }: Roo
     setSaving(true)
     setError('')
     try {
-      await onSave({ name: name.trim(), topic, workingDir: workingDir.trim(), maxHops, verifyCommand: verifyCommand.trim() })
+      await onSave({
+        name: name.trim(),
+        topic,
+        workingDir: workingDir.trim(),
+        maxHops,
+        verifyCommand: verifyCommand.trim(),
+        reviewerCharacterId: reviewerCharacterId || null,
+      })
       onClose()
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '保存失败')
@@ -198,6 +209,22 @@ export function RoomSettings({ room, canDelete, onClose, onSave, onDelete }: Roo
           本轮有代码改动时，服务器会在轮末收尾前自动运行这条命令，并要求最后一条 review 结论是 REVIEW: PASS，否则本轮不收尾。
         </span>
       </div>
+      {room && characters.length > 0 && (
+        <div className="field">
+          <label>指定 reviewer（禁止自审）</label>
+          <select className="input" value={reviewerCharacterId} onChange={(event) => setReviewerCharacterId(event.target.value)}>
+            <option value="">不指定（任何非实现者角色的 PASS 都可收尾）</option>
+            {characters.map((character) => (
+              <option key={character.id} value={character.id}>
+                {character.name}（{character.harness}）
+              </option>
+            ))}
+          </select>
+          <span className="field-hint">
+            指定后：REVIEW: PASS 必须来自该角色，且它与实现者不能是同一 harness（同一模型家族不算独立判断）。无论如何，实现者本人的自审 PASS 一律无效。
+          </span>
+        </div>
+      )}
 
       {room && (
         <div className="field">

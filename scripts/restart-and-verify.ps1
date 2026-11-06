@@ -61,7 +61,12 @@ param(
   [int]$DrainSeconds = 3000,
   [string]$ExcludeRoom = '',
   [string]$NotifyRoom = '',
-  [int]$TakeoverPid = 0
+  [int]$TakeoverPid = 0,
+  # Data dir of the RESTARTING server. The replacement must boot on the SAME
+  # database (2026-11-06 incident: test-triggered restarts replaced their
+  # temp servers with PROD-data zombies, whose boot sweeps then killed the
+  # live production's in-flight turns three times). Empty = repo default.
+  [string]$DataDir = ''
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -199,12 +204,16 @@ function Get-DescendantSet([int]$RootPid) {
 
 function Start-Starter {
   $starter = Join-Path $PSScriptRoot 'start-server.ps1'
+  $starterArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $starter, '-Port', "$Port")
+  # Propagate the restarting server's data dir: the replacement inherits the
+  # SAME database instead of falling back to the repo default (prod).
+  if ($DataDir) { $starterArgs += @('-DataDir', $DataDir) }
   Start-Process -FilePath 'powershell.exe' `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $starter, '-Port', "$Port") `
+    -ArgumentList $starterArgs `
     -WindowStyle Hidden
 }
 
-Log ("BEGIN pid=$PID port=$Port verifyOnly={0} excludeRoom='{1}' notifyRoom='{2}' takeoverPid={3}" -f [bool]$VerifyOnly, $ExcludeRoom, $NotifyRoom, $TakeoverPid)
+Log ("BEGIN pid=$PID port=$Port verifyOnly={0} excludeRoom='{1}' notifyRoom='{2}' takeoverPid={3} dataDir='{4}'" -f [bool]$VerifyOnly, $ExcludeRoom, $NotifyRoom, $TakeoverPid, $DataDir)
 if (-not $VerifyOnly -and $NotifyRoom) {
   Send-RoomSystem ("🔁 重启流程已启动（{0}），预计 1-3 分钟：等待空闲 → 切链 → 起新服务 → 六阶段验证。期间请勿在本群发消息，完成后会在此播报结果。" -f (Get-Date -Format 'HH:mm:ss'))
 }

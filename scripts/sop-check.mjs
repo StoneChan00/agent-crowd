@@ -33,6 +33,16 @@
  *                         verify PASS writes 「未配置验证」), and the
  *                         orchestrator's retrieval wiring pulls an out-of-
  *                         recency memory in only on a query hit (9)
+ *   S11 B05 self-review  — the implementer's own PASS blocks (notice names
+ *                         「实现者本人」, no summary, no episode); no
+ *                         designation keeps prior behavior; a designated
+ *                         reviewer on another harness closes, a same-harness
+ *                         reviewer or a PASS from someone else blocks (11)
+ *   S12 restart data dir — the WMI script args carry the restarting
+ *                         server's data dir: a test-triggered restart
+ *                         replacement must inherit the TEST database, not
+ *                         boot a PROD-data zombie whose sweep kills the
+ *                         live turns (2026-11-06 incident) (2)
  *
  * Scenarios S4-S8 share one server (each room drained before the next
  * starts, so per-turn change attribution stays clean); S9 boots its own
@@ -351,18 +361,69 @@ function scenarioParser() {
 /* -------------------------------------------------------- S2 decision table */
 
 function scenarioGateTable() {
+  // Author fixtures for the B05 dimension: implementer (mock), reviewer
+  // (custom harness), a same-harness reviewer, and a wrong reviewer.
+  const implementer = { id: 'dev', harness: 'mock' }
+  const otherMock = { id: 'other', harness: 'mock' }
+  const customReviewer = { id: 'rev', harness: 'custom' }
   const rows = [
     [{ changed: 0, verifyRequired: true, verify: 'none', verdict: 'none' }, 'close', '无改动 → 直接收尾（不跑验证）'],
     [{ changed: 2, verifyRequired: false, verify: 'none', verdict: 'changes' }, 'block', '有改动无验证命令 + CHANGES → 阻断'],
-    [{ changed: 2, verifyRequired: false, verify: 'none', verdict: 'pass' }, 'close', '有改动无验证命令 + PASS → 收尾'],
-    [{ changed: 1, verifyRequired: true, verify: 'none', verdict: 'none' }, 'block', '有验证命令但无结论 → 先卡结论不白跑验证'],
-    [{ changed: 1, verifyRequired: true, verify: 'none', verdict: 'pass' }, 'run-verify', '有改动 + PASS + 未验证 → 跑验证'],
-    [{ changed: 1, verifyRequired: true, verify: 'fail', verdict: 'pass' }, 'block', '验证失败 → 阻断'],
-    [{ changed: 1, verifyRequired: true, verify: 'pass', verdict: 'pass' }, 'close', '验证通过 + PASS → 收尾'],
+    [
+      { changed: 2, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer },
+      'close',
+      '有改动无验证命令 + 他角色 PASS → 收尾',
+    ],
+    [
+      { changed: 1, verifyRequired: true, verify: 'none', verdict: 'none' },
+      'block',
+      '有验证命令但无结论 → 先卡结论不白跑验证',
+    ],
+    [
+      { changed: 1, verifyRequired: true, verify: 'none', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer },
+      'run-verify',
+      '有改动 + 他角色 PASS + 未验证 → 跑验证',
+    ],
+    [
+      { changed: 1, verifyRequired: true, verify: 'fail', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer },
+      'block',
+      '验证失败 → 阻断',
+    ],
+    [
+      { changed: 1, verifyRequired: true, verify: 'pass', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer },
+      'close',
+      '验证通过 + 他角色 PASS → 收尾',
+    ],
+    // B05 author dimension.
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', changedAuthor: implementer },
+      'block',
+      'PASS 缺作者 → fail closed 阻断',
+    ],
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: implementer, changedAuthor: implementer },
+      'block',
+      '实现者自审 PASS → 阻断（self-review）',
+    ],
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer, reviewer: customReviewer },
+      'block',
+      'PASS 非指定 reviewer → 阻断',
+    ],
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: otherMock, changedAuthor: implementer, reviewer: otherMock },
+      'block',
+      '指定 reviewer 与实现者同一 harness → 阻断',
+    ],
+    [
+      { changed: 1, verifyRequired: false, verify: 'none', verdict: 'pass', verdictAuthor: customReviewer, changedAuthor: implementer, reviewer: customReviewer },
+      'close',
+      '指定异构 reviewer 的 PASS → 收尾',
+    ],
   ]
   for (const [input, expected, label] of rows) {
     const actual = gateDecision(input)
-    check(`S2 ${label}`, actual === expected, `实际 ${actual}`)
+    check(`S2 ${label}`, actual.action === expected, `实际 ${actual.action}(${actual.reason})`)
   }
 }
 
@@ -642,15 +703,15 @@ async function scenarioEndToEnd() {
   /* S10 (B04): automatic round-end episodes — clean+changed+PASS closes
    * write exactly one room-scope episode; everything else writes nothing;
    * identical facts on a repeat round are a hash no-op. */
+  const memoriesWhere = (roomId, where = '1=1', ...args) =>
+    withDb(
+      dir,
+      (handle) =>
+        handle
+          .prepare(`select * from memories where scope = 'room' and owner_id = ? and kind = 'episode' and ${where}`)
+          .all(roomId, ...args),
+    )
   {
-    const memoriesWhere = (roomId, where = '1=1', ...args) =>
-      withDb(
-        dir,
-        (handle) =>
-          handle
-            .prepare(`select * from memories where scope = 'room' and owner_id = ? and kind = 'episode' and ${where}`)
-            .all(roomId, ...args),
-      )
 
     // S10a: the S4 green round wrote exactly one episode with all facts.
     const episodes4 = memoriesWhere(roomS4.id)
@@ -831,6 +892,112 @@ async function scenarioEndToEnd() {
         JSON.stringify(episodes.map((row) => row.content)),
       )
     }
+  }
+
+  /* S11 (B05): the self-review ban — WHO gave the PASS finally matters.
+   * S11a implementer self-approves → block; S11b no designation + another
+   * character's PASS → unchanged; S11c designated reviewer on a different
+   * harness (custom, echoes the verdict) → closes; S11d designated reviewer
+   * shares the implementer's harness → block; S11e PASS from someone other
+   * than the designated reviewer → block. */
+  {
+    const roomA = await makeRoom(port, 's11a-自审', repo, 'exit 0')
+    await makeCharacter(port, roomA.id, '开发甲', ON_USER_ONLY, 'MOCK-自审')
+    await makeCharacter(port, roomA.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+    const messagesA = await runRoundAndDrain(port, roomA.id)
+    check('S11a 实现者自审 → 无轮末总结', characterMessages(messagesA, '总结丙').length === 0, '总结丙发言了')
+    check(
+      'S11a 门禁通知点名「实现者本人」',
+      systemNotices(messagesA, '实现者本人').length === 1,
+      `实际 ${systemNotices(messagesA, '实现者本人').length}`,
+    )
+    check('S11a 自审轮不写 episode', memoriesWhere(roomA.id).length === 0)
+
+    const roomB = await makeSopRoom(port, repo, 's11b-兼容', {
+      verifyCommand: 'exit 0',
+      reviewerPersona: 'MOCK-评审通过',
+    })
+    const messagesB = await runRoundAndDrain(port, roomB.id)
+    check('S11b 未指定 reviewer：他角色 PASS 仍正常收尾', characterMessages(messagesB, '总结丙').length === 1, '总结丙未发言')
+
+    const roomC = await makeRoom(port, 's11c-指定异构', repo, 'exit 0')
+    await makeCharacter(port, roomC.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
+    const reviewerC = await req(port, `/api/rooms/${roomC.id}/characters`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: '指定评审',
+        harness: 'custom',
+        model: '',
+        persona: 'SOP 测试角色',
+        commandTemplate: 'echo REVIEW: PASS',
+        triggers: FOLLOWS_DEV,
+      }),
+    })
+    await makeCharacter(port, roomC.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+    await req(port, `/api/rooms/${roomC.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ reviewerCharacterId: reviewerC.id }),
+    })
+    const messagesC = await runRoundAndDrain(port, roomC.id)
+    check('S11c 指定异构 reviewer 的 PASS → 正常收尾', characterMessages(messagesC, '总结丙').length === 1, '总结丙未发言')
+
+    const roomD = await makeRoom(port, 's11d-同harness', repo, 'exit 0')
+    await makeCharacter(port, roomD.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
+    const reviewerD = await makeCharacter(port, roomD.id, '评审乙', FOLLOWS_DEV, 'MOCK-评审通过')
+    await makeCharacter(port, roomD.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+    await req(port, `/api/rooms/${roomD.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ reviewerCharacterId: reviewerD.id }),
+    })
+    const messagesD = await runRoundAndDrain(port, roomD.id)
+    check('S11d reviewer 与实现者同一 harness → 阻断', characterMessages(messagesD, '总结丙').length === 0, '总结丙发言了')
+    check(
+      'S11d 门禁通知点名「同一 harness」',
+      systemNotices(messagesD, '同一 harness').length === 1,
+      `实际 ${systemNotices(messagesD, '同一 harness').length}`,
+    )
+
+    const roomE = await makeRoom(port, 's11e-非指定', repo, 'exit 0')
+    await makeCharacter(port, roomE.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
+    await makeCharacter(port, roomE.id, '评审乙', FOLLOWS_DEV, 'MOCK-评审通过')
+    const summarizerE = await makeCharacter(port, roomE.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+    await req(port, `/api/rooms/${roomE.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ reviewerCharacterId: summarizerE.id }),
+    })
+    const messagesE = await runRoundAndDrain(port, roomE.id)
+    check('S11e PASS 非指定 reviewer → 阻断', characterMessages(messagesE, '总结丙').length === 0, '总结丙发言了')
+    check(
+      'S11e 门禁通知点名「非指定 reviewer」',
+      systemNotices(messagesE, '非指定 reviewer').length === 1,
+      `实际 ${systemNotices(messagesE, '非指定 reviewer').length}`,
+    )
+  }
+
+  /* S12 (B05 incident, 2026-11-06): a fired restart must pass the
+   * RESTARTING server's data dir down the whole chain. A test server's
+   * replacement used to boot on the PRODUCTION database (start-server.ps1
+   * never set AC_DATA_DIR), and the replacement's boot sweep then killed
+   * the live production's in-flight turns — three review-loop deaths
+   * before this was found. Dynamic import AFTER pointing AC_DATA_DIR at
+   * this scenario's temp dir, so the db module the import pulls in opens
+   * the TEST database, not the production one. */
+  {
+    process.env.AC_DATA_DIR = dir
+    const { restartScriptArgs } = await import('../server/restart.ts')
+    const { DATA_DIR } = await import('../server/paths.ts')
+    const args = restartScriptArgs({})
+    const at = args.indexOf('-DataDir')
+    check(
+      'S12 重启脚本参数携带本服务器数据目录（替补继承同库）',
+      at >= 0 && args[at + 1] === DATA_DIR,
+      JSON.stringify(at >= 0 ? args.slice(at, at + 2) : []),
+    )
+    check(
+      'S12 重启脚本参数仍携带端口与接管 pid',
+      args.includes('-Port') && args.includes('-TakeoverPid'),
+      '',
+    )
   }
 }
 

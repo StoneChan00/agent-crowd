@@ -401,11 +401,14 @@ export default function App() {
     workingDir: string
     maxHops: number
     verifyCommand: string
+    reviewerCharacterId: string | null
   }) => {
     if (roomForm === 'create') {
       const created = await api.createRoom({
-        ...draft,
+        name: draft.name,
+        topic: draft.topic,
         workingDir: draft.workingDir || room?.workingDir || '',
+        maxHops: draft.maxHops,
         verifyCommand: draft.verifyCommand || room?.verifyCommand || '',
       })
       await refresh()
@@ -590,6 +593,7 @@ export default function App() {
       {roomForm && (
         <RoomSettings
           room={roomForm === 'edit' ? room : null}
+          characters={characters}
           canDelete={Boolean(room)}
           onClose={() => setRoomForm(null)}
           onSave={saveRoom}

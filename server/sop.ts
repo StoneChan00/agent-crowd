@@ -18,6 +18,7 @@ import { fromMarkdown } from 'mdast-util-from-markdown'
 import { gfm } from 'micromark-extension-gfm'
 import { gfmFromMarkdown } from 'mdast-util-gfm'
 import { NOT_A_CALL } from './mentions.ts'
+import type { HarnessKind } from './types.ts'
 
 /** Whole-line verdict: optional `**`/whitespace framing, REVIEW, colon, keyword, nothing else. */
 const REVIEW_LINE = /^\s*\**\s*review\s*[:：]\s*\**\s*(pass|changes)\s*\**\s*$/i
@@ -226,6 +227,16 @@ export function parseReviewVerdict(content: string): ReviewVerdict | null {
 
 export type GateDecision = 'close' | 'run-verify' | 'block'
 
+/**
+ * Who a gate judgment is about (B05): a character's stable identity plus its
+ * harness — the self-review ban needs both (id for "same character", harness
+ * for "same model family ≠ independent judge").
+ */
+export interface GateAuthor {
+  id: string
+  harness: HarnessKind
+}
+
 export interface GateInput {
   /** How many paths changed this round. 0 = a chat-only round. */
   changed: number
@@ -235,33 +246,79 @@ export interface GateInput {
   verify: 'none' | 'pass' | 'fail'
   /** Latest review verdict ('none' = nobody concluded). */
   verdict: 'none' | 'pass' | 'changes'
+  /** Author of that verdict (B05); null/absent while verdict isn't 'pass'. */
+  verdictAuthor?: GateAuthor | null
+  /** Author of the round's last turn that changed the worktree (B05). */
+  changedAuthor?: GateAuthor | null
+  /** The room's designated reviewer (B05); null = no designation. */
+  reviewer?: GateAuthor | null
+}
+
+/** Why a gate blocked, for the notice text. null = not blocked. */
+export type GateBlockReason =
+  | 'self-review'
+  | 'wrong-reviewer'
+  | 'same-harness'
+  | 'no-author'
+  | 'changes'
+  | 'verify-fail'
+  | 'no-verdict'
+
+export interface GateOutcome {
+  action: GateDecision
+  reason: GateBlockReason | null
 }
 
 /**
- * The gate's decision table — every row is asserted in sop-check S2:
+ * The gate's decision table — the ONE place a round's fate is decided. Every
+ * row is asserted in sop-check S2 (incl. the B05 author dimension):
  *
- * | changed | verifyCommand | verify | verdict | action                     |
- * |---------|---------------|--------|---------|----------------------------|
- * | 0       | any           | any    | any     | close (verify never runs) |
- * | >0      | empty         | —      | other   | block                     |
- * | >0      | empty         | —      | pass    | close                     |
- * | >0      | set           | none   | other   | block (verdict first: no  |
- * |         |               |        |         | wasted verify runs)       |
- * | >0      | set           | none   | pass    | run-verify                |
- * | >0      | set           | fail   | pass    | block                     |
- * | >0      | set           | pass   | pass    | close                     |
+ * | changed | verifyCommand | verify | verdict | authorship            | action          |
+ * |---------|---------------|--------|---------|-----------------------|-----------------|
+ * | 0       | any           | any    | any     | — (never checked)     | close           |
+ * | >0      | any           | any    | other   | —                     | block           |
+ * | >0      | any           | any    | pass    | author unknown        | block (fail     |
+ * |         |               |        |         |                       | closed)         |
+ * | >0      | any           | any    | pass    | PASS from implementer | block           |
+ * | >0      | any           | any    | pass    | PASS ≠ designated     | block           |
+ * | >0      | any           | any    | pass    | reviewer same harness | block           |
+ * | >0      | empty         | —      | pass    | independent PASS      | close           |
+ * | >0      | set           | none   | pass    | independent PASS      | run-verify      |
+ * | >0      | set           | fail   | pass    | independent PASS      | block           |
+ * | >0      | set           | pass   | pass    | independent PASS      | close           |
  *
- * A changed round closes only with verdict pass AND (no verify command OR a
- * passing verify run). Chat-only rounds close as before — the gate is a
- * worktree gate, not a speech gate.
+ * B05 authorship (checked once verdict === 'pass', BEFORE verify): without a
+ * designated reviewer the PASS author must simply differ from the round's
+ * last implementer. A designated reviewer adds two rules: the PASS must come
+ * from that character, and its harness must differ from the implementer's
+ * (same harness ≠ independent judgment). Chat-only rounds (changed = 0)
+ * never check authorship.
  */
-export function gateDecision(input: GateInput): GateDecision {
-  if (input.changed === 0) return 'close'
+export function gateDecision(input: GateInput): GateOutcome {
+  if (input.changed === 0) return { action: 'close', reason: null }
   // A changed round without a pass verdict never closes, and never burns a
   // verify run first: the verdict is the cheaper precondition.
-  if (input.verdict !== 'pass') return 'block'
-  if (!input.verifyRequired) return 'close'
-  if (input.verify === 'pass') return 'close'
-  if (input.verify === 'none') return 'run-verify'
-  return 'block'
+  if (input.verdict !== 'pass') {
+    return { action: 'block', reason: input.verdict === 'changes' ? 'changes' : 'no-verdict' }
+  }
+  // B05: a PASS without a recorded author (or an implementer without one) is
+  // an internal inconsistency — fail closed rather than wave it through.
+  if (input.verdictAuthor == null || input.changedAuthor == null) {
+    return { action: 'block', reason: 'no-author' }
+  }
+  if (input.verdictAuthor.id === input.changedAuthor.id) {
+    return { action: 'block', reason: 'self-review' }
+  }
+  if (input.reviewer) {
+    if (input.verdictAuthor.id !== input.reviewer.id) {
+      return { action: 'block', reason: 'wrong-reviewer' }
+    }
+    if (input.reviewer.harness === input.changedAuthor.harness) {
+      return { action: 'block', reason: 'same-harness' }
+    }
+  }
+  if (!input.verifyRequired) return { action: 'close', reason: null }
+  if (input.verify === 'pass') return { action: 'close', reason: null }
+  if (input.verify === 'none') return { action: 'run-verify', reason: null }
+  return { action: 'block', reason: 'verify-fail' }
 }

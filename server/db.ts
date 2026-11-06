@@ -37,6 +37,7 @@ db.exec(`
     working_dir text not null,
     max_hops integer not null default 6,
     verify_command text not null default '',
+    reviewer_character_id text,
     created_at integer not null
   );
 
@@ -225,6 +226,9 @@ addColumnIfMissing('sessions', 'consumed_seq', 'consumed_seq integer not null de
 // the card id so the round settlement can write the card's state back.
 addColumnIfMissing('turns', 'task_id', 'task_id text')
 
+// Self-review ban (B05): the room's designated reviewer column.
+addColumnIfMissing('rooms', 'reviewer_character_id', 'reviewer_character_id text')
+
 // Task cards (B03 review 1): approval writes `running` synchronously — the
 // fleeting `approved` state is no longer produced and had no exit (a swept
 // queued turn locked the card out of every action). Any row still sitting in
@@ -318,6 +322,10 @@ function mapRoom(row: Record<string, unknown>): Room {
     workingDir: String(row.working_dir),
     maxHops: Number(row.max_hops ?? 6),
     verifyCommand: String(row.verify_command ?? ''),
+    reviewerCharacterId:
+      row.reviewer_character_id === null || row.reviewer_character_id === undefined
+        ? null
+        : String(row.reviewer_character_id),
     createdAt: Number(row.created_at),
   }
 }
@@ -337,6 +345,7 @@ export function createRoom(input: {
   workingDir: string
   maxHops?: number
   verifyCommand?: string
+  reviewerCharacterId?: string | null
 }): Room {
   const room: Room = {
     id: randomUUID(),
@@ -345,17 +354,27 @@ export function createRoom(input: {
     workingDir: input.workingDir,
     maxHops: clampHops(input.maxHops),
     verifyCommand: clampVerifyCommand(input.verifyCommand),
+    reviewerCharacterId: input.reviewerCharacterId ?? null,
     createdAt: now(),
   }
   db.prepare(
-    'insert into rooms (id, name, topic, working_dir, max_hops, verify_command, created_at) values (?, ?, ?, ?, ?, ?, ?)',
-  ).run(room.id, room.name, room.topic, room.workingDir, room.maxHops, room.verifyCommand, room.createdAt)
+    'insert into rooms (id, name, topic, working_dir, max_hops, verify_command, reviewer_character_id, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    room.id,
+    room.name,
+    room.topic,
+    room.workingDir,
+    room.maxHops,
+    room.verifyCommand,
+    room.reviewerCharacterId,
+    room.createdAt,
+  )
   return room
 }
 
 export function updateRoom(
   id: string,
-  patch: Partial<Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops' | 'verifyCommand'>>,
+  patch: Partial<Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops' | 'verifyCommand' | 'reviewerCharacterId'>>,
 ): Room | undefined {
   const current = getRoom(id)
   if (!current) return undefined
@@ -364,15 +383,14 @@ export function updateRoom(
     ...pickDefined(patch),
     maxHops: patch.maxHops === undefined ? current.maxHops : clampHops(patch.maxHops),
     verifyCommand: patch.verifyCommand === undefined ? current.verifyCommand : clampVerifyCommand(patch.verifyCommand),
+    // Null is a legitimate value (clearing the designation) — pickDefined
+    // handles it; only undefined means "leave as is".
+    reviewerCharacterId:
+      patch.reviewerCharacterId === undefined ? current.reviewerCharacterId : patch.reviewerCharacterId || null,
   }
-  db.prepare('update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ? where id = ?').run(
-    next.name,
-    next.topic,
-    next.workingDir,
-    next.maxHops,
-    next.verifyCommand,
-    id,
-  )
+  db.prepare(
+    'update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ?, reviewer_character_id = ? where id = ?',
+  ).run(next.name, next.topic, next.workingDir, next.maxHops, next.verifyCommand, next.reviewerCharacterId, id)
   return next
 }
 
@@ -707,6 +725,9 @@ export function deleteCharacter(id: string): void {
   // Task cards (B03) outlive their assignee — the card keeps its content,
   // only the pointer clears; a re-assigned card can be approved again.
   db.prepare('update tasks set assignee_id = null where assignee_id = ?').run(id)
+  // Self-review ban (B05): a stale reviewer id would block the room forever
+  // (the PASS author can never match a deleted character) — clear it.
+  db.prepare('update rooms set reviewer_character_id = null where reviewer_character_id = ?').run(id)
 }
 
 /* --------------------------------------------------------------- messages */

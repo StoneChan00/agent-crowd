@@ -68,6 +68,14 @@ export interface Room {
    * review verdict.
    */
   verifyCommand: string
+  /**
+   * B05 (self-review ban): the room's designated reviewer. Null = no
+   * designation — only the hard rule applies (the PASS author must differ
+   * from the implementer). A designated reviewer adds two rules: the PASS
+   * must come from that character, and its harness must differ from the
+   * implementer's (same harness ≠ independent judgment).
+   */
+  reviewerCharacterId: string | null
 }
 
 /**

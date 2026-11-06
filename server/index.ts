@@ -311,9 +311,19 @@ app.post('/api/rooms', (req, res) => {
 })
 
 app.patch('/api/rooms/:id', (req, res) => {
-  const { name, topic, workingDir, maxHops, verifyCommand } = req.body ?? {}
+  const { name, topic, workingDir, maxHops, verifyCommand, reviewerCharacterId } = req.body ?? {}
   if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
     return fail(res, 400, '房间名不能为空')
+  }
+  // B05: the designated reviewer must be a member of THIS room (null clears).
+  if (reviewerCharacterId !== undefined && reviewerCharacterId !== null) {
+    if (typeof reviewerCharacterId !== 'string' || !reviewerCharacterId) {
+      return fail(res, 400, 'reviewer 必须是本房间的角色，或传 null 取消指定')
+    }
+    const reviewer = db.getCharacter(reviewerCharacterId)
+    if (!reviewer || reviewer.roomId !== req.params.id) {
+      return fail(res, 400, '指定 reviewer 必须是本房间的角色')
+    }
   }
   const room = db.updateRoom(req.params.id, {
     ...(typeof name === 'string' ? { name: name.trim() } : {}),
@@ -321,6 +331,7 @@ app.patch('/api/rooms/:id', (req, res) => {
     ...(typeof workingDir === 'string' ? { workingDir: normalizeWorkingDir(workingDir) } : {}),
     ...(maxHops !== undefined ? { maxHops: normalizeMaxHops(maxHops) } : {}),
     ...(verifyCommand !== undefined ? { verifyCommand: normalizeVerifyCommand(verifyCommand) } : {}),
+    ...(reviewerCharacterId !== undefined ? { reviewerCharacterId: reviewerCharacterId || null } : {}),
   })
   if (!room) return fail(res, 404, '房间不存在')
   // Other tabs of the same room only hear about settings changes via SSE.
