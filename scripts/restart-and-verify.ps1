@@ -34,13 +34,13 @@
 # safe. Phase 2 still carves our own subtree out of the kill set anyway:
 # pure defense against anyone ever launching this script from inside the
 # tree it is about to kill. Cross-run mutual exclusion: a full restart
-# (not -VerifyOnly) holds data\restart-verify.lock (pid + start time;
+# (not -VerifyOnly) holds <dataRoot>\restart-verify.lock (pid + start time;
 # stale if the pid is gone or older than 90min) for its whole life, so a
 # second launch - POST /api/restart retry, scheduled task, manual - ABORTs
 # immediately instead of racing the first (acquisition is atomic: CREATE_NEW
 # for a fresh lock, RENAME-claim for a stale one - see the lock block). Every
 # phase appends to
-# data\restart-verify.log so a silent death is never possible again. Phases:
+# <dataRoot>\restart-verify.log so a silent death is never possible again. Phases:
 #   0  log begin, sleep 40s (let the scheduling turn land and close)
 #   1  drain: wait until every room is idle (no in-flight turn to interrupt)
 #   2  kill the port-owner chain BY PORT: the listener plus its node.exe
@@ -57,6 +57,7 @@
 # See docs/devlog/0001-restart-lockout.md for why each phase exists.
 param(
   [switch]$VerifyOnly,
+  [switch]$ShowPaths,
   [int]$Port = 8787,
   [int]$DrainSeconds = 3000,
   [string]$ExcludeRoom = '',
@@ -66,12 +67,36 @@ param(
   # database (2026-11-06 incident: test-triggered restarts replaced their
   # temp servers with PROD-data zombies, whose boot sweeps then killed the
   # live production's in-flight turns three times). Empty = repo default.
+  # B05b-1: the log and the cross-run lock also follow this value, so a
+  # test-triggered restart no longer writes its evidence into the PRODUCTION
+  # data dir or contends the PRODUCTION restart lock.
   [string]$DataDir = ''
 )
 
 $root = Split-Path -Parent $PSScriptRoot
 $base = "http://127.0.0.1:$Port"
-$logFile = Join-Path $root 'data\restart-verify.log'
+# B05b-1: resolve the data root for THIS service chain — explicit -DataDir
+# wins (absolute used as-is; relative resolved against the repo root, NEVER
+# cwd: WMI launches have an unreliable cwd; [IO.Path]::GetFullPath would
+# throw on cross-drive absolutes under .NET Framework), otherwise the repo
+# default. Everything chain-scoped (log, lock) lives under here.
+if ($DataDir) {
+  if ([IO.Path]::IsPathRooted($DataDir)) { $dataRoot = $DataDir } else { $dataRoot = Join-Path $root $DataDir }
+} else {
+  $dataRoot = Join-Path $root 'data'
+}
+
+# -ShowPaths: print the chain-scoped paths and exit — no directory creation,
+# no log write, no lock, no server start. Used by scripts/restart-path-check.mjs
+# to lock the path derivation without side effects.
+if ($ShowPaths) {
+  Write-Output ("LOG={0}" -f (Join-Path $dataRoot 'restart-verify.log'))
+  Write-Output ("LOCK={0}" -f (Join-Path $dataRoot 'restart-verify.lock'))
+  exit 0
+}
+
+New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
+$logFile = Join-Path $dataRoot 'restart-verify.log'
 
 $script:LogFailed = $false
 # Flips true right before the FIRST taskkill goes out (P1, review round 5).
@@ -236,7 +261,9 @@ if (-not $VerifyOnly -and $NotifyRoom) {
 # 2026-11-03), so the rename is a claim, not the exclusion.
 $script:LockFile = $null
 if (-not $VerifyOnly) {
-  $script:LockFile = Join-Path $root 'data\restart-verify.lock'
+  # B05b-1: chain-scoped lock — a test-triggered restart takes the TEST
+  # data dir's lock, never the production one.
+  $script:LockFile = Join-Path $dataRoot 'restart-verify.lock'
   if (Test-Path -LiteralPath $script:LockFile) {
     $lock = $null
     try { $lock = Get-Content -LiteralPath $script:LockFile -Raw | ConvertFrom-Json } catch {}

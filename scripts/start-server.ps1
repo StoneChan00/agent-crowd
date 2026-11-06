@@ -26,22 +26,44 @@ param(
   # replacement boots on the repo default — for a test-triggered restart
   # that spawns a PROD-data zombie whose boot sweep kills the live
   # production's in-flight turns (2026-11-06 incident). Empty = repo default.
-  [string]$DataDir = ''
+  # B05b-1: the server's OWN log and latest.txt pointer also follow this
+  # value, so a replacement started for a test chain no longer drops log
+  # files into the PRODUCTION data dir.
+  [string]$DataDir = '',
+  # Print the chain-scoped log paths and exit — no dir creation, no log
+  # write, no server start (scripts/restart-path-check.mjs).
+  [switch]$ShowPaths
 )
 
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+
+# B05b-1: chain-scoped data root — absolute -DataDir used as-is, relative
+# resolved against the repo root (never cwd; GetFullPath throws on
+# cross-drive absolutes under .NET Framework), repo default as fallback.
+if ($DataDir) {
+  if ([IO.Path]::IsPathRooted($DataDir)) { $dataDir = $DataDir } else { $dataDir = Join-Path $root $DataDir }
+} else {
+  $dataDir = Join-Path $root 'data'
+}
+
+if ($ShowPaths) {
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  Write-Output ("LOG={0}" -f (Join-Path $dataDir ("server-{0}-{1}.log" -f $Port, $stamp)))
+  Write-Output ("LATEST={0}" -f (Join-Path $dataDir ("server-{0}-latest.txt" -f $Port)))
+  exit 0
+}
+
 foreach ($dir in @($NodeDir, "$env:APPDATA\npm")) {
   if ($dir -and (Test-Path $dir)) { $env:Path = "$dir;$env:Path" }
 }
 $env:AC_PORT = "$Port"
-if ($DataDir) { $env:AC_DATA_DIR = "$DataDir" }
+if ($DataDir) { $env:AC_DATA_DIR = "$dataDir" }
 if (-not $env:AC_TURN_TIMEOUT_MS) { $env:AC_TURN_TIMEOUT_MS = '60m' }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$dataDir = Join-Path $root 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 $log = Join-Path $dataDir "server-$Port-$stamp.log"
 Set-Content -Path (Join-Path $dataDir "server-$Port-latest.txt") -Value $log -Encoding ascii
