@@ -289,6 +289,7 @@ export interface GateOutcome {
  * | >0      | any           | any    | pass    | author unknown        | block (fail     |
  * |         |               |        |         |                       | closed)         |
  * | >0      | any           | any    | pass    | PASS from implementer | block           |
+ * | >0      | any           | any    | pass    | reviewer ineligible   | block           |
  * | >0      | any           | any    | pass    | PASS ≠ designated     | block           |
  * | >0      | any           | any    | pass    | reviewer same harness | block           |
  * | >0      | empty         | —      | pass    | independent PASS      | close           |
@@ -298,10 +299,11 @@ export interface GateOutcome {
  *
  * B05 authorship (checked once verdict === 'pass', BEFORE verify): without a
  * designated reviewer the PASS author must simply differ from the round's
- * last implementer. A designated reviewer adds two rules: the PASS must come
- * from that character, and its harness must differ from the implementer's
- * (same harness ≠ independent judgment). Chat-only rounds (changed = 0)
- * never check authorship.
+ * last implementer. A designated reviewer adds three rules (B05b-4 first):
+ * the reviewer itself must be eligible (enabled, not a summarizer), the PASS
+ * must come from that character, and its harness must differ from the
+ * implementer's (same harness ≠ independent judgment). Chat-only rounds
+ * (changed = 0) never check authorship.
  */
 export function gateDecision(input: GateInput): GateOutcome {
   if (input.changed === 0) return { action: 'close', reason: null }
