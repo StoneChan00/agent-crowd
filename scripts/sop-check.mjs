@@ -4,45 +4,48 @@
  *
  *   node scripts/sop-check.mjs
  *
- * Layers:
+ * Layers (per-layer counts are DELIBERATELY omitted, B05b-3: they drifted
+ * every time a row was added — the only authoritative count is the dynamic
+ * n/n in the OK line at the bottom):
  *   S1  verdict parser  — standalone REVIEW: lines, multi-block markdown
  *                         (blank-line splits, bold paragraphs, lists),
  *                         quoted verdicts (blockquote/table/heading are
- *                         invisible), variants, whole-line code spans (25)
- *   S2  gate table      — all 7 decision rows of gateDecision (7)
+ *                         invisible), variants, whole-line code spans
+ *   S2  gate table      — every decision row of gateDecision, incl. the B05
+ *                         author dimension and both fail-closed halves
  *   S3  worktree snap   — repo-root resolution: a cwd INSIDE a subdirectory
  *                         still sees sibling-directory changes; non-git
  *                         working dirs report available:false; untracked
- *                         fingerprints + dirty-file re-edit fallback (15)
+ *                         fingerprints + dirty-file re-edit fallback
  *   S4  green path      — write + REVIEW: PASS + verify exit 0 → verify runs
- *                         exactly once, round-end summary appears (6)
+ *                         exactly once, round-end summary appears
  *   S5  verify fails     — exit 1 with a LONG output (marker beyond the
  *                         1500-char prefix) → no summary, gate notice whose
- *                         output TAIL (not head) carries the marker (3)
+ *                         output TAIL (not head) carries the marker
  *   S6  no verdict      — changed round, no REVIEW line → blocked before any
- *                         verify runs (3)
- *   S7  chat-only round  — no changes → gate never runs, summary normal (3)
- *   S8  no verify config — changed + PASS closes directly; no verdict blocks (4)
+ *                         verify runs
+ *   S7  chat-only round  — no changes → gate never runs, summary normal
+ *   S8  no verify config — changed + PASS closes directly; no verdict blocks
  *   S9  restart race     — while the verify command runs, POST /api/restart
- *                         must NOT fire the restart (gateActive drains) (4)
+ *                         must NOT fire the restart (gateActive drains)
  *   S9b stale idle       — a new turn started while the gate's verify was
- *                         running must never see a busy:false (SSE watch) (3)
+ *                         running must never see a busy:false (SSE watch)
  *   S10 B04 episodes     — clean+changed+PASS rounds write exactly one
  *                         room-scope episode (repeat round = hash no-op;
  *                         verify-fail/no-verdict/chat write nothing; no-
  *                         verify PASS writes 「未配置验证」), and the
  *                         orchestrator's retrieval wiring pulls an out-of-
- *                         recency memory in only on a query hit (9)
+ *                         recency memory in only on a query hit
  *   S11 B05 self-review  — the implementer's own PASS blocks (notice names
  *                         「实现者本人」, no summary, no episode); no
  *                         designation keeps prior behavior; a designated
  *                         reviewer on another harness closes, a same-harness
- *                         reviewer or a PASS from someone else blocks (11)
+ *                         reviewer or a PASS from someone else blocks
  *   S12 restart data dir — the WMI script args carry the restarting
  *                         server's data dir: a test-triggered restart
  *                         replacement must inherit the TEST database, not
  *                         boot a PROD-data zombie whose sweep kills the
- *                         live turns (2026-11-06 incident) (2)
+ *                         live turns (2026-11-06 incident)
  *
  * Scenarios S4-S8 share one server (each room drained before the next
  * starts, so per-turn change attribution stays clean); S9 boots its own
