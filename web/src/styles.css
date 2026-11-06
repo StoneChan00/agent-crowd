@@ -2435,3 +2435,9 @@ select {
   background: rgba(255, 255, 255, 0.03);
   color: var(--text-dim);
 }
+
+/* B05b-4: the stale-designation warning under the reviewer dropdown —
+   louder than a plain field hint, softer than an error. */
+.reviewer-ineligible-hint {
+  color: #ffb454;
+}

@@ -21,7 +21,7 @@
  *   node scripts/restart-path-check.mjs
  */
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -63,6 +63,10 @@ const probe = (script, args) => {
 }
 
 const prodData = join(ROOT, 'data')
+// Fresh-clone guard (review suggestion 4): data/ is gitignored and doesn't
+// exist before the first server boot; create it so the before/after file-set
+// probe works on a pristine checkout instead of dying on ENOENT.
+mkdirSync(prodData, { recursive: true })
 const before = new Set(readdirSync(prodData))
 
 // R1: no -DataDir → repo default (behavior identical to pre-B05b-1).
@@ -115,6 +119,7 @@ try {
 }
 
 // P1: the four probes must not touch the production data dir.
+mkdirSync(prodData, { recursive: true })
 const after = new Set(readdirSync(prodData))
 const added = [...after].filter((name) => !before.has(name))
 const removed = [...before].filter((name) => !after.has(name))

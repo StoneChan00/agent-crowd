@@ -10,9 +10,12 @@
 # was started from an interactive terminal and held no log file. See
 # docs/devlog/0001-restart-lockout.md.
 #
-# Fix: each boot writes its OWN timestamped log under data\, so a restart
-# never fights the running chain over a file handle. The latest log path is
-# mirrored to data\server-<port>-latest.txt for quick lookup.
+# Fix: each boot writes its OWN timestamped log under <dataDir>\ (the
+# chain-scoped data root: -DataDir when given, repo data\ otherwise —
+# B05b-1), so a restart never fights the running chain over a file handle
+# AND a test-chain replacement never drops logs into the production data
+# dir. The latest log path is mirrored to <dataDir>\server-<port>-latest.txt
+# for quick lookup.
 #
 # Usage:
 #   powershell -File scripts\start-server.ps1              # default port 8787

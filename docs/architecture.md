@@ -107,11 +107,11 @@ prompt 走 argv 或临时文件、**不经过 shell**（spawn 无 shell，多行
 3. **收尾门禁（3c）**：队列排空时 `maybeStartRoundSummary` 先过 `gateDecision` 真值表——
    - 本轮无改动 → 直接收尾（现状不变）；
    - 有改动但最后结论不是 PASS → 阻断（发一条门禁说明，每轮至多一条）；
-   - **作者判定（B05 禁自审）**：有改动 + PASS 时先看 WHO——PASS 作者缺失 → 阻断（fail closed）；PASS 来自本轮最后一个「有改动回合」的作者 → 阻断（「实现者本人」，自审无效）；房间配了 `rooms.reviewer_character_id`（PATCH 校验必须本房间角色，删除角色时自动清空）再加两条：PASS 非该角色 → 阻断（「非指定 reviewer」），该角色与实现者同 harness → 阻断（「同一 harness」，同模型家族不算独立判断者）；未指定 reviewer 时任何非实现者角色的 PASS 均可收（兼容旧行为）。作者来源：verdict 记录处存 `round.verdictAuthor`，改动折叠处存 `round.changedAuthor`（均排除总结回合；changedAuthor 只在 `changedPaths.length > 0` 时更新——空数组是真值，不能拿真值判断）；
+    - **作者判定（B05 禁自审）**：有改动 + PASS 时先看 WHO——PASS 作者缺失 → 阻断（fail closed）；PASS 来自本轮最后一个「有改动回合」的作者 → 阻断（「实现者本人」，自审无效）；房间配了 `rooms.reviewer_character_id`（PATCH 校验必须本房间角色**且资格合格**——`enabled && !triggers.onRoundEnd`，停用/总结角色保存即 400；删除角色时自动清空指针对应的 reviewer）再加三条：指定 reviewer 已停用或为总结角色 → 阻断（「reviewer-ineligible」，可操作话术指向房间设置——B05b-4：指定保留不自动清空，绝不静默放行），PASS 非该角色 → 阻断（「非指定 reviewer」），该角色与实现者同 harness → 阻断（「同一 harness」，同模型家族不算独立判断者）；未指定 reviewer 时任何非实现者角色的 PASS 均可收（兼容旧行为）。作者来源：verdict 记录处存 `round.verdictAuthor`，改动折叠处存 `round.changedAuthor`（均排除总结回合；changedAuthor 只在 `changedPaths.length > 0` 时更新——空数组是真值，不能拿真值判断）；
    - 有改动 + 独立 PASS + 房间配了验证命令（`rooms.verify_command`）且未跑 → **服务端自己跑**（shell 语义、`room.workingDir`、300s 超时、超时 kill 后 10s 兜底 settle，输出保留**真尾部** 1500 落 `round_checks(kind='verify')`——exit 行恒在，输出截尾不截头），通过才收尾、失败阻断；
    - 门禁阻断的轮**不自动重排队**（防自锁），继续干活由人/角色的下一条消息发起新一轮。
 
-验证命令运行期间 `gateActive(roomId)` 为真：`/api/rooms/:id/state` 报 `gate: 'running'`，重启排空判定（restart.ts）也把它算作忙，避免重启在验证跑到一半时掀掉进程、静默丢失门禁结果。这个 await 是悬空的：期间新的人类消息可以正常开新回合，验证结算后老 pump 会重新核对 `active`/队列再决定是否广播 idle（不给运行中的回合闪 `busy:false`）。契约由 `scripts/sop-check.mjs` 锁定（S1 解析器 / S2 真值表含作者维度 / S3 快照 / S4-S8 端到端 / S9 重启竞态 / S9b 陈旧 idle / S11 自审五态 / S12 重启数据目录——2026-11-06 事故：测试触发的重启替补曾落在生产库，其启动 sweep 杀掉生产在飞回合三次；数据目录现在经 restart.ts → restart-and-verify.ps1 → start-server.ps1 全链传递，替补继承同库）。
+验证命令运行期间 `gateActive(roomId)` 为真：`/api/rooms/:id/state` 报 `gate: 'running'`，重启排空判定（restart.ts）也把它算作忙，避免重启在验证跑到一半时掀掉进程、静默丢失门禁结果。这个 await 是悬空的：期间新的人类消息可以正常开新回合，验证结算后老 pump 会重新核对 `active`/队列再决定是否广播 idle（不给运行中的回合闪 `busy:false`）。契约由 `scripts/sop-check.mjs` 锁定（S1 解析器 / S2 真值表含作者维度与 reviewer 资格 / S3 快照 / S4-S8 端到端 / S9 重启竞态 / S9b 陈旧 idle / S11 自审与 reviewer 资格（含保存校验与失效后可操作阻断）/ S12 重启数据目录——2026-11-06 事故：测试触发的重启替补曾落在生产库，其启动 sweep 杀掉生产在飞回合三次；数据目录与日志/锁现在经 restart.ts → restart-and-verify.ps1 → start-server.ps1 全链传递，替补继承同库、日志与锁也写同库）。
 
 ## 会话连续性（P0-1：sessions 表 + 增量 prompt + resume 回退）
 

@@ -985,6 +985,9 @@ async function scenarioEndToEnd() {
     const roomE = await makeRoom(port, 's11e-非指定', repo, 'exit 0')
     await makeCharacter(port, roomE.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
     await makeCharacter(port, roomE.id, '评审乙', FOLLOWS_DEV, 'MOCK-评审通过')
+    // B05b-4 review fix: a real summarizer must exist so "blocked round has
+    // no summary" is a FAILABLE assertion, not a vacuous one.
+    await makeCharacter(port, roomE.id, '总结丙', ROUND_SUMMARIZER, '总结者')
     // B05b-4: the designated reviewer must be an ELIGIBLE member (the save
     // validation refuses disabled/summarizer designations) — a silent
     // eligible 评审甲 that never speaks makes 评审乙's PASS a wrong-reviewer.
@@ -1029,6 +1032,9 @@ async function scenarioEndToEnd() {
       const room = await makeRoom(port, 's11g-资格失效', repo, 'exit 0')
       await makeCharacter(port, room.id, '开发甲', ON_USER_ONLY, 'MOCK-写文件')
       await makeCharacter(port, room.id, '评审甲', FOLLOWS_DEV, 'MOCK-评审通过')
+      // B05b-4 review fix: same as S11e — the "no summary after block"
+      // assertion needs a real summarizer to be able to fail.
+      await makeCharacter(port, room.id, '总结丙', ROUND_SUMMARIZER, '总结者')
       const designated = await makeCharacter(port, room.id, '评审乙', ON_USER_ONLY, 'MOCK-评审通过')
       await req(port, `/api/rooms/${room.id}`, {
         method: 'PATCH',
