@@ -498,8 +498,14 @@ export default function App() {
               onToggleSidebar={() => setSidebarOpen((open) => !open)}
             />
 
+            {/* NO key here on purpose: keying MessageList by roomId (d85d94f)
+              makes React 19.3.1 leave the previous room's whole list mounted
+              as an orphaned DOM subtree on every switch — the main view then
+              stacks one chat list per visited room (2026-11-06 incident,
+              minimized to this single key). The scroll/pin effect already
+              keys on [messages, roomId]; Composer below keeps its key (its
+              remount is clean AND resets the draft per room). */}
             <MessageList
-              key={roomId ?? 'no-room'}
               messages={messages}
               characters={characters}
               live={live}
