@@ -49,9 +49,22 @@ export function MessageList({
   const pinnedRef = useRef(true)
   const [showThinking, setShowThinking] = useState<Record<string, boolean>>({})
 
+  // Room switch without remount (App.tsx is deliberately keyless — see the
+  // 2026-11-06 stacking incident comment there): re-pin so the newly
+  // selected room lands on its newest messages even when the user was
+  // scrolled up reading history in the previous room. Runs BEFORE the
+  // scroll effect below (declaration order), so the same render's scroll
+  // pass sees pinned=true.
+  useEffect(() => {
+    pinnedRef.current = true
+  }, [roomId])
+
   useEffect(() => {
     const node = scrollRef.current
-    if (!node) return
+    // Skip the empty transitional render (room switch resets messages to []
+    // before the pull lands): assigning scrollTop there restarts the smooth
+    // scroll animation for nothing and stretches the switch dance.
+    if (!node || messages.length === 0) return
     if (pinnedRef.current) {
       node.scrollTop = node.scrollHeight
     }
