@@ -41,7 +41,7 @@
    - 用户 abort → turn `stopped`，半截文本保留为角色消息，`meta.error='已停止'`。
    - `error && 无正文` → turn `error` + 系统警告消息；瞬态失败（`isTransientFailure`：死得快）自动重试**恰好一次**（`item.retry` 循环守卫）。
    - 有正文（可能带 `meta.error`）→ 以角色消息落库，meta 携带 harness/model/turnId/durationMs/exitCode/pid/sessionId/tokens/thinking/tools。
- 7. **接力**：`!output.error` 时 `enqueueFollowers(hop+1)`；带 error/截断的回合**不接龙**（半成品传给下游比沉默更糟）。接力时把五元组交接（B06）挂在被接力的 assistant 消息上（`meta.handoff`，纯函数 `buildHandoff` 零模型、数据白名单：What=轮交付线+前 5 改动路径、Why/Next Action 仅在有任务卡时取卡上的 why/acceptance、Tradeoff 永久留空、Open Questions 只认已知未决态——卡未验收/验证命令未跑；**不写门禁结论**，门禁在队列排空时才跑，接力时刻写它是臆测）；被接力的回合注入【交接】段（head 位置在记忆之后、群聊规则之前，**不进 transcript**——不会被 B01 的折叠裁掉，续传轮也带），注入按 `triggerMessageId` 取交接而非"最新一条"（排队期间可能又有新消息）。字段在构建时截断（200/字段、总 ≤800），meta 与注入永不失配。契约由 prompt-check H1–H5 与 queue-check Q8（A→B 接力：meta deepEqual + seam 报告 prompt 段）锁定。
+7. **接力**：`!output.error` 时 `enqueueFollowers(hop+1)`；带 error/截断的回合**不接龙**（半成品传给下游比沉默更糟）。接力时把五元组交接（B06）挂在被接力的 assistant 消息上（`meta.handoff`，纯函数 `buildHandoff` 零模型、数据白名单：What=轮交付线+前 5 改动路径、Why/Next Action 仅在有任务卡时取卡上的 why/acceptance、Tradeoff 永久留空、Open Questions 只认已知未决态——卡未验收/验证命令未跑；**不写门禁结论**，门禁在队列排空时才跑，接力时刻写它是臆测）；被接力的回合注入【交接】段（head 位置在记忆之后、群聊规则之前，**不进 transcript**——不会被 B01 的折叠裁掉，续传轮也带），注入按 `triggerMessageId` 取交接而非"最新一条"（排队期间可能又有新消息）。字段在构建时截断（200/字段、总 ≤800），meta 与注入永不失配。契约由 prompt-check H1–H6（含 H4b/H4c）与 queue-check Q8（A→B 接力：meta deepEqual + seam 报告 prompt 段）锁定。
 8. **收尾**：队列排空时先过 SOP 门禁（见下节）——无改动轮直接进轮末总结（`onRoundEnd` 角色）；有改动轮必须 review 结论为 PASS 且（若配置了验证命令）服务端自跑验证通过，否则发一条门禁说明后丢弃本轮状态、不总结也不重排队。三处正常收尾汇入 `closeRoundNormally`（B04）：结算任务卡 → **干净收尾且有改动的轮写一条 room-scope `episode` 记忆**（路径/结论/验证/交付一句话，`sha256` 去重，best-effort）→ 删 round；blocked/error/stopped/纯聊天不写。
 
 ## DB（`db.ts`，node:sqlite 单文件，WAL）
@@ -135,3 +135,12 @@ prompt 走 argv 或临时文件、**不经过 shell**（spawn 无 shell，多行
 4. **重新派发**：`POST /api/tasks/:id/dispatch`（仅 `running`）重发一张「【任务卡·重新派发】」消息并开新 round——续传会话的增量里必须重新拿到完整卡片。前端 `TaskPanel`（Modal）+ 头部「任务」按钮（未完成数 badge）+ SSE `task` 事件跨标签页同步。
 
 契约由 `scripts/task-check.mjs` 锁定（T1 建卡不跑 / T2 恰一回合一消息 / T3 字段送达含大卡与续传 / T4 驳回零副作用 / T5 幂等 / T6-T7 级联 / T8 时间戳 / T9 门禁拦截 / T10 重派 / T11 校验 / T12 忙时批准+stop 仍可重派 / T13 排队中换人 / T14 出错不假 done）。不做：模型自动拆卡、一卡一房间/线程（B18）、跨房间看板、自动验收判定。
+
+## Skills 按需注入（B07）
+
+角色级技能白名单 + 回合内按需注入：仓库根 `skills/` 目录（每个 `.md` 一个技能，frontmatter 提供 `name`/`description`/`keywords`，正文为技能体）；房间角色可勾选「可用技能」（`characters.skills`，JSON 数组，脏数据防御解析——坏 JSON/非数组/非字符串一律丢弃，角色永远可读）。预设（角色库）不带 skills，`syncCharacterFromPreset` 不清空已选。
+
+- **匹配源 = 本轮 `visible` 消息**（续传轮只算游标之后，与增量同口径）：关键词对**原文**（CJK 子串、小写包含）；`@skill:名字` 对 **`visibleText()`**（代码块/行内代码/链接文字里的不算，与 `@名字` 同一边界；只解析原文含 `@skill:` 的消息——快路径，不每轮解析全部）。**只注入已勾选且命中**的技能正文（勾选是硬门：勾了 A 消息里 `@skill:B` 也不注入）；未命中只给一行目录（description 截 40 字、整行 ≤400 字、永不换行）。目录/正文顺序按 name 排序（确定性输出）。
+- **段位置**：【交接】之后、【群聊规则】之前，head 内、**不进 transcript**（折叠吃不掉，续传轮也带）；`MAX_TOTAL_PROMPT` 的最后一刀仍只切 head——技能段与其他 head 同命运。
+- **硬预算**：单条正文 `SKILL_BODY_MAX=2000`、整段 `SKILLS_TOTAL_MAX=4000`（含标题/目录/省略标记）；超了从当前条起停并记「预算用尽」一行。`skills/` 每次回合现读（`loadSkills` 任何情况不抛：缺目录/坏 YAML/BOM/CRLF/超 64KB/重名先到先得全部跳过 + 一次性告警）。
+- **接口**：`GET /api/skills` → `{ dir, skills }`（无 body，按 name 排序；缺目录 200 + 空数组，绝不 500）；角色 POST/PATCH 的 `skills` 必须是数组否则 400。契约由 prompt-check K1–K10 锁定（不勾选不出段 / 只目录 / 关键词与显式命中 / 勾选硬门 / visibleText 边界 / 单条与整段预算 / 解析容错 / 真实目录）。

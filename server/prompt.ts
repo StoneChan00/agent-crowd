@@ -320,8 +320,9 @@ export function buildTurnPromptDetailed(input: {
 
   // B06: the handoff section rides in the HEAD (never the transcript — the
   // budget fold must not eat it; resumed turns carry it too). Empty fields
-  // are omitted lines, so a handoff always renders at least What + Next
-  // Action — the two lines the receiver cannot act without.
+  // are omitted lines, so a handoff always renders at least Next Action —
+  // the one line the receiver cannot act without; What itself may be empty
+  // (a verdict-only relay with no prior round delivery).
   const handoffSection: string[] = []
   if (input.handoff) {
     handoffSection.push(
