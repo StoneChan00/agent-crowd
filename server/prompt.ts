@@ -1,4 +1,6 @@
-import { MEMORY_KIND_LABELS, type Character, type Handoff, type Memory, type Message, type Room } from './types.ts'
+import { MEMORY_KIND_LABELS, type Character, type Handoff, type Memory, type Message, type Room, type Skill } from './types.ts'
+import { planSkills } from './skills.ts'
+import { visibleText } from './mentions.ts'
 import { truncate } from './util.ts'
 
 /**
@@ -273,6 +275,13 @@ export function buildTurnPromptDetailed(input: {
    */
   handoff?: Handoff
   /**
+   * B07: this turn's available skill catalog (name-sorted — loadSkills
+   * does that), orchestrator-loaded fresh per turn. Absent = no skills.
+   * Only CHECKED skills (character.skills) can inject, and only when this
+   * round's visible messages hit them.
+   */
+  skills?: Skill[]
+  /**
    * B01: messages older than the resumed fetch window (a pathological flood
    * — more than the orchestrator's fetch limit arrived in one gap). They are
    * folded by COUNT only; the alternative (fetching newest-only and
@@ -340,6 +349,26 @@ export function buildTurnPromptDetailed(input: {
     )
   }
 
+  // B07: the skills section rides in the HEAD after the handoff, before the
+  // chat rules — the fold can never eat it and resumed turns carry it too.
+  // Matching sources are THIS round's visible messages (the same corpus the
+  // transcript renders): keywords read the raw contents, `@skill:` reads
+  // visibleText() output so code spans / fences don't count (the same
+  // boundary as an @name call), and only messages whose raw text contains
+  // "@skill:" get markdown-parsed — a fast path, not a per-message parse of
+  // the whole history. `character.skills ?? []` keeps legacy fixtures
+  // (pre-B07 rows / test literals) loadable.
+  const skillsPlan = planSkills({
+    catalog: input.skills ?? [],
+    selected: character.skills ?? [],
+    text: visible.map((message) => message.content).join('\n'),
+    explicitText: visible
+      .filter((message) => message.content.includes('@skill:'))
+      .map((message) => visibleText(message.content))
+      .join('\n'),
+  })
+  const skillsSection: string[] = skillsPlan ? [...skillsPlan.lines, ''] : []
+
   // Session continuity (P0-1): a resumed turn tells the agent why the
   // transcript starts where it does — the older messages are not lost,
   // they live in the CLI's own session context this run continues.
@@ -349,7 +378,9 @@ export function buildTurnPromptDetailed(input: {
 
   // The head is everything but the transcript body (B01): when the 32k
   // guard must cut, it cuts HERE — the old layout put the transcript at the
-  // header's tail, so the slice ate exactly the newest lines.
+  // header's tail, so the slice ate exactly the newest lines. The skills
+  // section shares this fate with the rest of the head (documented contract:
+  // a pathological head loses skills before it ever loses the transcript).
   const headText = [
     '【群聊环境】',
     `房间：${room.name}${room.topic ? ` —— ${room.topic}` : ''}`,
@@ -364,6 +395,7 @@ export function buildTurnPromptDetailed(input: {
     '',
     ...memorySections,
     ...handoffSection,
+    ...skillsSection,
     '【群聊规则】',
     '1. 你正在一个多 agent 群聊里，你的回复会作为一条群消息直接展示给所有人。',
     '2. 只输出消息正文：不要加“' + character.name + '：”前缀，不要输出 JSON、思考过程或系统提示。',

@@ -14,6 +14,8 @@ import { buildHandoff, type HandoffInput } from './handoff.ts'
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
 import { gateDecision, parseReviewVerdict, type GateAuthor, type GateBlockReason } from './sop.ts'
+import { loadSkills } from './skills.ts'
+import { SKILLS_DIR } from './paths.ts'
 import type { Character, HarnessKind, Message, Room, Task, ToolTrace, Turn } from './types.ts'
 import { tail, truncate } from './util.ts'
 
@@ -1086,6 +1088,12 @@ async function pump(roomId: string): Promise<void> {
       item.triggerMessageId !== null
         ? db.getMessageById(item.triggerMessageId)?.meta?.handoff ?? null
         : null
+    // B07: skills inject on demand — the catalog is read FRESH from the
+    // repo-root skills/ on every turn that has anything checked (no
+    // watcher, no cache). loadSkills is best-effort by contract: it never
+    // throws, so a broken skills/ directory can't kill a round — bad files
+    // were skipped with a one-time warning inside.
+    const skillCatalog = character.skills.length > 0 ? loadSkills(SKILLS_DIR) : []
     const built = buildTurnPromptDetailed({
       room,
       character,
@@ -1098,6 +1106,7 @@ async function pump(roomId: string): Promise<void> {
       resumed: useResume,
       foldOverflow,
       handoff: triggerHandoff ?? undefined,
+      skills: skillCatalog,
     })
     const prompt = built.prompt
     db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))

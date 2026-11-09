@@ -139,7 +139,26 @@ export interface Character {
   identityId: string | null
   /** Library template this character was created from; powers the "↻ 同步" refresh. */
   presetId: string | null
+  /**
+   * B07: names of the repo-root `skills/*.md` this character may inject.
+   * The checkbox is the hard gate — only a checked skill can ever land in
+   * the prompt, and only when this round's visible messages hit it. Presets
+   * deliberately carry nothing here (a template stays skill-neutral).
+   */
+  skills: string[]
   createdAt: number
+}
+
+/**
+ * B07: one `skills/*.md` file. Parsed by server/skills.ts (BOM/CRLF
+ * tolerated, junk rejected to null); `body` is the frontmatter-remainder
+ * that injects on a hit.
+ */
+export interface Skill {
+  name: string
+  description: string
+  keywords: string[]
+  body: string
 }
 
 /**

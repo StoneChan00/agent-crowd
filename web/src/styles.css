@@ -1835,6 +1835,45 @@ select {
   border-radius: 999px;
 }
 
+/* B07 skills picker (room mode): member-check layout + a grayed
+   selected-but-file-gone entry — still uncheckable, never silently dropped. */
+.skill-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.skill-check {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.025);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.skill-check input {
+  accent-color: #7c67ee;
+}
+.skill-check .skill-name {
+  color: var(--text);
+  font-weight: 600;
+  flex: none;
+}
+.skill-check .skill-desc {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skill-check.is-missing {
+  opacity: 0.55;
+}
+.skill-check.is-missing .skill-desc {
+  color: var(--amber, #d59f0b);
+}
+
 /* ------------------------------------------------------------- toast */
 
 .toast {

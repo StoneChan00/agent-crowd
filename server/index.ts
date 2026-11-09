@@ -25,7 +25,8 @@ import {
 import * as orchestrator from './orchestrator.ts'
 import { listMcps } from './mcps.ts'
 import * as restart from './restart.ts'
-import { DATA_DIR, DEFAULT_WORKSPACE, WEB_DIST } from './paths.ts'
+import { DATA_DIR, DEFAULT_WORKSPACE, SKILLS_DIR, WEB_DIST } from './paths.ts'
+import { loadSkills } from './skills.ts'
 import type { Character, HarnessKind, Room, Task } from './types.ts'
 import { HARNESS_LABELS } from './types.ts'
 import { truncate } from './util.ts'
@@ -676,11 +677,27 @@ app.delete('/api/presets/:id', (req, res) => {
 
 /* -------------------------------------------------------------- characters */
 
+// B07: the skills catalog for the editor's checkbox list. Body-less entries
+// only (a full skill body has no business riding every editor open), name-
+// sorted. loadSkills never throws — a missing skills/ directory is a normal
+// state and answers 200 + [], the UI explains where to put files.
+app.get('/api/skills', (_req, res) => {
+  const skills = loadSkills(SKILLS_DIR).map((skill) => ({
+    name: skill.name,
+    description: skill.description,
+    keywords: skill.keywords,
+  }))
+  res.json({ dir: SKILLS_DIR, skills })
+})
+
 app.post('/api/rooms/:id/characters', (req, res) => {
   const room = requireRoom(res, req.params.id)
   if (!room) return
   const body = req.body ?? {}
   if (typeof body.name !== 'string' || !body.name.trim()) return fail(res, 400, '角色名不能为空')
+  // B07: a malformed skills payload is a client bug, not a silent "no
+  // skills" — dropping it here would wipe a real selection invisibly.
+  if (body.skills !== undefined && !Array.isArray(body.skills)) return fail(res, 400, 'skills 必须是字符串数组')
 
   const harness = String(body.harness ?? 'mock') as HarnessKind
   try {
@@ -698,6 +715,7 @@ app.post('/api/rooms/:id/characters', (req, res) => {
       commandTemplate: body.commandTemplate,
       autoApprove: body.autoApprove,
       enabled: body.enabled,
+      skills: body.skills !== undefined ? body.skills.map(String) : undefined,
     })
     res.status(201).json(character)
   } catch (error) {
@@ -750,6 +768,9 @@ app.patch('/api/characters/:id', (req, res) => {
   const current = db.getCharacter(req.params.id)
   if (!current) return fail(res, 404, '角色不存在')
   const body = req.body ?? {}
+  // B07: same shape rule as POST — a non-array skills patch is a 400, never
+  // a silent selection wipe.
+  if (body.skills !== undefined && !Array.isArray(body.skills)) return fail(res, 400, 'skills 必须是字符串数组')
   try {
     const character = db.updateCharacter(current.id, {
       ...(body.name !== undefined ? { name: String(body.name) } : {}),
@@ -764,6 +785,7 @@ app.patch('/api/characters/:id', (req, res) => {
       ...(body.commandTemplate !== undefined ? { commandTemplate: String(body.commandTemplate) } : {}),
       ...(body.autoApprove !== undefined ? { autoApprove: Boolean(body.autoApprove) } : {}),
       ...(body.enabled !== undefined ? { enabled: Boolean(body.enabled) } : {}),
+      ...(body.skills !== undefined ? { skills: body.skills.map(String) } : {}),
     })
     res.json(character)
   } catch (error) {

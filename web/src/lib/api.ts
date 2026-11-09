@@ -7,6 +7,7 @@ import type {
   Memory,
   Message,
   Room,
+  SkillInfo,
   Task,
   TaskStatus,
 } from '../types'
@@ -82,6 +83,9 @@ export const api = {
   /** Re-copy the linked library template onto this room character. */
   syncCharacterFromPreset: (characterId: string) =>
     request<Character>(`/api/characters/${characterId}/sync-preset`, { method: 'POST' }),
+
+  /** B07: the skills/ catalog (body-less), for the editor's checkbox list. */
+  skills: () => request<{ dir: string; skills: SkillInfo[] }>('/api/skills'),
 
   presets: () => request<{ presets: CharacterPreset[] }>('/api/presets'),
 

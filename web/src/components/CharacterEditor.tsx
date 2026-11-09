@@ -1,5 +1,5 @@
 import { useEffect, useState, type ChangeEvent } from 'react'
-import type { Character, CharacterPreset, HarnessKind, HarnessMap, Memory, Room, Triggers } from '../types'
+import type { Character, CharacterPreset, HarnessKind, HarnessMap, Memory, Room, SkillInfo, Triggers } from '../types'
 import { api } from '../lib/api'
 import { HARNESS_META, HARNESS_ORDER } from '../lib/format'
 import { isImageAvatar } from './Avatar'
@@ -19,6 +19,8 @@ export interface CharacterDraft {
   autoApprove: boolean
   commandTemplate: string
   triggers: Triggers
+  /** B07: checked skill names — room characters only; presets never carry any. */
+  skills: string[]
 }
 
 interface CharacterEditorProps {
@@ -70,6 +72,9 @@ function toDraft(character: Character | CharacterPreset | null): CharacterDraft 
     enabled: character && 'enabled' in character ? character.enabled : true,
     autoApprove: character?.autoApprove ?? true,
     commandTemplate: character?.commandTemplate ?? '',
+    // B07: presets carry no skills (a template stays skill-neutral); the
+    // `?? []` also covers a legacy character JSON predating the field.
+    skills: character && 'skills' in character ? character.skills ?? [] : [],
     triggers: {
       onUser: character?.triggers.onUser ?? true,
       onAll: character?.triggers.onAll ?? false,
@@ -104,6 +109,8 @@ export function CharacterEditor({
   const [memories, setMemories] = useState<Memory[] | null>(null)
   const [memoryInput, setMemoryInput] = useState('')
   const [memoryBusy, setMemoryBusy] = useState(false)
+  /** B07: the skills/ catalog for the checkbox list; null = still loading. */
+  const [skillOptions, setSkillOptions] = useState<SkillInfo[] | null>(null)
 
   const isExistingRoomCharacter = mode === 'room' && character && 'roomId' in character
 
@@ -128,6 +135,31 @@ export function CharacterEditor({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isExistingRoomCharacter, room?.id, character?.id])
+
+  // B07: the skills catalog is a room-mode-only picker. A failed / empty
+  // load is a normal state (no skills/ directory yet) — an empty list with
+  // a hint, never a broken editor.
+  useEffect(() => {
+    if (mode !== 'room') {
+      setSkillOptions(null)
+      return
+    }
+    let cancelled = false
+    api
+      .skills()
+      .then((data) => {
+        if (!cancelled) setSkillOptions(data.skills)
+      })
+      .catch(() => {
+        if (!cancelled) setSkillOptions([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [mode])
+
+  const toggleSkill = (name: string) =>
+    set('skills', draft.skills.includes(name) ? draft.skills.filter((item) => item !== name) : [...draft.skills, name])
 
   const suggestions = models[draft.harness] ?? []
   const harnessInfo = harnesses[draft.harness]
@@ -534,6 +566,44 @@ export function CharacterEditor({
           <span className="field-hint">这段文字会作为角色的系统提示注入，写清职责、输出格式和边界。</span>
         </div>
       </section>
+
+      {!isLibrary && (
+        <section className="form-section">
+          <h4>技能</h4>
+          <p className="field-hint">
+            勾选后，本轮消息命中技能关键词（或写 @skill:名字）时才把该技能正文注入 prompt；未命中只注入一行目录。
+            勾选是硬门：没勾的技能即使被 @ 到也不注入。
+          </p>
+          {skillOptions === null ? (
+            <p className="field-hint">技能目录加载中…</p>
+          ) : skillOptions.length === 0 ? (
+            <p className="field-hint">还没有可用技能：在仓库 skills/ 目录下添加 .md 技能文件（frontmatter 带 name/description/keywords）。</p>
+          ) : (
+            <div className="skill-checks">
+              {skillOptions.map((skill) => (
+                <label key={skill.name} className="skill-check">
+                  <input
+                    type="checkbox"
+                    checked={draft.skills.includes(skill.name)}
+                    onChange={() => toggleSkill(skill.name)}
+                  />
+                  <span className="skill-name">{skill.name}</span>
+                  {skill.description && <span className="skill-desc">{skill.description.slice(0, 40)}</span>}
+                </label>
+              ))}
+              {draft.skills
+                .filter((name) => !skillOptions.some((skill) => skill.name === name))
+                .map((name) => (
+                  <label key={name} className="skill-check is-missing">
+                    <input type="checkbox" checked onChange={() => toggleSkill(name)} />
+                    <span className="skill-name">{name}</span>
+                    <span className="skill-desc">（缺失：技能文件已不存在，取消勾选可移除）</span>
+                  </label>
+                ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {isExistingRoomCharacter && (
         <section className="form-section">

@@ -229,6 +229,10 @@ addColumnIfMissing('turns', 'task_id', 'task_id text')
 // Self-review ban (B05): the room's designated reviewer column.
 addColumnIfMissing('rooms', 'reviewer_character_id', 'reviewer_character_id text')
 
+// B07 on-demand skills: the character's checked skill names, JSON-encoded.
+// Default '[]' so every existing row reads as "nothing checked".
+addColumnIfMissing('characters', 'skills', "skills text not null default '[]'")
+
 // Task cards (B03 review 1): approval writes `running` synchronously — the
 // fleeting `approved` state is no longer produced and had no exit (a swept
 // queued turn locked the card out of every action). Any row still sitting in
@@ -479,6 +483,50 @@ function sanitizeAliases(input: unknown, name: string): string[] {
   return out
 }
 
+/**
+ * B07: read-side defense for characters.skills. Legacy rows predate the
+ * column (default '[]'), and hand-edited JSON can be anything — bad JSON, a
+ * non-array, non-string or empty elements. Nothing here may stop the
+ * character from loading: junk elements are dropped, the rest survives.
+ */
+function parseSkillsColumn(raw: unknown): string[] {
+  if (typeof raw !== 'string' || raw.trim() === '') return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(parsed)) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const entry of parsed) {
+    if (typeof entry !== 'string' || entry === '') continue
+    if (seen.has(entry)) continue
+    seen.add(entry)
+    out.push(entry)
+  }
+  return out
+}
+
+/**
+ * B07: write-side normalization for a skills selection — trim, drop
+ * empties, dedupe, preserve order, ≤32 entries, each sliced at 64 chars
+ * (the skill-name grammar cap, so a hand-edited long name still matches a
+ * real catalog entry after the slice).
+ */
+function normalizeSkills(input: string[] | undefined): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const entry of input ?? []) {
+    const name = String(entry).trim().slice(0, 64)
+    if (!name || seen.has(name) || out.length >= 32) continue
+    seen.add(name)
+    out.push(name)
+  }
+  return out
+}
+
 /** Raised when a character is about to be stored under a call-name the chip grammar can't highlight. */
 export class InvalidCallNameError extends Error {
   constructor(message: string) {
@@ -549,6 +597,7 @@ function mapCharacter(row: Record<string, unknown>): Character {
     enabled: Number(row.enabled ?? 1) === 1,
     identityId: row.identity_id === null || row.identity_id === undefined ? null : String(row.identity_id),
     presetId: row.preset_id === null || row.preset_id === undefined ? null : String(row.preset_id),
+    skills: parseSkillsColumn(row.skills),
     createdAt: Number(row.created_at),
   }
 }
@@ -585,6 +634,8 @@ export interface CharacterInput {
   enabled?: boolean
   /** Library template this character is copied from; null for hand-made characters. */
   presetId?: string | null
+  /** B07: checked skill names; absent = leave as-is (update) / none (create). */
+  skills?: string[]
 }
 
 export function createCharacter(input: CharacterInput): Character {
@@ -607,14 +658,15 @@ export function createCharacter(input: CharacterInput): Character {
     enabled: input.enabled ?? true,
     identityId: null,
     presetId: input.presetId ?? null,
+    skills: normalizeSkills(input.skills),
     createdAt: now(),
   }
   // Ambiguous call-names would make @mentions wake the wrong character.
   assertCallNamesFree(input.roomId, null, character.name, character.aliases)
   db.prepare(
     `insert into characters
-       (id, room_id, name, aliases, avatar, color, harness, model, persona, cwd, triggers, command_template, auto_approve, enabled, preset_id, created_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, room_id, name, aliases, avatar, color, harness, model, persona, cwd, triggers, command_template, auto_approve, enabled, preset_id, skills, created_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     character.id,
     character.roomId,
@@ -631,6 +683,7 @@ export function createCharacter(input: CharacterInput): Character {
     character.autoApprove ? 1 : 0,
     character.enabled ? 1 : 0,
     character.presetId,
+    JSON.stringify(character.skills),
     character.createdAt,
   )
   return character
@@ -660,6 +713,10 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
         ? current.aliases.filter((alias) => alias !== nextName)
         : sanitizeAliases(patch.aliases, nextName),
     triggers: patch.triggers ? { ...current.triggers, ...patch.triggers } : current.triggers,
+    // B07: skills only change when the patch carries them — the preset
+    // "↻ 对齐" refresh routes through here WITHOUT skills, so a re-alignment
+    // never silently wipes the room-local selection.
+    skills: patch.skills === undefined ? current.skills : normalizeSkills(patch.skills),
   }
   // Only police call-names when they actually change: rooms with legacy
   // duplicate names (created before the check existed) stay editable for
@@ -673,7 +730,7 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
   }
   db.prepare(
     `update characters set name = ?, aliases = ?, avatar = ?, color = ?, harness = ?, model = ?, persona = ?,
-       cwd = ?, triggers = ?, command_template = ?, auto_approve = ?, enabled = ? where id = ?`,
+       cwd = ?, triggers = ?, command_template = ?, auto_approve = ?, enabled = ?, skills = ? where id = ?`,
   ).run(
     next.name,
     JSON.stringify(next.aliases),
@@ -687,6 +744,7 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
     next.commandTemplate,
     next.autoApprove ? 1 : 0,
     next.enabled ? 1 : 0,
+    JSON.stringify(next.skills),
     id,
   )
 

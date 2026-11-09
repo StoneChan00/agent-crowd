@@ -23,6 +23,10 @@
  *                 episode assembly) + DB-backed R1–R8 (FTS substring, LIKE
  *                 fallback for short CJK, mixed union, escaping, pinned,
  *                 budgets, empty-query parity).
+ *   7. skills   — (B07) on-demand injection: checkbox is the hard gate,
+ *                 keyword/explicit @skill: hits against THIS round's visible
+ *                 messages, one-line catalog, hard budgets, broken-file
+ *                 skips (K1–K10 at both the planSkills and prompt layers).
  *
  * Constants are IMPORTED from the live module — never re-typed here.
  * Node ≥ 23.6 (type stripping) is required for the `.ts` imports.
@@ -647,9 +651,296 @@ const mark = (tag) => `⟪${tag}⟫`
   check('H5 续传轮也带【交接】（head 段，不随增量裁剪）', resumed.includes('【交接】') && resumed.includes('- Next Action：'))
 }
 
+/* ------------------------------------------- skills on demand (B07, K1–K10) */
+{
+  // B07: skill injection. planSkills/parseSkillFile/loadSkills are PURE-ish
+  // (skills.ts imports no db/paths) — K9/K10 lock the module directly, while
+  // K1–K8 lock the composed prompt: the section's position, the checkbox
+  // hard gate, the visibleText boundary for @skill:, and the budgets.
+  const { SKILL_BODY_MAX, SKILLS_TOTAL_MAX, SKILL_CATALOG_LINE_MAX, parseSkillFile, loadSkills, planSkills } =
+    await import('../server/skills.ts')
+
+  const mkSkill = (name, description, keywords, body) => ({ name, description, keywords, body })
+  const skillPrompt = (catalog, selected, messages, extra = {}) =>
+    buildTurnPrompt({
+      room,
+      character: { ...baseCharacter, skills: selected },
+      characters: [baseCharacter],
+      messages,
+      cwd: 'D:/tmp',
+      skills: catalog,
+      ...extra,
+    })
+  const handoffStub = { what: '上一棒的交付', why: '', tradeoff: '', openQuestions: '', nextAction: '接手' }
+  const body = (letter) => letter.repeat(2_000)
+
+  // K1: nothing checked → not even the title, keyword hit or not.
+  check(
+    'K1 未勾选技能：连【技能】段都不出现（关键词命中也无效）',
+    !skillPrompt([mkSkill('alpha', 'A 技能', ['alpha'], '正文A')], [], [msg('m1', '提到 alpha 关键词', 1)]).includes('【技能】'),
+  )
+
+  // K2: checked, no hit → title + ONE catalog line, no body blocks.
+  {
+    const prompt = skillPrompt(
+      [mkSkill('alpha', 'A 技能', ['alpha'], '正文A'), mkSkill('beta', 'B 技能', ['beta'], '正文B')],
+      ['alpha', 'beta'],
+      [msg('m1', '普通聊天，不含任何关键词', 1)],
+    )
+    const catalogAt = prompt.indexOf('- 技能目录：')
+    const catalogSeg = prompt.slice(catalogAt, prompt.indexOf('\n', catalogAt))
+    check(
+      'K2 已勾选未命中：只有标题 + 一行目录，无正文块',
+      prompt.includes('【技能】') &&
+        prompt.includes('已勾选 2 个') &&
+        prompt.includes('- 技能目录：alpha（A 技能）、beta（B 技能）') &&
+        prompt.split('技能目录：').length - 1 === 1 &&
+        catalogSeg.length <= SKILL_CATALOG_LINE_MAX &&
+        !prompt.includes('### 技能：'),
+      catalogSeg,
+    )
+  }
+
+  // K3: Chinese keyword hit → body lands; section sits between 【交接】 and
+  // 【群聊规则】 (head, never the transcript — the fold can't eat it).
+  {
+    const prompt = skillPrompt(
+      [mkSkill('alpha', '审查助手', ['审查'], 'MARK-ALPHA-BODY 审查清单正文')],
+      ['alpha'],
+      [msg('m1', '这次改动请帮忙审查一下', 1)],
+      { handoff: handoffStub },
+    )
+    const at = prompt.indexOf('【技能】')
+    check(
+      'K3 关键词命中（中文）→ 正文出现；段在【交接】之后、【群聊规则】之前',
+      at > prompt.indexOf('【交接】') &&
+        at < prompt.indexOf('【群聊规则】') &&
+        prompt.includes('### 技能：alpha') &&
+        prompt.includes('MARK-ALPHA-BODY'),
+      '',
+    )
+  }
+
+  // K4: explicit @skill:NAME, case-insensitive, no keyword in the message
+  // ('code-review' the token would substring-match keyword 'review' — the
+  // fixture uses a disjoint keyword so ONLY the explicit path can fire).
+  {
+    const prompt = skillPrompt(
+      [mkSkill('code-review', '审查清单', ['审查'], 'MARK-EXPLICIT-BODY')],
+      ['code-review'],
+      [msg('m1', '请按 @skill:CODE-REVIEW 的流程来执行', 1)],
+    )
+    check(
+      'K4 @skill:code-review 显式命中（大小写不敏感，无关键词）→ 正文出现',
+      prompt.includes('### 技能：code-review') && prompt.includes('MARK-EXPLICIT-BODY'),
+      '',
+    )
+  }
+
+  // K5: the checkbox is the hard gate — an UNchecked skill injects nothing,
+  // neither by its keyword nor by an explicit @skill: (越权拒绝).
+  {
+    const prompt = skillPrompt(
+      [mkSkill('alpha', 'A 技能', ['alpha'], 'MARK-ALPHA-BODY'), mkSkill('beta', 'B 技能', ['beta'], 'MARK-BETA-BODY')],
+      ['beta'],
+      [msg('m1', '提到 alpha 关键词，并显式 @skill:alpha 想拉它进来', 1)],
+    )
+    check(
+      'K5 未勾选的技能即使关键词命中也不注入（勾选是硬门）',
+      !prompt.includes('### 技能：alpha') &&
+        !prompt.includes('MARK-ALPHA-BODY') &&
+        !prompt.includes('- 技能目录：alpha') &&
+        !prompt.includes('（A 技能）') &&
+        prompt.includes('- 技能目录：beta') &&
+        prompt.includes('已勾选 1 个'),
+      '',
+    )
+  }
+
+  // K6: @skill: inside code spans / fences is NOT a call — visibleText is
+  // the seam (same boundary as @名字). The control line proves the same
+  // token in prose WOULD inject, so this is a boundary test, not a no-op.
+  {
+    const quoted = skillPrompt(
+      [mkSkill('code-review', '审查清单', ['审查'], 'MARK-CODE-BODY')],
+      ['code-review'],
+      [msg('m1', '示例：`@skill:code-review` 不会触发；围栏里也一样：\n```\n@skill:code-review\n```\n就这些。', 1)],
+    )
+    check('K6 代码块/行内代码里的 @skill: 不注入正文（visibleText 边界）', !quoted.includes('### 技能：code-review') && !quoted.includes('MARK-CODE-BODY'), '')
+    const prose = skillPrompt(
+      [mkSkill('code-review', '审查清单', ['审查'], 'MARK-CODE-BODY')],
+      ['code-review'],
+      [msg('m1', '请按 @skill:code-review 的流程来执行', 1)],
+    )
+    check('K6b 对照组：同一 token 写在正文里则注入', prose.includes('### 技能：code-review') && prose.includes('MARK-CODE-BODY'), '')
+  }
+
+  // K7: a 5000-char body injects capped at SKILL_BODY_MAX, ellipsis-terminated.
+  {
+    const prompt = skillPrompt(
+      [mkSkill('long-one', '长技能', ['长文'], 'X'.repeat(4_996) + 'TAIL')],
+      ['long-one'],
+      [msg('m1', '这里有一篇长文需要处理', 1)],
+    )
+    check(
+      'K7 单条正文超长 → 注入体 ≤ SKILL_BODY_MAX 且以 … 结尾',
+      prompt.includes('### 技能：long-one') &&
+        prompt.includes('X'.repeat(SKILL_BODY_MAX - 1) + '…') &&
+        !prompt.includes('TAIL'),
+      '',
+    )
+  }
+
+  // K8: three 2000-char skills all hit → total budget stops at #1, the
+  // 预算用尽 marker lists the skipped names, the ceiling still holds, and
+  // the section survives a transcript fold (head placement).
+  {
+    const catalog = [
+      mkSkill('skill-a', 'A 技能', ['预算a'], body('A')),
+      mkSkill('skill-b', 'B 技能', ['预算b'], body('B')),
+      mkSkill('skill-c', 'C 技能', ['预算c'], body('C')),
+    ]
+    const messages = [msg('m1', '关键词：预算a、预算b、预算c 全部命中', 1)]
+    const prompt = skillPrompt(catalog, ['skill-a', 'skill-b', 'skill-c'], messages)
+    const at = prompt.indexOf('【技能】')
+    const section = prompt.slice(at, prompt.indexOf('\n【群聊规则】'))
+    check(
+      'K8 三条 2000 字全命中 → 整段 ≤ SKILLS_TOTAL_MAX，恰 1 条正文 + 预算用尽标记列出未注入者',
+      section.length <= SKILLS_TOTAL_MAX &&
+        prompt.split('### 技能：').length - 1 === 1 &&
+        prompt.includes('### 技能：skill-a') &&
+        prompt.includes('A'.repeat(2_000)) &&
+        prompt.includes('（技能正文预算用尽，未注入：skill-b、skill-c）') &&
+        prompt.length <= MAX_TOTAL_PROMPT + 30,
+      `section.length=${section.length}`,
+    )
+    const flooded = skillPrompt(
+      catalog,
+      ['skill-a', 'skill-b', 'skill-c'],
+      // The newest (trigger) message carries the keywords; the rest are bulk
+      // that only pushes the transcript over the fold budget.
+      [
+        ...Array.from({ length: 11 }, (_, i) => msg(`mf${i}`, 'y'.repeat(3_000) + `NEW-${i}`, 12 - i)),
+        msg('mf11', 'y'.repeat(3_000) + 'NEW-11 关键词：预算a、预算b、预算c 全部命中', 1),
+      ],
+      { resumed: true },
+    )
+    check(
+      'K8b 大 transcript 触发折叠时【技能】仍在（head 段，吃不掉）',
+      flooded.includes('〔已折叠') && flooded.includes('【技能】') && flooded.includes('（技能正文预算用尽，未注入：skill-b、skill-c）'),
+      '',
+    )
+    // Resumed turns match ONLY post-cursor messages (the same corpus the
+    // transcript renders) — a keyword in pre-cursor history must not fire.
+    const alpha = mkSkill('alpha', '审查助手', ['审查'], 'MARK-ALPHA-BODY')
+    const newer = msg('m2', '新消息没有关键词', 1)
+    const older = msg('m1', '旧消息里有审查关键词', 5)
+    const cursor = { at: newer.createdAt - 1, seq: 0 }
+    check(
+      'K8c 续传轮只按游标之后的消息做关键词源（游标前的命中不算）',
+      !skillPrompt([alpha], ['alpha'], [older, newer], { resumed: true, since: cursor }).includes('### 技能：alpha'),
+      '',
+    )
+    const newerHit = msg('m2', '新消息里有审查关键词', 1)
+    const olderMiss = msg('m1', '旧消息没有关键词', 5)
+    check(
+      'K8d 续传轮游标之后的命中照常注入',
+      skillPrompt([alpha], ['alpha'], [olderMiss, newerHit], { resumed: true, since: { at: newerHit.createdAt - 1, seq: 0 } }).includes(
+        '### 技能：alpha',
+      ),
+      '',
+    )
+  }
+
+  // K9: the parser — array/comma keywords, junk rejection, BOM/CRLF.
+  {
+    check(
+      'K9 keywords 支持数组与逗号串；单字关键词被丢弃',
+      JSON.stringify(parseSkillFile('a.md', '---\nname: a\nkeywords: [Alpha, 卡塔, x]\n---\n正文').keywords) ===
+        JSON.stringify(['alpha', '卡塔']) &&
+        JSON.stringify(parseSkillFile('b.md', '---\nname: b\nkeywords: 审查, kata, 词\n---\n正文').keywords) ===
+          JSON.stringify(['审查', 'kata']),
+      '',
+    )
+    check(
+      'K9 缺 name / 无 frontmatter / 坏 YAML / 非法 name → null',
+      parseSkillFile('c.md', '---\ndescription: 没有名字\n---\n正文') === null &&
+        parseSkillFile('d.md', '# 普通文档\n没有 frontmatter') === null &&
+        parseSkillFile('e.md', '---\nname: [unclosed\n---\n正文') === null &&
+        parseSkillFile('f.md', '---\nname: has space\n---\n正文') === null,
+      '',
+    )
+    const bom = parseSkillFile('g.md', '\uFEFF---\r\nname: bom\r\nkeywords: bomkey\r\n---\r\nCRLF 正文')
+    check('K9 BOM + CRLF 可读', bom !== null && bom.name === 'bom' && bom.body === 'CRLF 正文', JSON.stringify(bom))
+    check('K9 空正文合法（只能被显式 @ 到）', parseSkillFile('h.md', '---\nname: h\n---\n').body === '')
+
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'ac-skills-check-'))
+    writeFileSync(join(dir, 'a.md'), '---\nname: dup\n---\n第一个')
+    writeFileSync(join(dir, 'b.md'), '---\nname: dup\n---\n第二个')
+    writeFileSync(join(dir, 'ignored.txt'), '---\nname: txt\n---\n不是 md')
+    writeFileSync(join(dir, 'huge.md'), `---\nname: huge\n---\n${'x'.repeat(64_001)}`)
+    mkdirSync(join(dir, 'nested'))
+    writeFileSync(join(dir, 'nested', 'z.md'), '---\nname: nested\n---\n嵌套目录里的')
+    const loaded = loadSkills(dir)
+    check(
+      'K9 loadSkills：重名先到先得（按文件名序）、非 .md 与超大文件跳过、不递归',
+      loaded.length === 1 &&
+        loaded[0].name === 'dup' &&
+        loaded[0].body === '第一个' &&
+        !loaded.some((skill) => skill.name === 'nested'),
+      JSON.stringify(loaded.map((skill) => skill.name)),
+    )
+    check(
+      'K9 空目录 / 不存在的目录 → [] 不抛',
+      loadSkills(mkdtempSync(join(tmpdir(), 'ac-skills-empty-'))).length === 0 &&
+        loadSkills(join(tmpdir(), 'ac-skills-missing-nope')).length === 0,
+      '',
+    )
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      /* Windows EBUSY, same treatment as the memory section */
+    }
+  }
+
+  // K10: the shipped example skill — the real repo `skills/` directory.
+  {
+    const { fileURLToPath } = await import('node:url')
+    const repoSkills = loadSkills(fileURLToPath(new URL('../skills', import.meta.url)))
+    const codeReview = repoSkills.find((skill) => skill.name === 'code-review')
+    check(
+      'K10 仓库 skills/ 解析出 code-review（frontmatter 完整、关键词含 review/审查）',
+      repoSkills.length >= 1 &&
+        codeReview !== undefined &&
+        codeReview.description.length > 0 &&
+        codeReview.keywords.includes('review') &&
+        codeReview.keywords.includes('审查') &&
+        codeReview.body.trim().length > 0 &&
+        codeReview.body.length <= 1_000,
+      JSON.stringify(repoSkills.map((skill) => skill.name)),
+    )
+    // Determinism: same inputs, same plan (catalog order, not checkbox order).
+    const catalog = [
+      mkSkill('b-skill', 'B', ['kb'], 'BB'),
+      mkSkill('a-skill', 'A', ['ka'], 'AA'),
+    ]
+    const planA = planSkills({ catalog: [...catalog].sort((x, y) => (x.name < y.name ? -1 : 1)), selected: ['a-skill', 'b-skill'], text: 'kb ka', explicitText: '' })
+    const planB = planSkills({ catalog: [...catalog].sort((x, y) => (x.name < y.name ? -1 : 1)), selected: ['b-skill', 'a-skill'], text: 'kb ka', explicitText: '' })
+    check(
+      'K10b 同输入同输出：勾选顺序不影响注入顺序（按目录 name 序）',
+      JSON.stringify(planA?.lines) === JSON.stringify(planB?.lines) &&
+        planA?.injected.join() === 'a-skill,b-skill',
+      JSON.stringify(planA?.lines),
+    )
+  }
+}
+
 if (failed) {
   console.log(`\n${failed} case(s) failed`)
   process.exitCode = 1
-} else {
-  console.log('\nOK: prompt transcript contract passed (delivery + bound + budget + ceiling + override + memory retrieval)')
+  } else {
+  console.log('\nOK: prompt transcript contract passed (delivery + bound + budget + ceiling + override + memory retrieval + handoff + skills)')
 }

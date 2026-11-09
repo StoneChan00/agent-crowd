@@ -9,6 +9,7 @@ export type {
   Message,
   MessageMeta,
   Room,
+  Skill,
   Task,
   TaskStatus,
   ToolTrace,
@@ -16,6 +17,9 @@ export type {
   Turn,
   TurnTokens,
 } from '../../server/types.ts'
+
+/** One skills/*.md entry WITHOUT the body — the editor's checkbox list item (B07). */
+export type SkillInfo = Omit<import('../../server/types.ts').Skill, 'body'>
 
 export interface HarnessInfo {
   label: string
