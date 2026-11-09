@@ -111,6 +111,8 @@ export function CharacterEditor({
   const [memoryBusy, setMemoryBusy] = useState(false)
   /** B07: the skills/ catalog for the checkbox list; null = still loading. */
   const [skillOptions, setSkillOptions] = useState<SkillInfo[] | null>(null)
+  /** B07: the catalog request failed — NOT the same as an empty directory. */
+  const [skillsLoadFailed, setSkillsLoadFailed] = useState(false)
 
   const isExistingRoomCharacter = mode === 'room' && character && 'roomId' in character
 
@@ -136,30 +138,45 @@ export function CharacterEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isExistingRoomCharacter, room?.id, character?.id])
 
-  // B07: the skills catalog is a room-mode-only picker. A failed / empty
-  // load is a normal state (no skills/ directory yet) — an empty list with
-  // a hint, never a broken editor.
+  // B07: the skills catalog is a room-mode-only picker. An EMPTY catalog is
+  // a normal state (no skills/ directory yet) — hint where to put files. A
+  // FAILED request is a different state: the checked names may still be
+  // perfectly fine, so they render as plain checked rows, never as 缺失.
   useEffect(() => {
     if (mode !== 'room') {
       setSkillOptions(null)
+      setSkillsLoadFailed(false)
       return
     }
     let cancelled = false
     api
       .skills()
       .then((data) => {
-        if (!cancelled) setSkillOptions(data.skills)
+        if (!cancelled) {
+          setSkillOptions(data.skills)
+          setSkillsLoadFailed(false)
+        }
       })
       .catch(() => {
-        if (!cancelled) setSkillOptions([])
+        if (!cancelled) {
+          setSkillOptions([])
+          setSkillsLoadFailed(true)
+        }
       })
     return () => {
       cancelled = true
     }
   }, [mode])
 
-  const toggleSkill = (name: string) =>
-    set('skills', draft.skills.includes(name) ? draft.skills.filter((item) => item !== name) : [...draft.skills, name])
+  // Skill keys compare case-insensitively everywhere: the db canonicalizes
+  // stored selections to lowercase, and a catalog name may carry its
+  // original case ('Code-Review') — `code-review`/`Code-Review` is one
+  // skill, not a checked-plus-missing pair (B07 review, non-blocking 3).
+  const skillKey = (name: string) => name.trim().toLowerCase()
+  const toggleSkill = (name: string) => {
+    const key = skillKey(name)
+    set('skills', draft.skills.includes(key) ? draft.skills.filter((item) => item !== key) : [...draft.skills, key])
+  }
 
   const suggestions = models[draft.harness] ?? []
   const harnessInfo = harnesses[draft.harness]
@@ -576,6 +593,18 @@ export function CharacterEditor({
           </p>
           {skillOptions === null ? (
             <p className="field-hint">技能目录加载中…</p>
+          ) : skillsLoadFailed ? (
+            <>
+              <p className="field-hint">技能目录加载失败（服务端/网络错误）：下面只列出已勾选项，不影响保存。</p>
+              <div className="skill-checks">
+                {draft.skills.map((name) => (
+                  <label key={name} className="skill-check">
+                    <input type="checkbox" checked onChange={() => toggleSkill(name)} />
+                    <span className="skill-name">{name}</span>
+                  </label>
+                ))}
+              </div>
+            </>
           ) : skillOptions.length === 0 ? (
             <p className="field-hint">还没有可用技能：在仓库 skills/ 目录下添加 .md 技能文件（frontmatter 带 name/description/keywords）。</p>
           ) : (
@@ -584,7 +613,7 @@ export function CharacterEditor({
                 <label key={skill.name} className="skill-check">
                   <input
                     type="checkbox"
-                    checked={draft.skills.includes(skill.name)}
+                    checked={draft.skills.includes(skillKey(skill.name))}
                     onChange={() => toggleSkill(skill.name)}
                   />
                   <span className="skill-name">{skill.name}</span>
@@ -592,7 +621,7 @@ export function CharacterEditor({
                 </label>
               ))}
               {draft.skills
-                .filter((name) => !skillOptions.some((skill) => skill.name === name))
+                .filter((name) => !skillOptions.some((skill) => skillKey(skill.name) === name))
                 .map((name) => (
                   <label key={name} className="skill-check is-missing">
                     <input type="checkbox" checked onChange={() => toggleSkill(name)} />

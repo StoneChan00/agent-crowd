@@ -486,8 +486,11 @@ function sanitizeAliases(input: unknown, name: string): string[] {
 /**
  * B07: read-side defense for characters.skills. Legacy rows predate the
  * column (default '[]'), and hand-edited JSON can be anything — bad JSON, a
- * non-array, non-string or empty elements. Nothing here may stop the
- * character from loading: junk elements are dropped, the rest survives.
+ * non-array, non-string, empty or whitespace-only elements. Nothing here may
+ * stop the character from loading: junk elements are dropped, the rest
+ * survives. Keys are canonicalized to lowercase — the skill matcher is
+ * case-insensitive, so `code-review` and `Code-Review` must read as ONE
+ * entry, never a checked-plus-missing pair (B07 review, non-blocking 3).
  */
 function parseSkillsColumn(raw: unknown): string[] {
   if (typeof raw !== 'string' || raw.trim() === '') return []
@@ -501,10 +504,11 @@ function parseSkillsColumn(raw: unknown): string[] {
   const seen = new Set<string>()
   const out: string[] = []
   for (const entry of parsed) {
-    if (typeof entry !== 'string' || entry === '') continue
-    if (seen.has(entry)) continue
-    seen.add(entry)
-    out.push(entry)
+    if (typeof entry !== 'string') continue
+    const name = entry.trim().toLowerCase()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    out.push(name)
   }
   return out
 }
@@ -513,13 +517,14 @@ function parseSkillsColumn(raw: unknown): string[] {
  * B07: write-side normalization for a skills selection — trim, drop
  * empties, dedupe, preserve order, ≤32 entries, each sliced at 64 chars
  * (the skill-name grammar cap, so a hand-edited long name still matches a
- * real catalog entry after the slice).
+ * real catalog entry after the slice). Keys lowercase for the same reason
+ * as parseSkillsColumn above.
  */
 function normalizeSkills(input: string[] | undefined): string[] {
   const seen = new Set<string>()
   const out: string[] = []
   for (const entry of input ?? []) {
-    const name = String(entry).trim().slice(0, 64)
+    const name = String(entry).trim().slice(0, 64).toLowerCase()
     if (!name || seen.has(name) || out.length >= 32) continue
     seen.add(name)
     out.push(name)

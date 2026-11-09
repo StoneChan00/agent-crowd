@@ -30,15 +30,32 @@ export const SKILL_FILE_MAX_BYTES = 64_000
 /**
  * The one-token grammar a skill name must fit — the SAME character class as
  * room call-names (CALL_NAME_SOURCE in mentions.ts), so an `@skill:name`
- * target is always a single @-able token and the explicit-match regex below
- * can share the class.
+ * target is always a single @-able token.
  */
 const SKILL_NAME = /^[A-Za-z0-9_\-\u4e00-\u9fff]{1,64}$/
 
-/** `@skill:name` in prose: bounded like a call-name so `@skill:foo-bar` is one
- *  token. MatchAll-only (it clones the regex, so this shared literal keeps no
- *  lastIndex state between turns). */
-const SKILL_EXPLICIT = /(?<![A-Za-z0-9_])@skill:([A-Za-z0-9_\-\u4e00-\u9fff]{1,64})/g
+/** Regex-literal escape for building the explicit-match alternation. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * The explicit `@skill:` matcher (B07 review P1-1): an alternation of the
+ * KNOWN, CHECKED skill names — never a generic name-capture class. Two real
+ * bugs that shape fixed: `@SKILL:…` (prefix must be case-insensitive, so the
+ * pattern carries the `i` flag), and `请按@skill:code-review的流程来` —
+ * Chinese writes no space after the name, so a CJK character class in the
+ * capture would swallow 「的流程」 and miss the catalog. Longest name first,
+ * so overlapping known names resolve to the longest; the RIGHT boundary
+ * excludes a longer LATIN continuation (`[A-Za-z0-9_-]`, so `@skill:code`
+ * does not match the skill `code` when `code-review` follows) but ALLOWS
+ * CJK after the name — the left boundary mirrors the @-mention grammar.
+ */
+function explicitMatcher(names: string[]): RegExp | null {
+  if (names.length === 0) return null
+  const ordered = [...names].sort((a, b) => b.length - a.length)
+  return new RegExp(`(?<![A-Za-z0-9_])@skill:(${ordered.map(escapeRegExp).join('|')})(?![A-Za-z0-9_-])`, 'gi')
+}
 
 /** Warn-once bookkeeping (module scope): a bad file logs once, not every turn. */
 const warnedPaths = new Set<string>()
@@ -205,8 +222,11 @@ export function planSkills(input: {
   let used = title.length + 1 + catalogLine.length
 
   const explicitNames = new Set<string>()
-  for (const match of input.explicitText.matchAll(SKILL_EXPLICIT)) {
-    explicitNames.add(match[1].toLowerCase())
+  const explicit = explicitMatcher(available.map((skill) => skill.name))
+  if (explicit) {
+    for (const match of input.explicitText.matchAll(explicit)) {
+      explicitNames.add(match[1].toLowerCase())
+    }
   }
   const text = input.text.toLowerCase()
   const hits = available.filter(

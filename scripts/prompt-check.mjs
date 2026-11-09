@@ -699,6 +699,33 @@ const mark = (tag) => `⟪${tag}⟫`
         !prompt.includes('### 技能：'),
       catalogSeg,
     )
+    // K2b/K2c (B07 review P1-2): the caps above are pinned to LITERAL
+    // contract values on purpose — the imported constants would grade the
+    // implementation with itself (bump them to 10_000 and nothing fails).
+    // 30 long descriptions: the natural line runs far past the 400-char
+    // contract — the catalog line must come back ellipsized and SHORTER
+    // than the natural concatenation.
+    const many = Array.from({ length: 30 }, (_, i) => mkSkill(`skill-${String(i).padStart(2, '0')}`, '长'.repeat(60), [], 'X'))
+    const manyPrompt = skillPrompt(many, many.map((skill) => skill.name), [msg('m1', '普通聊天，不含关键词', 1)])
+    const manyAt = manyPrompt.indexOf('- 技能目录：')
+    const manySeg = manyPrompt.slice(manyAt, manyPrompt.indexOf('\n', manyAt))
+    const naturalLine = `- 技能目录：${many.map((skill) => `${skill.name}（${skill.description}）`).join('、')}`
+    check(
+      'K2b 目录行硬上限 400：30 个长描述技能 → 单行截断以 … 结尾，明显短于自然拼接',
+      manySeg.endsWith('…') && manySeg.length <= 400 && manySeg.length < naturalLine.length,
+      `seg=${manySeg.length} natural=${naturalLine.length}`,
+    )
+    // One 118-char description: the entry itself must cap at 40 (39 chars +
+    // …) — the tail marker must not survive into the catalog line.
+    const longDesc = mkSkill('desc-check', 'D'.repeat(110) + 'TAILMARK', [], 'X')
+    const descPrompt = skillPrompt([longDesc], ['desc-check'], [msg('m1', '普通聊天，不含关键词', 1)])
+    const descAt = descPrompt.indexOf('- 技能目录：')
+    const descSeg = descPrompt.slice(descAt, descPrompt.indexOf('\n', descAt))
+    check(
+      'K2c 目录条目 description 硬上限 40：118 字描述 → 39 字 + …，尾巴标记不出现',
+      descSeg.includes('D'.repeat(39) + '…') && !descSeg.includes('TAILMARK'),
+      descSeg,
+    )
   }
 
   // K3: Chinese keyword hit → body lands; section sits between 【交接】 and
@@ -725,14 +752,30 @@ const mark = (tag) => `⟪${tag}⟫`
   // ('code-review' the token would substring-match keyword 'review' — the
   // fixture uses a disjoint keyword so ONLY the explicit path can fire).
   {
-    const prompt = skillPrompt(
-      [mkSkill('code-review', '审查清单', ['审查'], 'MARK-EXPLICIT-BODY')],
-      ['code-review'],
-      [msg('m1', '请按 @skill:CODE-REVIEW 的流程来执行', 1)],
-    )
+    const catalog = [mkSkill('code-review', '审查清单', ['审查'], 'MARK-EXPLICIT-BODY')]
+    const selected = ['code-review']
+    const prompt = skillPrompt(catalog, selected, [msg('m1', '请按 @skill:CODE-REVIEW 的流程来执行', 1)])
     check(
       'K4 @skill:code-review 显式命中（大小写不敏感，无关键词）→ 正文出现',
       prompt.includes('### 技能：code-review') && prompt.includes('MARK-EXPLICIT-BODY'),
+      '',
+    )
+    // K4b (B07 review P1-1): the @skill: PREFIX itself is case-insensitive —
+    // @SKILL: is the same call. The old regex lacked the i flag.
+    const upperPrefix = skillPrompt(catalog, selected, [msg('m1', '请按 @SKILL:code-review 的流程来执行', 1)])
+    check(
+      'K4b @SKILL: 大写前缀同样命中（前缀大小写不敏感）',
+      upperPrefix.includes('### 技能：code-review') && upperPrefix.includes('MARK-EXPLICIT-BODY'),
+      '',
+    )
+    // K4c (B07 review P1-1): Chinese doesn't space after the name — the
+    // match must not swallow 「的流程」. A generic name-class regex eats the
+    // CJK suffix and misses the catalog; matching KNOWN names with a
+    // Latin-only right boundary lets CJK follow the name.
+    const noSpace = skillPrompt(catalog, selected, [msg('m1', '请按@skill:code-review的流程来执行', 1)])
+    check(
+      'K4c 名字后紧跟中文（无空格）不吞字 → 命中',
+      noSpace.includes('### 技能：code-review') && noSpace.includes('MARK-EXPLICIT-BODY'),
       '',
     )
   }

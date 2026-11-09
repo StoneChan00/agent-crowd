@@ -355,15 +355,16 @@ export function buildTurnPromptDetailed(input: {
   // transcript renders): keywords read the raw contents, `@skill:` reads
   // visibleText() output so code spans / fences don't count (the same
   // boundary as an @name call), and only messages whose raw text contains
-  // "@skill:" get markdown-parsed — a fast path, not a per-message parse of
-  // the whole history. `character.skills ?? []` keeps legacy fixtures
-  // (pre-B07 rows / test literals) loadable.
+  // "@skill:" (case-insensitively — @SKILL: is the same call, B07 review
+  // P1-1) get markdown-parsed — a fast path, not a per-message parse of the
+  // whole history. `character.skills ?? []` keeps legacy fixtures (pre-B07
+  // rows / test literals) loadable.
   const skillsPlan = planSkills({
     catalog: input.skills ?? [],
     selected: character.skills ?? [],
     text: visible.map((message) => message.content).join('\n'),
     explicitText: visible
-      .filter((message) => message.content.includes('@skill:'))
+      .filter((message) => message.content.toLowerCase().includes('@skill:'))
       .map((message) => visibleText(message.content))
       .join('\n'),
   })
