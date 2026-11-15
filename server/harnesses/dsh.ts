@@ -139,6 +139,41 @@ function writeRuntime(character: Character): DshRuntime {
   return { patchPath, provider, model }
 }
 
+/**
+ * dsh run argv, assembled in one pure function (the P0-1 codex lesson: the
+ * assembly point is what a dropped permission flag slips through silently).
+ *
+ * autoApprove → `--permission-mode danger-full-access`, dsh's counterpart of
+ * the other harnesses' skip-permissions flags: it selects the permission
+ * preset that bundles the danger-full-access sandbox with the never approval
+ * policy. Without it the headless default is workspace-write + ask — and in
+ * a one-shot run "ask" can only deny, while the sandbox's Windows ACL
+ * (SetNamedSecurityInfoW) gates even in-workspace process spawns, which is
+ * exactly why auto-approve-on dsh characters still saw `npm test` die with
+ * spawn EPERM before this wiring existed.
+ */
+export function buildDshArgs({
+  argsPrefix,
+  patchPath,
+  autoApprove,
+  prompt,
+}: {
+  argsPrefix: string[]
+  patchPath: string
+  autoApprove: boolean
+  prompt: string
+}): string[] {
+  return [
+    ...argsPrefix,
+    '--profile',
+    'headless',
+    '--patch',
+    patchPath,
+    ...(autoApprove ? ['--permission-mode', 'danger-full-access'] : []),
+    prompt,
+  ]
+}
+
 interface Attempt {
   result: ProcessResult
   text: string
@@ -158,7 +193,12 @@ async function attemptRun(
 
   const result = await runProcess(
     spec.command,
-    [...spec.argsPrefix, '--profile', 'headless', '--patch', runtime.patchPath, input.prompt],
+    buildDshArgs({
+      argsPrefix: spec.argsPrefix,
+      patchPath: runtime.patchPath,
+      autoApprove: input.character.autoApprove,
+      prompt: input.prompt,
+    }),
     {
       cwd: input.cwd,
       signal: input.signal,

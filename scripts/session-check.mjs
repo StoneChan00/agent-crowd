@@ -54,6 +54,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { buildClaudeArgs } from '../server/harnesses/claude.ts'
 import { buildCodexArgs } from '../server/harnesses/codex.ts'
+import { buildDshArgs } from '../server/harnesses/dsh.ts'
 import { buildOpencodeLikeArgs } from '../server/harnesses/opencodeLike.ts'
 import { getAdapter } from '../server/harnesses/index.ts'
 import {
@@ -686,6 +687,19 @@ function scenarioFullArgv() {
     'P3 cannbot 续传 argv（--session + 其 bypass 旗标）',
     buildOpencodeLikeArgs({ argsPrefix: [], resumeId: 'sid-3', autoApprove: true, autoApproveFlag: '--dangerously-skip-permissions', model: '', cwd: WD, prompt: P }),
     ['run', '--format', 'json', '--session', 'sid-3', '--dangerously-skip-permissions', '--dir', WD, P],
+  )
+
+  // dsh — autoApprove selects the danger-full-access permission preset (the
+  // flag-less default is headless's own workspace-write + ask).
+  eq(
+    'P3 dsh 全量 argv（autoApprove → danger-full-access 预设）',
+    buildDshArgs({ argsPrefix: ['node', 'bin.js'], patchPath: 'C:/rt/patch.yml', autoApprove: true, prompt: P }),
+    ['node', 'bin.js', '--profile', 'headless', '--patch', 'C:/rt/patch.yml', '--permission-mode', 'danger-full-access', P],
+  )
+  eq(
+    'P3 dsh 全量 argv（非 autoApprove 无权限旗标，保持 headless 默认沙箱）',
+    buildDshArgs({ argsPrefix: [], patchPath: 'C:/rt/patch.yml', autoApprove: false, prompt: P }),
+    ['--profile', 'headless', '--patch', 'C:/rt/patch.yml', P],
   )
 }
 

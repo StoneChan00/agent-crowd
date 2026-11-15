@@ -13,7 +13,7 @@
 
 ![Agent Crowd 界面](docs/screenshot.png)
 
-> 截图是示例房间跑的一轮真实协作：开发者（CANNBot / glm-5.3）建好文件后发消息，审查者（DeepSeek Harness / deepseek-flash）自动接手并逐项 review。（截图摄于旧版角色名时期，现默认阵容为 GLM / DeepSeek / Qwen / Claude / GPT。）
+> 截图是示例房间跑的一轮真实协作：开发者（CANNBot / glm-5.3）建好文件后发消息，审查者（DeepSeek Harness / deepseek-flash）自动接手并逐项 review。（截图摄于旧版角色名与自动接力时期；现默认阵容为 GLM / DeepSeek / Qwen / Claude / GPT，GLM→DeepSeek 的 review 改为 @点名。）
 
 ---
 
@@ -88,6 +88,8 @@ pnpm serve        # = vite build + tsx server/index.ts
 
 注意：**用户消息不走这张表**——它严格按 @ 路由（`@名字` / `@别名` / `@all`），没人被 @ 时由第一个启用的角色接手；表里的规则只决定角色发言后的接力。「每轮结束后总结」是唯一不在接力链上的规则：它在轮次收尾时触发，而不是某次发言之后。
 
+工作目录在 git 仓库内的房间，轮次干净收尾（review PASS、验证未失败）时，本轮的代码改动会由服务器**自动提交为一个 commit**：主题带交付摘要（`auto:` 前缀），正文带改动清单与 review 结论；被 `.gitignore` 的文件自动跳过，你预先暂存的其他内容不会混进 auto 提交。**push 永远不会自动执行**——需要推送时在群里说一声（任意角色都能执行 `git push`），或自己推。手动停止或被门禁拦截的轮次不提交。
+
 `单轮接力上限`（默认 6）限制的是**角色之间的接力层数**：你和 @ 点名（含 @all）、▶ 发言等直接唤起的角色都算第 1 层、不受上限约束，只有角色接力才逐层 +1，防止互相刷屏。
 
 ## 每个 harness 是怎么接进来的
@@ -117,6 +119,8 @@ dsh --profile headless --patch <每角色生成的 patch.yml> "<prompt>"
 ```
 
 **模型覆盖**：headless 的模型来自 `agent-default-model`，所以每个角色每回合会生成一个 `--patch` 覆盖层，写入该角色的 provider/model（`deepseek-flash` 会补成 `deepseek-official/deepseek-flash`）。
+
+**权限**：headless 默认沙箱是 `workspace-write`（工作区外只读、进程受限），且「自动批准」开关在 0.2.x 的 dsh 上原生对应 `--permission-mode danger-full-access` 预设（沙箱全开 + 审批 never）。角色的「自动批准工具调用」勾选时适配器会带上该旗标；不勾则维持 dsh 自己的默认沙箱。全局放开也可以：启动 agent-crowd 的终端里设 `$env:DSH_PERMISSION_MODE="danger-full-access"`（dsh 官方的环境变量通道，作用于所有 dsh 回合）。
 
 > DSH 0.2 把文件型 settings 插件（`dsh-settings-file`）换成了抽象 settings seam。适配器会检测当前安装的版本：老版本额外复制 `~/.dsh/settings.yaml` 并重定向 settings provider；0.2+ 只写 `agent-default-model`，不再依赖 settings 文件。
 
