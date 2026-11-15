@@ -77,3 +77,37 @@ export function triggerSummary(character: Character | CharacterPreset, members: 
 export function uid(prefix = 'tmp'): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}`
 }
+
+/** #e9ebf0 == var(--text): the light tone too-dark colors are lifted toward. */
+const TEXT_TINT = '#e9ebf0'
+/** WCAG relative-luminance floor: below this a text color is under ~4.6:1 on --bg. */
+const TEXT_FLOOR = 0.2
+
+/** WCAG relative luminance of a 3- or 6-digit hex color; null if not one. */
+function relativeLuminance(color: string): number | null {
+  const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim())
+  if (!match) return null
+  const digits = match[1].length === 3
+    ? match[1].split('').map((ch) => ch + ch).join('')
+    : match[1]
+  const channel = (start: number) => {
+    const value = parseInt(digits.slice(start, start + 2), 16) / 255
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+  }
+  return 0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+}
+
+/**
+ * Dark-theme text floor for character colors used as *text* (names, @chips).
+ * A color below the luminance floor (e.g. the palette's black on --bg near
+ * #0b0c10) is lifted with a color-mix toward the light text tone, keeping 40%
+ * of the original tint. Readable colors pass through unchanged; unparseable
+ * values (named colors, rgb(), garbage) pass through untouched rather than
+ * guessed at. Avatars and bubble decorations keep the raw color — only text
+ * goes through here.
+ */
+export function readableTextColor(color: string): string {
+  const luminance = relativeLuminance(color)
+  if (luminance === null || luminance >= TEXT_FLOOR) return color
+  return `color-mix(in srgb, ${color} 40%, ${TEXT_TINT})`
+}

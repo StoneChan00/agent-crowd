@@ -41,7 +41,7 @@ const AVATARS = [
   '🐙', '🐟', '🦊', '🐼', '⚡', '🧭', '📚', '🐉',
 ]
 
-const COLORS = ['#f97316', '#8b76f6', '#4f9cf9', '#2dd4bf', '#f0a75a', '#f472b6', '#a3e635', '#f87171']
+const COLORS = ['#f97316', '#8b76f6', '#4f9cf9', '#2dd4bf', '#f0a75a', '#f472b6', '#a3e635', '#f87171', '#000000', '#ffffff']
 
 /** Split raw alias input on half/full-width commas, keeping trimmed parts. */
 function parseAliasInput(text: string): string[] {

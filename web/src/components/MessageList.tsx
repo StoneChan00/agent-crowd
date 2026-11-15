@@ -4,7 +4,7 @@ import { MENTION_HREF_PREFIX, markdownRemarkPlugins, mentionTokenFromHref } from
 import { resolveMention } from '../lib/mentions'
 import type { Character, Message } from '../types'
 import { Avatar } from './Avatar'
-import { HARNESS_META, clock, formatDuration, modelShort, tokenSummary } from '../lib/format'
+import { HARNESS_META, clock, formatDuration, modelShort, readableTextColor, tokenSummary } from '../lib/format'
 
 export interface LiveTurn {
   turnId: string
@@ -123,7 +123,10 @@ export function MessageList({
             </div>
             <div className="msg-main">
               <div className="msg-head">
-                <span className="msg-name" style={{ color: liveCharacter?.color }}>
+                <span
+                  className="msg-name"
+                  style={{ color: liveCharacter ? readableTextColor(liveCharacter.color) : undefined }}
+                >
                   {liveCharacter?.name ?? '角色'}
                 </span>
                 {liveCharacter && (
@@ -249,7 +252,7 @@ function MessageRow({
       </div>
       <div className="msg-main">
         <div className="msg-head">
-          <span className="msg-name" style={{ color }}>
+          <span className="msg-name" style={{ color: readableTextColor(color) }}>
             {message.authorName}
           </span>
           {harness && (
@@ -359,7 +362,7 @@ function MentionAt({ token, characters }: { token: string; characters: Character
   return (
     <span
       className="mention-at"
-      style={{ '--c': target.color } as CSSProperties}
+      style={{ '--c': readableTextColor(target.color) } as CSSProperties}
       title={`@${target.name}：会唤醒它接着发言（只想提到、不想唤醒时写成 \`@${target.name}\`）`}
     >
       @{token}

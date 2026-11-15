@@ -44,13 +44,15 @@ pnpm serve        # = vite build + tsx server/index.ts
 
 开发自检：改完代码跑 `npm test`（回归护栏，覆盖回合超时、进程树清理、markdown 换行契约，不依赖 NPU/外部服务）。
 
-首次启动会建一个 SQLite 数据库（`data/agent-crowd.db`）、一个示例房间「开发小队」，以及三个角色库模板：
+首次启动会建一个 SQLite 数据库（`data/agent-crowd.db`）、一个示例房间「开发小队」，以及五个角色库模板：
 
 | 角色 | harness | 模型 | 触发 |
 | --- | --- | --- | --- |
-| 开发者 🛠️ | CANNBot | `cannbot/glm-5.3` | 用户发言后 |
-| 审查者 🔍 | DeepSeek Harness | `deepseek-flash` | 开发者发言后 |
-| 赫尔墨斯 🪽 | Hermes | `deepseek-flash` | 被 @（示例房间中默认停用） |
+| GLM | CANNBot | `cannbot/glm-5.3` | 用户发言后（没人被 @ 时由它接手） |
+| DeepSeek | DeepSeek Harness | `deepseek-flash` | 被 @（点名 review） |
+| Qwen | CANNBot | `cannbot/qwen3.8-max` | 被 @ |
+| Claude | Claude Code | 默认模型 | 被 @（别名：克劳德） |
+| GPT | Codex | 默认模型 | 被 @ |
 
 > 示例房间的工作目录是项目内的 `workspace/`。把它改成你真正想改的代码目录，再发需求。
 
@@ -174,7 +176,7 @@ $env:AC_HERMES_BIN   = "C:\...\hermes.exe"
 | `AC_HOST` | `127.0.0.1` | 监听地址 |
 | `AC_DATA_DIR` | `./data` | SQLite 与运行时文件目录 |
 | `AC_TURN_TIMEOUT_MS` | `3600000` | 单个角色回合超时，支持 `60m` / `45s` / `1.5m` 等写法，非法值回落默认 |
-| `AC_SEED_DEV_MODEL` | `cannbot/glm-5.3` | 示例房间开发者的模型 |
+| `AC_SEED_DEV_MODEL` | `cannbot/glm-5.3` | 示例房间 GLM 的模型 |
 | `AC_CANNBOT_BIN` / `AC_OPENCODE_BIN` / `AC_DSH_BIN` / `AC_HERMES_BIN` | 自动探测 | 覆盖可执行文件路径 |
 | `DSH_HOME` | `~/.dsh` | DSH 配置目录（读取 settings/凭据） |
 

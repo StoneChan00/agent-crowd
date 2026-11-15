@@ -4,6 +4,7 @@ data/
 workspace/
 .probe/
 .edge-profile/
+.omo/
 /shot*.png
 *.log
 .env

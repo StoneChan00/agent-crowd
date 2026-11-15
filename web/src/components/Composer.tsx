@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import type { Character } from '../types'
 import { Avatar } from './Avatar'
+import { readableTextColor } from '../lib/format'
 
 interface ComposerProps {
   characters: Character[]
@@ -231,7 +232,7 @@ export function Composer({
             <button
               key={character.id}
               className="mention-chip"
-              style={{ borderColor: `${character.color}44`, color: character.color }}
+              style={{ borderColor: `${character.color}44`, color: readableTextColor(character.color) }}
               title={character.aliases.length ? `也可 @${character.aliases.join(' / @')} 唤醒` : undefined}
               onClick={() => insertCallName(character.name)}
             >

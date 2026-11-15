@@ -2,6 +2,13 @@ import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { DATA_DIR } from './paths.ts'
+import {
+  SEED_AVATAR_GLM,
+  SEED_AVATAR_DEEPSEEK,
+  SEED_AVATAR_QWEN,
+  SEED_AVATAR_CLAUDE,
+  SEED_AVATAR_GPT,
+} from './seed-avatars.ts'
 import { buildRoundEpisode, escapeLike, ftsQuote, planMemoryQuery, type RoundEpisodeFacts } from './memory.ts'
 import { DEFAULT_TRIGGERS,
   type AuthorType,
@@ -2034,12 +2041,18 @@ function characterToPreset(character: Character, members: Character[]): PresetIn
 
 /* ------------------------------------------------------------------- seed */
 
+/**
+ * Default character library, captured verbatim from the live library on
+ * 2026-11-15 (avatars: server/seed/*.png). Re-capture here if the defaults
+ * should follow a future library edit. GLM keeps the old 开发者 template's
+ * AC_SEED_DEV_MODEL hook (README: 示例房间实现角色的模型).
+ */
 function builtinPresets(): PresetInput[] {
   return [
     {
-      name: '开发者',
-      avatar: '🛠️',
-      color: '#f97316',
+      name: 'GLM',
+      avatar: SEED_AVATAR_GLM,
+      color: '#000000',
       harness: 'cannbot',
       model: process.env.AC_SEED_DEV_MODEL ?? 'cannbot/glm-5.3',
       persona: [
@@ -2050,9 +2063,9 @@ function builtinPresets(): PresetInput[] {
       triggers: { onUser: true },
     },
     {
-      name: '审查者',
-      avatar: '🔍',
-      color: '#8b76f6',
+      name: 'DeepSeek',
+      avatar: SEED_AVATAR_DEEPSEEK,
+      color: '#4f9cf9',
       harness: 'dsh',
       model: 'deepseek-flash',
       persona: [
@@ -2061,16 +2074,37 @@ function builtinPresets(): PresetInput[] {
         '输出结构化的 review：先说结论（通过 / 需修改），再列具体问题（文件:行 + 原因 + 建议），最后给一句总体评价。',
         '如果没有发现问题，也要说明你检查了哪些点。',
       ].join('\n'),
-      triggers: { onUser: false, onCharacterNames: ['开发者'] },
+      // Mention-only by design (the old 审查者 auto-followed 开发者): review
+      // is invoked with an explicit `@DeepSeek`, as in the captured library.
+      triggers: { onUser: false, mention: true },
     },
     {
-      name: '赫尔墨斯',
-      avatar: '🪽',
+      name: 'Qwen',
+      avatar: SEED_AVATAR_QWEN,
       color: '#2dd4bf',
-      harness: 'hermes',
-      model: 'deepseek-flash',
+      harness: 'cannbot',
+      model: 'cannbot/qwen3.8-max',
       persona: '你是团队里的全能助手，擅长查资料、跑命令、整理结论。只在被 @ 时发言。',
       triggers: { onUser: false, mention: true },
+    },
+    {
+      name: 'Claude',
+      aliases: ['克劳德'],
+      avatar: SEED_AVATAR_CLAUDE,
+      color: '#f97316',
+      harness: 'claude',
+      model: '',
+      persona: '你是团队里的全能助手，擅长查资料、跑命令、整理结论。只在被 @ 时发言。',
+      triggers: { onUser: true },
+    },
+    {
+      name: 'GPT',
+      avatar: SEED_AVATAR_GPT,
+      color: '#ffffff',
+      harness: 'codex',
+      model: '',
+      persona: '你是团队里的全能助手，擅长查资料、跑命令、整理结论。只在被 @ 时发言。',
+      triggers: { onUser: true },
     },
   ]
 }
@@ -2139,14 +2173,13 @@ export function seedIfEmpty(defaultWorkingDir: string): void {
 
   const room = createRoom({
     name: '开发小队',
-    topic: '提需求 → 开发者实现 → 审查者 review',
+    topic: '提需求 → GLM 实现 → DeepSeek review',
     workingDir: defaultWorkingDir,
     maxHops: 6,
   })
 
   for (const preset of listPresets()) {
-    const character = createCharacterFromPreset(preset, room.id)
-    if (preset.name === '赫尔墨斯') updateCharacter(character.id, { enabled: false })
+    createCharacterFromPreset(preset, room.id)
   }
 
   addMessage({
@@ -2154,7 +2187,7 @@ export function seedIfEmpty(defaultWorkingDir: string): void {
     authorType: 'system',
     authorName: '系统',
     content:
-      '房间已创建。开发者（CANNBot / glm-5.3）会响应你的每条消息；它发言后，审查者（DeepSeek Harness）会自动接手 review。这些角色都来自「角色库」，可以先去角色库统一维护，再一键加进新房间。',
+      '房间已创建。没人被 @ 时由第一个启用的角色 GLM（CANNBot / glm-5.3）接手；`@DeepSeek` 点名 review，`@Qwen`、`@Claude`、`@GPT` 也在待命（`@克劳德` 是 Claude 的别名）。这些角色都来自「角色库」，可以先去角色库统一维护，再一键加进新房间。',
     meta: { generated: true },
   })
 }
