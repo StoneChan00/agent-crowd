@@ -46,6 +46,13 @@
  *                         replacement must inherit the TEST database, not
  *                         boot a PROD-data zombie whose sweep kills the
  *                         live turns (2026-11-06 incident)
+ *   S13 auto-commit     — a clean+changed+PASS round lands its work as
+ *                         exactly one commit at the drain point; CHANGES
+ *                         and chat-only rounds commit nothing; ignored
+ *                         paths never enter the commit; push NEVER runs
+ *                         (the bare remote's ref never moves); pre-staged
+ *                         unrelated content stays out (--only) and a
+ *                         vanished never-tracked path can't kill the batch
  *
  * Scenarios S4-S8 share one server (each room drained before the next
  * starts, so per-turn change attribution stays clean); S9 boots its own
@@ -60,7 +67,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { changedPathsBetween, diffSnapshotPaths, snapshotWorktree } from '../server/gitstate.ts'
+import { changedPathsBetween, commitPaths, diffSnapshotPaths, snapshotWorktree } from '../server/gitstate.ts'
 import { gateDecision, parseReviewVerdict } from '../server/sop.ts'
 
 const ROOT = join(import.meta.dirname, '..')
@@ -545,6 +552,259 @@ async function scenarioSnapshot() {
   check('S3 非 git 工作目录 → available:false', noRepo.available === false)
 }
 
+/* --------------------------------------------- S13 unit: commitPaths itself */
+
+async function scenarioAutoCommitUnit() {
+  const repo = mkdtempSync(join(tmpdir(), 'ac-s13u-'))
+  tempDirs.push(repo)
+  const gitIn = (args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' })
+  const headFiles = () =>
+    gitIn(['show', '--name-only', '--format=', 'HEAD'])
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+  execFileSync('git', ['-C', repo, 'init'], { stdio: 'ignore' })
+  writeFileSync(join(repo, '.gitignore'), 'local-state/\n')
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, '-c', 'user.name=sop', '-c', 'user.email=sop@t', 'commit', '-m', 'seed', '--allow-empty'], {
+    stdio: 'ignore',
+  })
+
+  // Mixed change set: one ignored + one normal file → only the normal one
+  // lands; the ignored file is left untouched on disk.
+  mkdirSync(join(repo, 'local-state'), { recursive: true })
+  writeFileSync(join(repo, 'local-state', 'scratch.json'), '{}')
+  writeFileSync(join(repo, 'feature.ts'), 'export const feature = 1\n')
+  const mixed = await commitPaths(repo, ['local-state/scratch.json', 'feature.ts'], {
+    subject: 'auto: 混合改动测试',
+    body: (kept) => `改动: ${kept.join('、')}\nREVIEW: PASS（测试）`,
+  })
+  check(
+    'S13e ignored 路径被滤除，普通文件正常提交',
+    mixed.ok && !mixed.skipped && typeof mixed.hash === 'string' && mixed.hash.length > 0 && headFiles().length === 1 && headFiles()[0] === 'feature.ts',
+    JSON.stringify({ mixed, files: headFiles() }),
+  )
+  check(
+    'S13e commitPaths.files 即为实际提交路径',
+    Array.isArray(mixed.files) && mixed.files.length === 1 && mixed.files[0] === 'feature.ts',
+    JSON.stringify(mixed.files),
+  )
+  const body1 = gitIn(['log', '-1', '--format=%B'])
+  check(
+    'S13e commit 双段消息（主题 + 正文）',
+    body1.includes('auto: 混合改动测试') && body1.includes('改动: feature.ts') && body1.includes('REVIEW: PASS（测试）'),
+    body1,
+  )
+  check('S13e ignored 文件不进提交也不被跟踪', !gitIn(['ls-files']).includes('local-state/'), gitIn(['ls-files']))
+
+  // All-ignored change set → skipped, commit count unchanged.
+  const count1 = Number(gitIn(['rev-list', '--count', 'HEAD']).trim())
+  writeFileSync(join(repo, 'local-state', 'more.json'), '{}')
+  const allIgnored = await commitPaths(repo, ['local-state/more.json'], { subject: 'auto: x', body: () => 'x' })
+  check(
+    'S13f 全 ignored 改动集跳过提交',
+    allIgnored.ok && allIgnored.skipped === 'ignored' && Number(gitIn(['rev-list', '--count', 'HEAD']).trim()) === count1,
+    JSON.stringify(allIgnored),
+  )
+
+  // A path that existed during the round but was never tracked and has since
+  // been deleted (diffSnapshotPaths records it as "before has, after hasn't")
+  // must not kill the batch — the round's real work still lands.
+  writeFileSync(join(repo, 'ghost.tmp'), 'temp')
+  rmSync(join(repo, 'ghost.tmp'))
+  writeFileSync(join(repo, 'real3.ts'), 'export const real3 = 1\n')
+  const ghost = await commitPaths(repo, ['ghost.tmp', 'real3.ts'], { subject: 'auto: ghost 测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13h 已消失的未跟踪路径不炸提交（真实改动照常落地）',
+    ghost.ok && !ghost.skipped && ghost.files?.length === 1 && ghost.files[0] === 'real3.ts',
+    JSON.stringify(ghost),
+  )
+
+  // Pre-staged unrelated content must stay OUT of the auto-commit (--only)
+  // and keep its staged state.
+  writeFileSync(join(repo, 'unrelated.ts'), 'unrelated WIP\n')
+  execFileSync('git', ['-C', repo, 'add', 'unrelated.ts'], { stdio: 'ignore' })
+  writeFileSync(join(repo, 'feature2.ts'), 'export const feature2 = 1\n')
+  const staged = await commitPaths(repo, ['feature2.ts'], { subject: 'auto: 预暂存隔离测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13g 预暂存的无关改动不进 auto 提交且保持 staged',
+    staged.ok && !staged.skipped && staged.files?.length === 1 && staged.files[0] === 'feature2.ts' && gitIn(['status', '--porcelain']).includes('A  unrelated.ts'),
+    JSON.stringify({ staged, status: gitIn(['status', '--porcelain']) }),
+  )
+
+  // A non-ASCII ignored path must be filtered too: check-ignore quotes such
+  // paths by default (core.quotePath), which would miss the set and sink the
+  // whole add — quotePath=false in commitPaths is what keeps it working.
+  writeFileSync(join(repo, '.gitignore'), 'local-state/\n本地缓存/\n')
+  mkdirSync(join(repo, '本地缓存'), { recursive: true })
+  writeFileSync(join(repo, '本地缓存', 'x.json'), '{}')
+  writeFileSync(join(repo, 'ascii.ts'), 'export const ascii = 1\n')
+  const cjk = await commitPaths(repo, ['本地缓存/x.json', 'ascii.ts'], { subject: 'auto: quotePath 测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13i 非 ASCII ignored 路径正确过滤（quotePath=false）',
+    cjk.ok && !cjk.skipped && cjk.files?.length === 1 && cjk.files[0] === 'ascii.ts' && !gitIn(['ls-files']).includes('本地缓存'),
+    JSON.stringify(cjk),
+  )
+
+  // Staged deletion (git rm): the path left the index AND the disk but not
+  // HEAD — HEAD-based tracking keeps it, the add pathspec set drops it
+  // (git add would fatal), commit --only lands the removal.
+  const commitIn = (msg) =>
+    execFileSync('git', ['-C', repo, '-c', 'user.name=sop', '-c', 'user.email=sop@t', 'commit', '-m', msg], { stdio: 'ignore' })
+  writeFileSync(join(repo, 'dead.ts'), 'dying\n')
+  execFileSync('git', ['-C', repo, 'add', 'dead.ts'], { stdio: 'ignore' })
+  commitIn('add dead')
+  execFileSync('git', ['-C', repo, 'rm', 'dead.ts'], { stdio: 'ignore' })
+  const removed = await commitPaths(repo, ['dead.ts'], { subject: 'auto: 删除测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13j 已暂存删除（git rm）恰提交 1 个 deletion 且工作区干净',
+    removed.ok &&
+      !removed.skipped &&
+      removed.files?.length === 1 &&
+      removed.files[0] === 'dead.ts' &&
+      !gitIn(['ls-files']).includes('dead.ts') &&
+      !gitIn(['status', '--porcelain']).includes('dead.ts'),
+    JSON.stringify({ removed, status: gitIn(['status', '--porcelain']) }),
+  )
+
+  // fs delete + `git add -A` (an agent staging everything after the fact):
+  // same index state as git rm — the deletion must land the same way.
+  writeFileSync(join(repo, 'gone2.ts'), 'g\n')
+  execFileSync('git', ['-C', repo, 'add', 'gone2.ts'], { stdio: 'ignore' })
+  commitIn('add gone2')
+  rmSync(join(repo, 'gone2.ts'))
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  const removed2 = await commitPaths(repo, ['gone2.ts'], { subject: 'auto: 删除测试2', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13k 删文件后 git add -A 的暂存删除同样落地',
+    removed2.ok && !removed2.skipped && removed2.files?.length === 1 && removed2.files[0] === 'gone2.ts' && !gitIn(['status', '--porcelain']).includes('gone2.ts'),
+    JSON.stringify(removed2),
+  )
+
+  // Staged rename: parsePorcelainZ must record the origin as a deletion so it
+  // enters changedPaths at all; commitPaths then commits BOTH halves.
+  writeFileSync(join(repo, 'old.ts'), 'old\n')
+  execFileSync('git', ['-C', repo, 'add', 'old.ts'], { stdio: 'ignore' })
+  commitIn('add old')
+  execFileSync('git', ['-C', repo, 'mv', 'old.ts', 'new.ts'], { stdio: 'ignore' })
+  const snap = await snapshotWorktree(repo)
+  check(
+    'S13l 重命名 origin 进入快照 paths（D 语义）',
+    snap.paths.includes('old.ts') && snap.paths.includes('new.ts'),
+    JSON.stringify(snap.paths),
+  )
+  const renamed = await commitPaths(repo, ['new.ts', 'old.ts'], { subject: 'auto: 重命名测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13m 暂存重命名完整提交（HEAD 无旧路径、工作区干净）',
+    renamed.ok &&
+      !renamed.skipped &&
+      renamed.files?.length === 2 &&
+      renamed.files.includes('new.ts') &&
+      renamed.files.includes('old.ts') &&
+      !gitIn(['ls-files']).includes('old.ts') &&
+      gitIn(['ls-files']).includes('new.ts') &&
+      !gitIn(['status', '--porcelain']).includes('old.ts'),
+    JSON.stringify({ renamed, status: gitIn(['status', '--porcelain']) }),
+  )
+
+  // Staged deletion + real change in one round: both land, nothing is left.
+  writeFileSync(join(repo, 'victim.ts'), 'v\n')
+  execFileSync('git', ['-C', repo, 'add', 'victim.ts'], { stdio: 'ignore' })
+  commitIn('add victim')
+  execFileSync('git', ['-C', repo, 'rm', 'victim.ts'], { stdio: 'ignore' })
+  writeFileSync(join(repo, 'real5.ts'), 'export const real5 = 1\n')
+  const mixedRemoval = await commitPaths(repo, ['victim.ts', 'real5.ts'], { subject: 'auto: 混合删除测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13n 暂存删除 + 真实变更混合时两者都提交',
+    mixedRemoval.ok &&
+      !mixedRemoval.skipped &&
+      mixedRemoval.files?.length === 2 &&
+      mixedRemoval.files.includes('victim.ts') &&
+      mixedRemoval.files.includes('real5.ts') &&
+      !gitIn(['ls-files']).includes('victim.ts') &&
+      !gitIn(['status', '--porcelain']).includes('victim.ts'),
+    JSON.stringify({ mixedRemoval, files: headFiles(), status: gitIn(['status', '--porcelain']) }),
+  )
+
+  // Glob metacharacters in paths ([?*) are filename characters, never git
+  // pathspec magic: without --literal-pathspecs, app/[id]/page.tsx matches
+  // the sibling app/i/page.tsx and silently swallows its staged WIP.
+  mkdirSync(join(repo, 'app', '[id]'), { recursive: true })
+  mkdirSync(join(repo, 'app', 'i'), { recursive: true })
+  writeFileSync(join(repo, 'app', '[id]', 'page.tsx'), 'export const dyn = 1\n')
+  writeFileSync(join(repo, 'app', 'i', 'page.tsx'), 'export const plain = 1\n')
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  commitIn('add app pages')
+  // Pre-stage WIP on the sibling, change the [id] page this round: only the
+  // literal path may enter the commit; the staged WIP stays staged.
+  writeFileSync(join(repo, 'app', 'i', 'page.tsx'), 'export const plain = 2 // WIP\n')
+  execFileSync('git', ['-C', repo, 'add', 'app/i/page.tsx'], { stdio: 'ignore' })
+  writeFileSync(join(repo, 'app', '[id]', 'page.tsx'), 'export const dyn = 2\n')
+  const glob = await commitPaths(repo, ['app/[id]/page.tsx'], { subject: 'auto: glob 字面量测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13o glob 元字符路径按字面提交（预暂存兄弟 WIP 不被吞）',
+    glob.ok &&
+      !glob.skipped &&
+      glob.files?.length === 1 &&
+      glob.files[0] === 'app/[id]/page.tsx' &&
+      gitIn(['status', '--porcelain']).includes('M  app/i/page.tsx'),
+    JSON.stringify({ glob, status: gitIn(['status', '--porcelain']) }),
+  )
+  // Unstaged-dirty variant: unstage the WIP, dirty both files again — the
+  // wildcard must not even STAGE the sibling.
+  execFileSync('git', ['-C', repo, 'reset', '--', 'app/i/page.tsx'], { stdio: 'ignore' })
+  writeFileSync(join(repo, 'app', 'i', 'page.tsx'), 'export const plain = 3 // dirty\n')
+  writeFileSync(join(repo, 'app', '[id]', 'page.tsx'), 'export const dyn = 3\n')
+  const glob2 = await commitPaths(repo, ['app/[id]/page.tsx'], { subject: 'auto: glob 字面量（未暂存变体）', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13p 未暂存的兄弟脏文件也不被通配卷入',
+    glob2.ok &&
+      !glob2.skipped &&
+      glob2.files?.length === 1 &&
+      glob2.files[0] === 'app/[id]/page.tsx' &&
+      gitIn(['status', '--porcelain']).includes(' M app/i/page.tsx'),
+    JSON.stringify({ glob2, status: gitIn(['status', '--porcelain']) }),
+  )
+
+  // Tracked-but-ignored (force-added past .gitignore) whose staged deletion
+  // is in this round: check-ignore alone would read it as "ignored" and the
+  // deletion would be lost forever — HEAD-first filtering must rescue it.
+  writeFileSync(join(repo, '.gitignore'), 'local-state/\n本地缓存/\n*.log\n')
+  writeFileSync(join(repo, 'kept.log'), 'force-added log\n')
+  execFileSync('git', ['-C', repo, 'add', '-f', 'kept.log'], { stdio: 'ignore' })
+  commitIn('force-add kept.log')
+  execFileSync('git', ['-C', repo, 'rm', 'kept.log'], { stdio: 'ignore' })
+  writeFileSync(join(repo, 'real6.ts'), 'export const real6 = 1\n')
+  const trackedIgnored = await commitPaths(repo, ['kept.log', 'real6.ts'], { subject: 'auto: tracked-ignored 删除测试', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13q tracked-ignored 暂存删除 + 真实变更混合时两者都提交',
+    trackedIgnored.ok &&
+      !trackedIgnored.skipped &&
+      trackedIgnored.files?.length === 2 &&
+      trackedIgnored.files.includes('kept.log') &&
+      trackedIgnored.files.includes('real6.ts') &&
+      !gitIn(['ls-files']).includes('kept.log') &&
+      !gitIn(['status', '--porcelain']).includes('kept.log'),
+    JSON.stringify({ trackedIgnored, status: gitIn(['status', '--porcelain']) }),
+  )
+
+  // Same shape, deletion ONLY: the verdict must not be skipped:'ignored'.
+  writeFileSync(join(repo, 'only.log'), 'another force-added log\n')
+  execFileSync('git', ['-C', repo, 'add', '-f', 'only.log'], { stdio: 'ignore' })
+  commitIn('force-add only.log')
+  execFileSync('git', ['-C', repo, 'rm', 'only.log'], { stdio: 'ignore' })
+  const trackedIgnoredOnly = await commitPaths(repo, ['only.log'], { subject: 'auto: tracked-ignored 纯删除', body: (kept) => `改动: ${kept.join('、')}` })
+  check(
+    'S13q tracked-ignored 纯删除照常落地（不是 skipped）',
+    trackedIgnoredOnly.ok &&
+      !trackedIgnoredOnly.skipped &&
+      trackedIgnoredOnly.files?.length === 1 &&
+      trackedIgnoredOnly.files[0] === 'only.log' &&
+      !gitIn(['ls-files']).includes('only.log'),
+    JSON.stringify(trackedIgnoredOnly),
+  )
+}
+
 /* --------------------------------------------- S4–S8 end-to-end (one server) */
 
 /**
@@ -583,6 +843,14 @@ async function scenarioEndToEnd() {
   execFileSync('git', ['-C', repo, '-c', 'user.name=sop', '-c', 'user.email=sop@t', 'commit', '-m', 'seed', '--allow-empty'], {
     stdio: 'ignore',
   })
+  // S13: a bare remote the auto-commit must NEVER touch — push is a user
+  // decision by contract, and the ref staying on the seed commit is the
+  // proof for every round this scenario runs.
+  const bare = mkdtempSync(join(tmpdir(), 'ac-sop-bare-'))
+  tempDirs.push(bare)
+  execFileSync('git', ['-C', bare, 'init', '--bare'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', bare], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, 'push', '-q', 'origin', 'HEAD:refs/heads/main'], { stdio: 'ignore' })
 
   const server = await bootServer(dir)
   const port = server.port
@@ -723,6 +991,52 @@ async function scenarioEndToEnd() {
       systemNotices(messagesB, 'SOP 门禁').length === 1,
       `实际 ${systemNotices(messagesB, 'SOP 门禁').length}`,
     )
+  }
+
+  /* S13 auto-commit: a clean+changed+PASS round lands its work as exactly one
+   * commit at the drain point; a CHANGES round and a chat-only round commit
+   * nothing; push NEVER runs — the bare remote stays on the seed commit. */
+  {
+    const gitIn = (args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' })
+    const bareIn = (args) => execFileSync('git', ['-C', bare, ...args], { encoding: 'utf8' })
+    const seedRemote = bareIn(['rev-parse', 'refs/heads/main']).trim()
+    const commitCount = () => Number(gitIn(['rev-list', '--count', 'HEAD']).trim())
+    const before13 = commitCount()
+
+    const room13a = await makeSopRoom(port, repo, 's13a-自动提交', {
+      verifyCommand: 'exit 0',
+      reviewerPersona: 'MOCK-评审通过',
+    })
+    const messages13a = await runRoundAndDrain(port, room13a.id)
+    const changedFile = characterMessages(messages13a, '开发甲')[0]?.meta?.changed?.[0] ?? ''
+    check('S13a 全绿轮新增恰 1 个 commit', commitCount() === before13 + 1, `${before13} -> ${commitCount()}`)
+    check('S13a 全绿轮系统播报自动提交', systemNotices(messages13a, '已自动提交').length === 1, '未见提交播报')
+    const headFiles = gitIn(['show', '--name-only', '--format=', 'HEAD'])
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+    check('S13a commit 恰含本轮改动文件', headFiles.length === 1 && headFiles[0] === changedFile, `${JSON.stringify(headFiles)} vs ${changedFile}`)
+    const headSubject = gitIn(['log', '-1', '--format=%s']).trim()
+    check('S13a commit 主题带 auto 前缀', headSubject.startsWith('auto: '), headSubject)
+    check('S13a 提交后该文件不再是脏路径', !gitIn(['status', '--porcelain']).includes(changedFile), changedFile)
+
+    const room13b = await makeSopRoom(port, repo, 's13b-返修不提交', {
+      verifyCommand: 'exit 0',
+      reviewerPersona: 'MOCK-评审返修',
+    })
+    const messages13b = await runRoundAndDrain(port, room13b.id)
+    check('S13b CHANGES 轮不提交', commitCount() === before13 + 1, `出现新 commit：${before13 + 1} -> ${commitCount()}`)
+    check('S13b CHANGES 轮无自动提交播报', systemNotices(messages13b, '已自动提交').length === 0, '出现提交播报')
+    check('S13b CHANGES 轮被门禁拦截', systemNotices(messages13b, 'SOP 门禁').length === 1, '未见拦截通知')
+
+    const room13c = await makeRoom(port, 's13c-纯聊天', repo, 'exit 0')
+    await makeCharacter(port, room13c.id, '闲己', ON_USER_ONLY, '普通聊天角色')
+    await makeCharacter(port, room13c.id, '总结丙', ROUND_SUMMARIZER, '总结者')
+    const messages13c = await runRoundAndDrain(port, room13c.id)
+    check('S13c 纯聊天轮不提交', commitCount() === before13 + 1, `出现新 commit：${before13 + 1} -> ${commitCount()}`)
+    check('S13c 纯聊天轮总结正常', characterMessages(messages13c, '总结丙').length === 1, '总结丙未发言')
+
+    check('S13d push 永不发生（bare 远端仍在 seed）', bareIn(['rev-parse', 'refs/heads/main']).trim() === seedRemote, bareIn(['rev-parse', 'refs/heads/main']).trim())
   }
 
   /* S10 (B04): automatic round-end episodes — clean+changed+PASS closes
@@ -1207,6 +1521,7 @@ try {
   scenarioParser()
   scenarioGateTable()
   await scenarioSnapshot()
+  await scenarioAutoCommitUnit()
   await scenarioEndToEnd()
   await scenarioRestartRace()
   await scenarioStaleIdleRace()

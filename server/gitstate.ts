@@ -18,6 +18,7 @@
  */
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -43,13 +44,17 @@ export interface WorktreeSnapshot {
 
 const UNAVAILABLE: WorktreeSnapshot = { available: false, digest: '', paths: [], entries: [] }
 
-function git(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string }> {
+function git(
+  cwd: string,
+  args: string[],
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     execFile(
       'git',
       args,
-      { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
-      (error, stdout) => resolve({ ok: !error, stdout: String(stdout ?? '') }),
+      { cwd, timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout, stderr) => resolve({ ok: !error, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') }),
     )
   })
 }
@@ -58,6 +63,10 @@ function git(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string
  * Parse `git status --porcelain=v1 -z --untracked-files=all` output.
  * -z mode: NUL-separated records, no quoting; rename/copy records carry the
  * origin path as one extra NUL-terminated field after the target path.
+ * A RENAME origin is recorded as a `D ` entry of its own: every consumer of
+ * this snapshot (paths, digests, diffSnapshotPaths → round.changedPaths)
+ * must see the old path die, or a staged rename never puts it in the commit
+ * set. A copy origin is consumed but NOT recorded — its source still exists.
  */
 function parsePorcelainZ(output: string): Array<{ status: string; path: string; fingerprint?: string }> {
   const records = output.split('\0')
@@ -71,8 +80,15 @@ function parsePorcelainZ(output: string): Array<{ status: string; path: string; 
     const path = record.slice(3)
     if (!path) continue
     entries.push({ status, path })
-    // R/C records: the next NUL field is the origin path — consume it.
-    if (status.includes('R') || status.includes('C')) index += 1
+    // R/C records: the next NUL field is the origin path — consume it for
+    // both. Only a RENAME origin enters as a deletion (the old path is gone);
+    // a copy's source still exists, and recording it would list a path with
+    // no net change (C records need status.renames=copies to appear at all).
+    if (status.includes('R') || status.includes('C')) {
+      const origin = records[index]
+      index += 1
+      if (origin && status.includes('R')) entries.push({ status: 'D ', path: origin })
+    }
   }
   return entries
 }
@@ -163,4 +179,165 @@ export function changedPathsBetween(before: WorktreeSnapshot, after: WorktreeSna
   if (before.digest === after.digest) return []
   const diff = diffSnapshotPaths(before, after)
   return diff.length > 0 ? diff : after.paths
+}
+
+/**
+ * Auto-commit on round close (S13): stage exactly the round's changed paths
+ * and commit them — and NOTHING else that might already sit in the index.
+ * Pure I/O like the rest of this module — the orchestrator decides WHEN,
+ * this decides HOW:
+ *  - gitignored paths are filtered out first (round change sets legitimately
+ *    contain ignored files — local state, build output): committing them is
+ *    never wanted, and one ignored path would fail the whole `git add`;
+ *  - ghost paths (existed during the round, never tracked, since deleted —
+ *    diffSnapshotPaths records them as "before has, after doesn't") are
+ *    dropped, not fatal: git has no such pathspec and one would abort the
+ *    whole add, losing the round's real work. "Tracked" reads from HEAD, so
+ *    staged deletions and rename origins survive the filter and their
+ *    removal lands in the commit;
+ *  - staging (`add`) and committing (`commit --only`) take different path
+ *    sets: add rejects pathspecs that are neither on disk nor in the index
+ *    (a staged deletion), commit --only accepts them;
+ *  - every pathspec runs with --literal-pathspecs: [/?* in a pathname are
+ *    filename characters, never glob magic — app/[id]/page.tsx must not
+ *    match the sibling app/i/page.tsx (check-ignore alone must stay
+ *    flag-free: it rejects pathspec magic and is literal by itself);
+ *  - `--only` also keeps anything the user (or an earlier round) left staged
+ *    out of the auto-commit, without losing its staged state;
+ *  - the repo's own git identity wins; a machine without one still gets the
+ *    commit (agent-crowd fallback), so a green round never fails to land;
+ *  - NEVER pushes — pushing stays a user decision, by design.
+ */
+export interface CommitPathsResult {
+  ok: boolean
+  /** Nothing to commit: every path gitignored/vanished, or no net change. */
+  skipped?: 'ignored' | 'empty'
+  hash?: string
+  subject?: string
+  /** Paths actually inside the commit (name-only listing of the new HEAD). */
+  files?: string[]
+  error?: string
+}
+
+/** Staging + commit can outrun a status probe on cold Windows spawns. */
+const COMMIT_TIMEOUT_MS = 30_000
+
+export async function commitPaths(
+  cwd: string,
+  paths: string[],
+  message: { subject: string; body: (keptPaths: string[]) => string },
+): Promise<CommitPathsResult> {
+  const top = await git(cwd, ['rev-parse', '--show-toplevel'])
+  if (!top.ok || !top.stdout.trim()) return { ok: false, error: '非 git 仓库或 git 不可用' }
+  const root = top.stdout.trim()
+  const unique = [...new Set(paths.filter(Boolean))]
+  if (unique.length === 0) return { ok: true, skipped: 'empty' }
+
+  // HEAD tracking FIRST — before any ignore filtering. check-ignore reads
+  // index/worktree only, so a file that was force-added past .gitignore and
+  // since staged-for-deletion (gone from the index, gone from disk, still in
+  // HEAD) reads as "ignored"; letting that verdict run would silently drop a
+  // real deletion and, once the next round's snapshot normalizes it, lose it
+  // forever. A path tracked in HEAD is never a fresh ignored file — the
+  // ignore check only gets the paths HEAD does not know.
+  const headTree = await git(
+    root,
+    ['--literal-pathspecs', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--name-only', 'HEAD', '--', ...unique],
+  )
+  const headTracked = new Set(
+    (headTree.ok ? headTree.stdout : '')
+      .split('\0')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  )
+
+  // check-ignore exits 0 when SOME path is ignored (stdout lists them, one
+  // per line) and 1 when none is — both fine; only a crashed git is a failure.
+  // (No -z here: on current git it is fatal without --stdin; quotePath=false
+  // keeps non-ASCII paths from coming back octal-escaped and missing the set.
+  // Also NO --literal-pathspecs here: check-ignore rejects pathspec magic
+  // outright ("fatal: pathspec magic not supported") and already takes its
+  // arguments as literal pathnames — the flag belongs on add/commit/ls-*,
+  // where a path like app/[id]/page.tsx would otherwise glob-match siblings.
+  // A filename with an embedded newline still slips past the line split —
+  // the consequence is a loud git-add failure notice, never a wrong commit.)
+  const ignoreCandidates = unique.filter((path) => !headTracked.has(path))
+  const ignored = new Set()
+  if (ignoreCandidates.length > 0) {
+    const ignoreCheck = await git(root, ['-c', 'core.quotePath=false', 'check-ignore', '--', ...ignoreCandidates])
+    for (const line of (ignoreCheck.ok ? ignoreCheck.stdout : '').split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed) ignored.add(trimmed)
+    }
+  }
+  const addable = unique.filter((path) => !ignored.has(path))
+  if (addable.length === 0) return { ok: true, skipped: 'ignored' }
+
+  // The index set completes "tracked": it feeds the add filter below, and an
+  // index-only (ls-files) notion of tracked was exactly the bug the HEAD set
+  // above fixes. HEAD is unborn on a fresh repo: ls-tree fails, headTracked
+  // is empty, and index+disk carry the root commit.
+  const indexFiles = await git(
+    root,
+    ['--literal-pathspecs', '-c', 'core.quotePath=false', 'ls-files', '--', ...addable],
+  )
+  const indexTracked = new Set(
+    (indexFiles.ok ? indexFiles.stdout : '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  )
+  const onDisk = (path: string) => existsSync(join(root, path))
+  // Commit set: HEAD-tracked ∪ index-tracked ∪ exists-on-disk. Ghosts (never
+  // tracked, since deleted) drop out; staged deletions and rename origins
+  // survive via HEAD; tracked-but-deleted paths survive for deletion commits.
+  const kept = addable.filter((path) => headTracked.has(path) || indexTracked.has(path) || onDisk(path))
+  if (kept.length === 0) return { ok: true, skipped: 'empty' }
+
+  // Supply identity only where the repo has none, so a set-up machine's git
+  // log attribution stays untouched.
+  const [name, email] = await Promise.all([
+    git(root, ['config', '--get', 'user.name']),
+    git(root, ['config', '--get', 'user.email']),
+  ])
+  const identity = [
+    ...(name.ok && name.stdout.trim() ? [] : ['-c', 'user.name=agent-crowd']),
+    ...(email.ok && email.stdout.trim() ? [] : ['-c', 'user.email=agent-crowd@round.local']),
+  ]
+
+  // Staging and committing take DIFFERENT path sets: `git add` rejects a
+  // pathspec that is neither on disk nor in the index (a staged deletion or
+  // rename origin) with a fatal that would abort the whole batch, while
+  // `commit --only` accepts it and commits the staged removal just fine.
+  // Both run with --literal-pathspecs: [/?* in a path are filename
+  // characters, never glob magic — without the flag, app/[id]/page.tsx
+  // matches the sibling app/i/page.tsx and swallows its staged WIP.
+  const addPaths = kept.filter((path) => indexTracked.has(path) || onDisk(path))
+  if (addPaths.length > 0) {
+    const add = await git(root, ['--literal-pathspecs', 'add', '-A', '--', ...addPaths], COMMIT_TIMEOUT_MS)
+    if (!add.ok) return { ok: false, error: `git add 失败：${add.stderr.trim() || '未知原因'}` }
+  }
+  // --only: commit JUST the kept paths — pre-staged unrelated entries stay
+  // staged and out of the auto-commit.
+  const commit = await git(
+    root,
+    [...identity, '--literal-pathspecs', 'commit', '--only', '-m', message.subject, '-m', message.body(kept), '--', ...kept],
+    COMMIT_TIMEOUT_MS,
+  )
+  if (!commit.ok) {
+    if (commit.stdout.includes('nothing to commit')) return { ok: true, skipped: 'empty' }
+    return { ok: false, error: `git commit 失败：${(commit.stderr || commit.stdout).trim() || '未知原因'}` }
+  }
+  const hash = await git(root, ['rev-parse', '--short', 'HEAD'])
+  // --no-renames: a rename must list BOTH paths (deletion + addition), not
+  // collapse to the new name — the notice's file count and the S13 contract
+  // read this as "paths that differ", which a detected rename hides half of.
+  const listed = await git(root, ['show', '--name-only', '--no-renames', '--format=', 'HEAD'])
+  const files = listed.ok
+    ? listed.stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+    : []
+  return { ok: true, hash: hash.ok ? hash.stdout.trim() : '', subject: message.subject, files }
 }
