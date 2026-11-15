@@ -4,16 +4,16 @@
 每个角色绑定一个 harness、一个模型、一段人设和一组触发规则：
 
 ```
-你提需求  →  开发者（CANNBot / glm-5.3）动手实现  →  在群里说"做完了"
-                                                      ↓ 自动触发
-                                  审查者（DSH / deepseek-flash）读代码、review
+你提需求  →  GLM（CANNBot / glm-5.3）动手实现  →  在群里说"做完了"
+                                                      ↓ 点名接力
+                                  DeepSeek（DSH / deepseek-flash）读代码、review
 ```
 
 角色之间靠"谁发言后触发谁"接力，像真的群聊一样协作。常用角色可以在**角色库**里配一次，之后每个房间一键添加。
 
 ![Agent Crowd 界面](docs/screenshot.png)
 
-> 截图是示例房间跑的一轮真实协作：开发者（CANNBot / glm-5.3）建好文件后发消息，审查者（DeepSeek Harness / deepseek-flash）自动接手并逐项 review。
+> 截图是示例房间跑的一轮真实协作：开发者（CANNBot / glm-5.3）建好文件后发消息，审查者（DeepSeek Harness / deepseek-flash）自动接手并逐项 review。（截图摄于旧版角色名时期，现默认阵容为 GLM / DeepSeek / Qwen / Claude / GPT。）
 
 ---
 
@@ -50,7 +50,7 @@ pnpm serve        # = vite build + tsx server/index.ts
 | --- | --- | --- | --- |
 | GLM | CANNBot | `cannbot/glm-5.3` | 用户发言后（没人被 @ 时由它接手） |
 | DeepSeek | DeepSeek Harness | `deepseek-flash` | 被 @（点名 review） |
-| Qwen | CANNBot | `cannbot/qwen3.8-max` | 被 @ |
+| Qwen | CANNBot | `cannbot/qwen3.8-max` | 被 @；每轮结束后总结 |
 | Claude | Claude Code | 默认模型 | 被 @（别名：克劳德） |
 | GPT | Codex | 默认模型 | 被 @ |
 
@@ -81,11 +81,12 @@ pnpm serve        # = vite build + tsx server/index.ts
 | 规则 | 含义 |
 | --- | --- |
 | 任何角色发言后 | 其他角色说话就触发（慎用，容易互相接话） |
-| 指定角色发言后 | 只有指定名字的角色说话才触发——这是「开发者 → 审查者」的关键 |
+| 指定角色发言后 | 只有指定名字的角色说话才触发——固定搭档的自动接力；默认阵容未启用它（GLM→DeepSeek 的 review 靠「被 @」点名） |
 | 被 @ 时 | 消息里出现 `@角色名` 或它的任意 `@别名` |
 | 关键词触发 | 消息包含指定文本（不区分大小写） |
+| 每轮结束后总结 | 轮次干净收尾后，勾选的角色自动发一条本轮总结（做了什么、遗留了什么）；手动停止或被门禁拦截的轮次不总结 |
 
-注意：**用户消息不走这张表**——它严格按 @ 路由（`@名字` / `@别名` / `@all`），没人被 @ 时由第一个启用的角色接手；表里的规则只决定角色发言后的接力。
+注意：**用户消息不走这张表**——它严格按 @ 路由（`@名字` / `@别名` / `@all`），没人被 @ 时由第一个启用的角色接手；表里的规则只决定角色发言后的接力。「每轮结束后总结」是唯一不在接力链上的规则：它在轮次收尾时触发，而不是某次发言之后。
 
 `单轮接力上限`（默认 6）限制的是**角色之间的接力层数**：你和 @ 点名（含 @all）、▶ 发言等直接唤起的角色都算第 1 层、不受上限约束，只有角色接力才逐层 +1，防止互相刷屏。
 
@@ -157,7 +158,7 @@ $env:AC_HERMES_BIN   = "C:\...\hermes.exe"
 
 | harness | 可用模型 | 备注 |
 | --- | --- | --- |
-| cannbot | `cannbot/glm-5.3`、`cannbot/glm-5.3-flash`、`cannbot/deepseek-v4-pro` 等 | 可用；示例房间开发者用它 |
+| cannbot | `cannbot/glm-5.3`、`cannbot/glm-5.3-flash`、`cannbot/deepseek-v4-pro` 等 | 可用；示例房间 GLM 用它 |
 | opencode | `opencode/glm-5.3-flash-free`、`opencode/deepseek-v4.1-flash-free` 等免费模型 | 可用 |
 | opencode | `deepseek/deepseek-flash`、`deepseek/deepseek-v4-pro` | 可用 |
 | opencode | `cannbot/glm-5.3` | **不可用**：opencode 侧没有这个 provider，报 `Unexpected server error`（只有个占位的 `cannbot/cannbot-error`） |

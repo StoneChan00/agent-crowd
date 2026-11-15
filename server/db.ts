@@ -2,13 +2,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { DATA_DIR } from './paths.ts'
-import {
-  SEED_AVATAR_GLM,
-  SEED_AVATAR_DEEPSEEK,
-  SEED_AVATAR_QWEN,
-  SEED_AVATAR_CLAUDE,
-  SEED_AVATAR_GPT,
-} from './seed-avatars.ts'
+import { loadSeedAvatars } from './seed-avatars.ts'
 import { buildRoundEpisode, escapeLike, ftsQuote, planMemoryQuery, type RoundEpisodeFacts } from './memory.ts'
 import { DEFAULT_TRIGGERS,
   type AuthorType,
@@ -614,15 +608,18 @@ function mapCharacter(row: Record<string, unknown>): Character {
   }
 }
 
+// created_at alone can tie within the seeding loop's same millisecond, which
+// leaves insert order to SQLite's whim — and "first enabled character" (the
+// no-@ routing fallback) plus the library order both ride on it. rowid is
+// the insertion sequence and breaks the tie deterministically.
+const CHAR_ORDER = 'order by created_at asc, rowid asc'
+
 export function listCharacters(roomId: string): Character[] {
-  return db
-    .prepare('select * from characters where room_id = ? order by created_at asc')
-    .all(roomId)
-    .map(mapCharacter)
+  return db.prepare(`select * from characters where room_id = ? ${CHAR_ORDER}`).all(roomId).map(mapCharacter)
 }
 
 export function listAllCharacters(): Character[] {
-  return db.prepare('select * from characters order by created_at asc').all().map(mapCharacter)
+  return db.prepare(`select * from characters ${CHAR_ORDER}`).all().map(mapCharacter)
 }
 
 export function getCharacter(id: string): Character | undefined {
@@ -1828,7 +1825,7 @@ export interface PresetInput {
 }
 
 export function listPresets(): CharacterPreset[] {
-  return db.prepare('select * from character_presets order by created_at asc').all().map(mapPreset)
+  return db.prepare('select * from character_presets order by created_at asc, rowid asc').all().map(mapPreset)
 }
 
 export function countPresets(): number {
@@ -2048,10 +2045,11 @@ function characterToPreset(character: Character, members: Character[]): PresetIn
  * AC_SEED_DEV_MODEL hook (README: 示例房间实现角色的模型).
  */
 function builtinPresets(): PresetInput[] {
+  const avatars = loadSeedAvatars()
   return [
     {
       name: 'GLM',
-      avatar: SEED_AVATAR_GLM,
+      avatar: avatars.glm,
       color: '#000000',
       harness: 'cannbot',
       model: process.env.AC_SEED_DEV_MODEL ?? 'cannbot/glm-5.3',
@@ -2064,7 +2062,7 @@ function builtinPresets(): PresetInput[] {
     },
     {
       name: 'DeepSeek',
-      avatar: SEED_AVATAR_DEEPSEEK,
+      avatar: avatars.deepseek,
       color: '#4f9cf9',
       harness: 'dsh',
       model: 'deepseek-flash',
@@ -2080,17 +2078,21 @@ function builtinPresets(): PresetInput[] {
     },
     {
       name: 'Qwen',
-      avatar: SEED_AVATAR_QWEN,
+      avatar: avatars.qwen,
       color: '#2dd4bf',
       harness: 'cannbot',
       model: 'cannbot/qwen3.8-max',
-      persona: '你是团队里的全能助手，擅长查资料、跑命令、整理结论。只在被 @ 时发言。',
-      triggers: { onUser: false, mention: true },
+      persona:
+        '你是团队里的全能助手，擅长查资料、跑命令、整理结论。被 @ 时响应；每轮对话结束后，你会作为轮值总结者发一条本轮总结（做了什么、遗留了什么）。',
+      // Per-round summarizer: every cleanly-closed round ends with a Qwen
+      // summary (orchestrator round drain). Side effect to remember: the SOP
+      // gate excludes round summarizers from reviewer eligibility.
+      triggers: { onUser: false, mention: true, onRoundEnd: true },
     },
     {
       name: 'Claude',
       aliases: ['克劳德'],
-      avatar: SEED_AVATAR_CLAUDE,
+      avatar: avatars.claude,
       color: '#f97316',
       harness: 'claude',
       model: '',
@@ -2099,7 +2101,7 @@ function builtinPresets(): PresetInput[] {
     },
     {
       name: 'GPT',
-      avatar: SEED_AVATAR_GPT,
+      avatar: avatars.gpt,
       color: '#ffffff',
       harness: 'codex',
       model: '',
@@ -2187,7 +2189,7 @@ export function seedIfEmpty(defaultWorkingDir: string): void {
     authorType: 'system',
     authorName: '系统',
     content:
-      '房间已创建。没人被 @ 时由第一个启用的角色 GLM（CANNBot / glm-5.3）接手；`@DeepSeek` 点名 review，`@Qwen`、`@Claude`、`@GPT` 也在待命（`@克劳德` 是 Claude 的别名）。这些角色都来自「角色库」，可以先去角色库统一维护，再一键加进新房间。',
+      '房间已创建。没人被 @ 时由第一个启用的角色 GLM（CANNBot / glm-5.3）接手；`@DeepSeek` 点名 review，`@Qwen`、`@Claude`、`@GPT` 也在待命（`@克劳德` 是 Claude 的别名）；每轮对话干净收尾后，Qwen 会自动发一条本轮总结。这些角色都来自「角色库」，可以先去角色库统一维护，再一键加进新房间。',
     meta: { generated: true },
   })
 }
