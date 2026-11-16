@@ -2189,7 +2189,7 @@ export function seedIfEmpty(defaultWorkingDir: string): void {
     authorType: 'system',
     authorName: '系统',
     content:
-      '房间已创建。没人被 @ 时由第一个启用的角色 GLM（CANNBot / glm-5.3）接手；`@DeepSeek` 点名 review，`@Qwen`、`@Claude`、`@GPT` 也在待命（`@克劳德` 是 Claude 的别名）；每轮对话干净收尾后，Qwen 会自动发一条本轮总结。这些角色都来自「角色库」，可以先去角色库统一维护，再一键加进新房间。',
+      '房间已创建。没人被 @ 时由第一个启用的角色 GLM（CANNBot / glm-5.3）接手；`@DeepSeek` 点名 review，`@Qwen`、`@Claude`、`@GPT` 也在待命（`@克劳德` 是 Claude 的别名）；每轮对话干净收尾后，Qwen 会自动发一条本轮总结，review 通过的代码改动会由系统自动提交到工作目录所在的 git 仓库（push 始终等你确认）。这些角色都来自「角色库」，可以先去角色库统一维护，再一键加进新房间。',
     meta: { generated: true },
   })
 }

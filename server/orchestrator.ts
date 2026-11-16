@@ -5,7 +5,7 @@ import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure } from './harnesses/process.ts'
-import { changedPathsBetween, snapshotWorktree } from './gitstate.ts'
+import { changedPathsBetween, commitPaths, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPromptDetailed } from './prompt.ts'
 import { episodeDelivery, memoryQueryFromMessages } from './memory.ts'
@@ -123,6 +123,14 @@ interface RoundState {
   verifyState: 'none' | 'running' | 'pass' | 'fail'
   /** The gate notice fires at most once per round — repeat blocks stay silent. */
   gateNoticeSent: boolean
+  /**
+   * S13: the round's auto-commit is in flight. A re-entrant pump visit while
+   * the commit awaits (the verify early-return doesn't cover this window)
+   * must not run a second commit for the same round — the retry usually
+   * degrades to a misleading "nothing to commit" notice, and at worst
+   * collides on index.lock.
+   */
+  autoCommitStarted?: boolean
   /**
    * Terminal state of this round's last NON-SUMMARY turn (B03 review 2):
    * 'ok' | 'error' | 'stopped'. A round that ended in error/stopped must not
@@ -712,6 +720,23 @@ function settleTaskForRound(roomId: string, round: RoundState, outcome: 'done' |
 }
 
 /**
+ * The round's work is done AND approved (B04 + S13 share this predicate):
+ * work happened (hadTurn), it left code evidence (changedPaths), the review
+ * verdict is PASS, verify (when configured) did not fail, and the last real
+ * turn ended ok. Everything else — blocked, errored, stopped, chat-only — is
+ * not "finished work": no episode, no auto-commit.
+ */
+function roundWorkApproved(round: RoundState): boolean {
+  return (
+    round.hadTurn &&
+    round.changedPaths.length > 0 &&
+    round.verdict === 'pass' &&
+    round.verifyState !== 'fail' &&
+    round.lastTurnOutcome === 'ok'
+  )
+}
+
+/**
  * Normal-close settlement (B03 review 2): a round whose last real turn ended
  * in error or was stopped never closes its card as done — the card keeps
  * `running` with `result='error'` so the panel offers a re-dispatch instead
@@ -728,23 +753,15 @@ function settleTaskClosed(roomId: string, round: RoundState): void {
  * memory failure logs and moves on — it must never take the card settlement
  * or the round's removal down with it), then drop the round.
  *
- * The episode only fires on a CLEAN, CHANGED, APPROVED round: work happened
- * (hadTurn), it left code evidence (changedPaths), the review verdict is
- * PASS, verify (when configured) passed, and the last real turn ended ok.
- * Everything else — blocked, errored, stopped, pure chat — is not "finished
- * work" and writes nothing. (A hop-limited round whose last turn still ended
- * ok with a PASS verdict DOES write: the work happened and was approved —
- * only the relay chain was cut short.)
+ * The episode only fires on a CLEAN, CHANGED, APPROVED round
+ * (roundWorkApproved). Everything else — blocked, errored, stopped, pure
+ * chat — is not "finished work" and writes nothing. (A hop-limited round
+ * whose last turn still ended ok with a PASS verdict DOES write: the work
+ * happened and was approved — only the relay chain was cut short.)
  */
 function closeRoundNormally(roomId: string, round: RoundState): void {
   settleTaskClosed(roomId, round)
-  if (
-    round.hadTurn &&
-    round.changedPaths.length > 0 &&
-    round.verdict === 'pass' &&
-    round.verifyState !== 'fail' &&
-    round.lastTurnOutcome === 'ok'
-  ) {
+  if (roundWorkApproved(round)) {
     try {
       db.addRoundEpisode({
         roomId,
@@ -759,6 +776,58 @@ function closeRoundNormally(roomId: string, round: RoundState): void {
     }
   }
   rounds.delete(roomId)
+}
+
+/**
+ * Auto-commit on clean close (S13): a round whose work is done and approved
+ * lands as one commit of exactly its changed paths — deterministic server
+ * behavior at the round's drain point (the same moment a summarizer speaks),
+ * never delegated to an agent turn that could mis-run git, and NEVER a push:
+ * pushing stays a user decision, the notice says how to ask. Failure degrades
+ * to a notice; the round closes regardless.
+ */
+async function autoCommitRound(room: Room, round: RoundState): Promise<void> {
+  const subject = `auto: ${truncate((round.lastDelivery ?? '').trim(), 66) || '本轮改动（review PASS）'}`
+  const reviewer = round.verdictAuthor ? db.getCharacter(round.verdictAuthor.id) : undefined
+  // The body lists the paths that actually go INTO the commit (kept), not the
+  // raw round change set — ghosts and ignored files were filtered out by then.
+  const buildBody = (keptPaths: string[]) =>
+    [
+      `改动: ${keptPaths.slice(0, 8).join('、')}${keptPaths.length > 8 ? ` 等 ${keptPaths.length} 个` : ''}`,
+      `REVIEW: PASS（${reviewer?.name ?? '未知角色'}）`,
+      'agent-crowd 轮次收尾自动提交；push 未执行，等用户确认。',
+    ].join('\n')
+  // Hold the gate flag through the commit: /state must keep answering
+  // gate=running across the await — without it, a waitIdle poll between
+  // "verify settled" and "summary queued" catches a fleeting idle and
+  // observes a round that isn't closed yet. Same reference-count reasoning
+  // as verifyRuns (overlapping rounds), and a pending restart drains behind
+  // it too.
+  verifyRuns.set(room.id, (verifyRuns.get(room.id) ?? 0) + 1)
+  try {
+    const result = await commitPaths(room.workingDir, round.changedPaths, { subject, body: buildBody })
+    if (result.skipped === 'ignored') {
+      sendGateNotice(room.id, 'ℹ️ 本轮改动均为被 gitignore 的文件，自动提交跳过。')
+    } else if (result.skipped === 'empty') {
+      sendGateNotice(room.id, 'ℹ️ 没有可提交的新改动（可能已被提交过），自动提交跳过。')
+    } else if (!result.ok) {
+      sendGateNotice(room.id, `⚠️ 自动提交失败：${result.error ?? '未知原因'}。改动仍在工作区，可手动提交。`)
+    } else {
+      const fileCount = result.files?.length ?? round.changedPaths.length
+      sendGateNotice(
+        room.id,
+        `📦 本轮改动已自动提交：${result.hash} ${subject}（${fileCount} 个文件）。push 未执行，需要推送时说一声即可。`,
+      )
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    console.warn(`[agent-crowd] auto-commit failed (${room.id}): ${reason}`)
+    sendGateNotice(room.id, `⚠️ 自动提交失败：${reason}。改动仍在工作区，可手动提交。`)
+  } finally {
+    const remaining = (verifyRuns.get(room.id) ?? 1) - 1
+    if (remaining > 0) verifyRuns.set(room.id, remaining)
+    else verifyRuns.delete(room.id)
+  }
 }
 
 /**
@@ -882,6 +951,16 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
     }
     // decision === 'close' → straight to the summary below.
   }
+
+  // S13 auto-commit: work that cleared the gate lands as one commit before
+  // the summary queues (the summarizer then reports it in the round
+  // summary). Never a push — see autoCommitRound. autoCommitStarted guards
+  // the await window against a re-entrant pump visit.
+  if (roundWorkApproved(round) && !round.autoCommitStarted) {
+    round.autoCommitStarted = true
+    await autoCommitRound(room, round)
+  }
+  if (rounds.get(roomId) !== round) return false
 
   const summarizers = db.listCharacters(roomId).filter((character) => character.enabled && character.triggers.onRoundEnd)
   if (summarizers.length === 0) {
