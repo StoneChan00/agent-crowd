@@ -106,8 +106,34 @@ export async function snapshotWorktree(cwd: string): Promise<WorktreeSnapshot> {
   const root = top.stdout.trim()
   const status = await git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
   if (!status.ok) return UNAVAILABLE
-  const diff = await git(root, ['diff', 'HEAD', '--stat'])
-  const entries = parsePorcelainZ(status.stdout)
+  // The DIFFSTAT cannot be filtered in JS: git abbreviates long paths in its
+  // text (`.../ses_...json | 4 +-`), so slicing it is unreliable. Excluded at
+  // the command level instead — and the trailing `/**` is load-bearing: a
+  // pathspec like `:(exclude)**/.omo` matches only the directory entry, never
+  // its contents (this is exactly why the first attempt, `:!**/.omo`,
+  // silently excluded nothing; probed on git 2.51).
+  const diff = await git(root, [
+    'diff',
+    'HEAD',
+    '--stat',
+    '--',
+    ':(exclude).omo',
+    ':(exclude)**/.omo/**',
+  ])
+  // Status entries are filtered here in JS — one code path feeding paths,
+  // entries and the digest's status part. The opencode-family CLIs write
+  // session-continuation files under `.omo/run-continuation/` in their cwd
+  // every turn; agent-crowd's own repo ignores `.omo/`, but a user project
+  // that does not (e.g. a fresh ComfyUI checkout) would otherwise see them
+  // surface as "code changes" — no-change rounds would gate-block on harness
+  // state, and a green round's auto-commit would commit it into the user's
+  // repo. The digest is rebuilt from the filtered entries (never the raw
+  // status text) for the same reason: otherwise pure .omo churn would move
+  // the digest, and a moved digest with no attributable diff path degrades
+  // changedPathsBetween to the full dirty-path fallback.
+  const entries = parsePorcelainZ(status.stdout).filter(
+    (entry) => !entry.path.split('/').some((segment) => segment === '.omo'),
+  )
   // Every dirty entry gets a size+mtime fingerprint. Three holes it closes:
   // untracked edits never reach `git diff HEAD`; a tracked re-edit can keep
   // its XY code; and a 1-line-for-1-line swap keeps the diffstat numbers
@@ -125,7 +151,9 @@ export async function snapshotWorktree(cwd: string): Promise<WorktreeSnapshot> {
     }),
   )
   const digest = createHash('sha1')
-    .update(status.stdout)
+    // Rebuilt from the FILTERED entries, never the raw status text — see the
+    // .omo filtering comment above for the fallback path this avoids.
+    .update(entries.map((entry) => `${entry.status} ${entry.path}`).join('\n'))
     .update('\n--diff--\n')
     .update(diff.ok ? diff.stdout : '')
     .update('\n--fingerprints--\n')

@@ -546,6 +546,73 @@ async function scenarioSnapshot() {
   check('S3 两侧其一不可判定 → null（无法判定≠无改动）', changedPathsBetween(clean1, { ...clean1, available: false }) === null)
   check('S3 digest 相同 → []', JSON.stringify(changedPathsBetween(clean1, { ...clean1 })) === '[]')
 
+  // The opencode-family CLIs write session-continuation files under `.omo/`
+  // in the turn cwd every round. Snapshots must never see them — root or
+  // nested: a user repo that doesn't ignore `.omo/` would gate-block
+  // no-change rounds on harness state and auto-commit it as project work.
+  for (const dir of [join(sub, '.omo', 'run-continuation'), join(sub, 'nested', 'deep', '.omo')]) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'ses_x.json'), '{"v":1}')
+  }
+  const omo1 = await snapshotWorktree(sub)
+  check(
+    'S3 .omo 运行时产物不进快照（根层与嵌套层）',
+    !omo1.paths.some((path) => path.includes('/.omo/') || path.startsWith('.omo/')),
+    JSON.stringify(omo1.paths),
+  )
+  await sleep(60)
+  writeFileSync(join(sub, '.omo', 'run-continuation', 'ses_x.json'), '{"v":2}')
+  writeFileSync(join(sub, 'nested', 'deep', '.omo', 'ses_x.json'), '{"v":2}')
+  writeFileSync(join(sub, 'omo-neighbor.txt'), 'visible change')
+  const omo2 = await snapshotWorktree(sub)
+  const omoChanged = changedPathsBetween(omo1, omo2)
+  check(
+    'S3 .omo 变化不算代码改动（真实文件照常进 changed）',
+    omoChanged.includes('workspace/omo-neighbor.txt') && !omoChanged.some((path) => path.includes('.omo')),
+    JSON.stringify(omoChanged),
+  )
+  await sleep(60)
+  writeFileSync(join(sub, '.omo', 'run-continuation', 'ses_y.json'), '{"fresh":true}')
+  const omo3 = await snapshotWorktree(sub)
+  check('S3 纯 .omo 变化 → digest 不受影响（快照根本不看它）', omo3.digest === omo2.digest, 'digest moved')
+
+  // A TRACKED .omo file is the other half (review round: only untracked was
+  // covered): its edit moves the diffstat, and with status entries filtered
+  // there is nothing to attribute the moved digest to — changedPathsBetween
+  // would degrade to the full dirty-path fallback and bill the user's
+  // unrelated WIP to the round. The diffstat exclusion is what closes it.
+  mkdirSync(join(sub, 'wip-user'), { recursive: true })
+  writeFileSync(join(sub, 'wip-user', 'wip.ts'), 'user WIP\n')
+  writeFileSync(join(sub, '.omo', 'run-continuation', 'ses_tracked.json'), 'v1\n')
+  execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', repo, '-c', 'user.name=sop', '-c', 'user.email=sop@t', 'commit', '-m', 'seed tracked omo'], {
+    stdio: 'ignore',
+  })
+  const trackedOmo = await snapshotWorktree(sub)
+  await sleep(60)
+  writeFileSync(join(sub, '.omo', 'run-continuation', 'ses_tracked.json'), 'v1\nv2\nv3\n')
+  writeFileSync(join(sub, 'wip-user', 'wip.ts'), 'user WIP\nedited this round\n')
+  const trackedOmoEdited = await snapshotWorktree(sub)
+  const trackedChanged = changedPathsBetween(trackedOmo, trackedOmoEdited)
+  check(
+    'S3 已跟踪 .omo 的行数变化不进 digest/changed（diffstat 排除生效）',
+    trackedChanged.length === 1 && trackedChanged[0] === 'workspace/wip-user/wip.ts',
+    JSON.stringify(trackedChanged),
+  )
+  check(
+    'S3 tracked-omo 编辑后 digest 归因仍然精确（不退化成全量脏路径）',
+    trackedOmoEdited.digest !== trackedOmo.digest && trackedChanged.length === 1,
+    'digest moved with no attribution',
+  )
+  await sleep(60)
+  writeFileSync(join(sub, '.omo', 'run-continuation', 'ses_tracked.json'), 'v1\nv2\nv3\nv4\nv5\n')
+  const trackedOmoOnly = await snapshotWorktree(sub)
+  check(
+    'S3 纯 tracked-omo 行数变化 → digest 不动',
+    trackedOmoOnly.digest === trackedOmoEdited.digest,
+    'digest moved on pure tracked-omo churn',
+  )
+
   const nonGit = mkdtempSync(join(tmpdir(), 'ac-sop-s3n-'))
   tempDirs.push(nonGit)
   const noRepo = await snapshotWorktree(nonGit)
