@@ -23,6 +23,7 @@ import {
   type LaunchMatch,
 } from './harnesses/process.ts'
 import * as orchestrator from './orchestrator.ts'
+import { mediaFileHandler } from './media.ts'
 import { listMcps } from './mcps.ts'
 import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, SKILLS_DIR, WEB_DIST } from './paths.ts'
@@ -1004,6 +1005,11 @@ app.post('/api/tasks/:id/dispatch', (req, res) => {
 })
 
 /* ------------------------------------------------------------------ static */
+
+// M1 media: serves generated images/videos for the rewritten markdown links.
+// Mounted BEFORE the static/SPA block — and /api is explicitly excluded from
+// the SPA fallback below, so this route keeps priority either way.
+app.get('/api/files', mediaFileHandler)
 
 if (existsSync(WEB_DIST)) {
   app.use(express.static(WEB_DIST))

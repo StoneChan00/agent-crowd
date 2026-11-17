@@ -839,6 +839,24 @@ select {
   line-height: 1.65;
   color: #d7dbe6;
 }
+
+/* M1 in-chat media: a 1024×1024 render must not blow up the bubble — the
+   image caps at the bubble width and opens full-size in a new tab; videos
+   keep their intrinsic player and cap the height instead. */
+.markdown .msg-media {
+  display: block;
+  max-width: 100%;
+  border-radius: 10px;
+  margin: 8px 0;
+}
+.markdown img.msg-media {
+  cursor: zoom-in;
+}
+.markdown video.msg-media-video {
+  width: 100%;
+  max-height: 420px;
+  cursor: default;
+}
 .markdown blockquote {
   margin: 10px 0;
   padding: 2px 12px;

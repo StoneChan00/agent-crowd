@@ -202,8 +202,8 @@ check('@所有人 resolves to a broadcast chip', resolveMention('所有人', ros
   )
   check(
     'relay detection strips code too',
-    orchestrator.includes('visibleText(content)'),
-    'shouldWake/mentions must ignore quoted @name, or the escape hatch is one-way',
+    orchestrator.includes('visibleText(media.text)'),
+    'shouldWake/mentions must ignore quoted @name, or the escape hatch is one-way (media.text: the relay path reads the media-rewritten text, so a [media] link never mints a call either)',
   )
   check(
     'relay parses once, outside the per-member filter',

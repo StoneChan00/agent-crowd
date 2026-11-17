@@ -14,6 +14,7 @@ import { buildHandoff, type HandoffInput } from './handoff.ts'
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
 import { gateDecision, parseReviewVerdict, type GateAuthor, type GateBlockReason } from './sop.ts'
+import { rewriteMediaLines } from './media.ts'
 import { loadSkills } from './skills.ts'
 import { SKILLS_DIR } from './paths.ts'
 import type { Character, HarnessKind, Message, Room, Task, ToolTrace, Turn } from './types.ts'
@@ -1243,6 +1244,7 @@ async function pump(roomId: string): Promise<void> {
       // Keep whatever streamed before the stop: without this the text vanished
       // together with the live buffer. meta.error flags it as incomplete.
       if (output.text.trim()) {
+        const stoppedMedia = rewriteMediaLines(output.text)
         const stopped = db.addMessage({
           roomId,
           authorType: 'character',
@@ -1250,7 +1252,7 @@ async function pump(roomId: string): Promise<void> {
           authorName: character.name,
           authorAvatar: character.avatar,
           color: character.color,
-          content: output.text,
+          content: stoppedMedia.text,
           meta: {
             harness: character.harness,
             model: character.model,
@@ -1260,6 +1262,7 @@ async function pump(roomId: string): Promise<void> {
             pid: output.pid,
             error: '已停止',
             generated: true,
+            ...(stoppedMedia.attachments.length > 0 ? { attachments: stoppedMedia.attachments } : {}),
           },
         })
         broadcast(roomId, 'message', { roomId, message: stopped })
@@ -1319,6 +1322,10 @@ async function pump(roomId: string): Promise<void> {
     const content =
       output.text.trim() ||
       `（${character.name} 没有返回正文 · 耗时 ${Math.round((output.durationMs ?? 0) / 1000)} 秒 · exit ${output.exitCode} · 工具调用 ${output.toolTraces?.length ?? 0} 次）`
+    // M1 media: `[media] <path>` lines become short markdown links served by
+    // /api/files (relay/handoff below read the rewritten text, so a media
+    // line never leaks into delivery or a follow-up prompt as a raw path).
+    const media = rewriteMediaLines(content)
     // Who this reply hands off to (developer → reviewer), one relay level
     // deeper than the message that triggered this turn. Computed BEFORE the
     // row is written so `meta.relayTo` can carry the truth — the UI shows
@@ -1333,7 +1340,7 @@ async function pump(roomId: string): Promise<void> {
     // Extract once, match per member — the same shape as the user-message
     // router above, so a room of ten members parses ten names, not ten
     // markdown trees.
-    const plain = relays ? visibleText(content) : ''
+    const plain = relays ? visibleText(media.text) : ''
     const followers = relays
       ? db
           .listCharacters(room.id)
@@ -1346,7 +1353,7 @@ async function pump(roomId: string): Promise<void> {
                   authorType: 'character',
                   characterId: character.id,
                   authorName: character.name,
-                  content,
+                  content: media.text,
                 },
                 plain,
               ),
@@ -1383,7 +1390,7 @@ async function pump(roomId: string): Promise<void> {
     const handoff =
       followers.length > 0
         ? buildHandoff({
-            lastDelivery: episodeDelivery(content) || ownRound?.lastDelivery || '',
+            lastDelivery: episodeDelivery(media.text) || ownRound?.lastDelivery || '',
             changedPaths: [...(ownRound?.changedPaths ?? []), ...(changedPaths ?? [])],
             taskId: item.taskId ?? null,
             taskWhy: item.taskId ? (db.getTask(item.taskId)?.why ?? null) : null,
@@ -1402,7 +1409,7 @@ async function pump(roomId: string): Promise<void> {
       authorName: character.name,
       authorAvatar: character.avatar,
       color: character.color,
-      content,
+      content: media.text,
       meta: {
         harness: character.harness,
         model: character.model,
@@ -1420,6 +1427,9 @@ async function pump(roomId: string): Promise<void> {
         // resumed CLI session (incremental prompt) or a full replay.
         resume: useResume || undefined,
         generated: true,
+        // M1: absolute paths behind the rewritten media links — the archive /
+        // gallery hook later features can build on.
+        ...(media.attachments.length > 0 ? { attachments: media.attachments } : {}),
         ...(changedPaths && changedPaths.length > 0 ? { changed: changedPaths } : {}),
         // B06: the five-tuple relay context — see the handoff block above.
         ...(handoff ? { handoff } : {}),

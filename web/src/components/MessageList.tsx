@@ -283,6 +283,27 @@ function MessageRow({
                       {children}
                     </a>
                   ),
+                // M1 media: rewritten `[media]` links render in-chat — the
+                // extension picks the tag. Only /api/files (and relative) URLs
+                // survive react-markdown's defaultUrlTransform, which is exactly
+                // the short-link shape the server rewrites to.
+                img: ({ node: _node, src, alt, ...props }) => {
+                  if (!src) return null
+                  const url = String(src)
+                  if (/\.(mp4|webm)(\?|$)/i.test(url)) {
+                    return <video className="msg-media msg-media-video" src={url} controls preload="metadata" />
+                  }
+                  return (
+                    <img
+                      className="msg-media"
+                      src={url}
+                      alt={alt ?? ''}
+                      loading="lazy"
+                      onClick={() => window.open(url, '_blank')}
+                      {...props}
+                    />
+                  )
+                },
               }}
             >
               {message.content}
