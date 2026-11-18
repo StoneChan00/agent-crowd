@@ -1002,6 +1002,113 @@ async function scenarioKillSwitch() {
   check('P6 开关只关乘坐不关记账（turns 仍累加到 2）', row && row.turns === 2, JSON.stringify(row))
 }
 
+/* ----------------- P7 M2 timeout resume: the session survives the kill */
+
+/**
+ * A timed-out turn keeps its CLI session and rides ONE resume with a
+ * continue-instruction, instead of settling for the truncated reply and
+ * losing the prompt cache on a manual full replay. Three rooms on one
+ * server: (a) zero-text timeout → notice → resume reply; (b) partial-text
+ * timeout → lands as-is with meta.error, THEN resumed; (c) the resume
+ * times out again → the once-per-turn guard holds, no second resume.
+ */
+async function scenarioTimeoutResume() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-session-p7-'))
+  tempDirs.push(dir)
+  const work = mkdtempSync(join(tmpdir(), 'ac-session-p7w-'))
+  tempDirs.push(work)
+
+  const server = await bootServer(dir)
+  const port = server.port
+  const roomMessages = async (roomId) => (await req(port, `/api/rooms/${roomId}/messages?limit=200`)).messages
+
+  // (a) zero-text timeout: notice + one resumed reply riding the session.
+  {
+    const room = await makeRoom(port, 'p7a-超时续跑', work)
+    const character = await makeCharacter(port, room.id, '甲', 'MOCK-超时')
+    await postMessage(port, room.id, '跑个安静的长任务')
+    await waitIdle(port, room.id, 40_000)
+    const messages = await roomMessages(room.id)
+    check('P7a 零文本超时后系统播报恰 1 条（恢复会话自动续跑）', systemNotices(messages, '自动续跑').length === 1, `实际 ${systemNotices(messages, '自动续跑').length}`)
+    const replies = characterMessages(messages, '甲')
+    check(
+      'P7a 最终恰 1 条角色回复（续跑完成形态，无半截残留）',
+      replies.length === 1 && replies[0].content.includes('已从中断处继续'),
+      `实际 ${replies.length} 条: ${replies.map((m) => m.content.slice(0, 30)).join(' / ')}`,
+    )
+    check('P7a 续跑回合乘坐已存会话（meta.resume=true）', replies[0]?.meta?.resume === true, JSON.stringify(replies[0]?.meta?.resume))
+    check('P7a 恢复播报代替了失败播报（无「运行失败」）', systemNotices(messages, '运行失败').length === 0, 'unexpected failure notice')
+    const row = sessionRows(dir, 'room_id = ?', room.id)[0]
+    check('P7a session 行存在且 turns=2（超时回合也记账）', row && row.turns === 2, JSON.stringify(row))
+    const turns = turnRows(dir, 'character_id = ?', character.id)
+    check(
+      'P7a turn 行恰 2 条：首回合 error、续跑 done',
+      turns.length === 2 && turns[0].status === 'error' && turns[1].status === 'done',
+      JSON.stringify(turns.map((t) => t.status)),
+    )
+  }
+
+  // (b) partial-text timeout: the truncation lands as-is, then resumes.
+  {
+    const room = await makeRoom(port, 'p7b-超时半截', work)
+    await makeCharacter(port, room.id, '乙', 'MOCK-超时半截')
+    await postMessage(port, room.id, '跑个安静的长任务，边跑边汇报')
+    await waitIdle(port, room.id, 40_000)
+    const messages = await roomMessages(room.id)
+    check('P7b 半截超时后系统播报恰 1 条', systemNotices(messages, '自动续跑').length === 1, `实际 ${systemNotices(messages, '自动续跑').length}`)
+    const replies = characterMessages(messages, '乙')
+    check(
+      'P7b 半截产出落库（meta.error 标记截断）+ 续跑完成，恰 2 条',
+      replies.length === 2 &&
+        replies[0].content.includes('干到一半') &&
+        String(replies[0].meta?.error ?? '').includes('运行超时') &&
+        replies[1].content.includes('已从中断处继续') &&
+        !replies[1].meta?.error,
+      JSON.stringify(replies.map((m) => ({ text: m.content.slice(0, 24), error: m.meta?.error ?? null }))),
+    )
+    check('P7b 续跑回合乘坐已存会话（meta.resume=true）', replies[1]?.meta?.resume === true, JSON.stringify(replies[1]?.meta?.resume))
+  }
+
+  // (c) the guard: a resume that times out again settles — no second ride.
+  {
+    const room = await makeRoom(port, 'p7c-超时连挂', work)
+    await makeCharacter(port, room.id, '丙', 'MOCK-超时连挂')
+    await postMessage(port, room.id, '这个任务会一直卡住')
+    await waitIdle(port, room.id, 40_000)
+    const messages = await roomMessages(room.id)
+    check('P7c 续跑也超时后不再续（播报仍恰 1 条）', systemNotices(messages, '自动续跑').length === 1, `实际 ${systemNotices(messages, '自动续跑').length}`)
+    const replies = characterMessages(messages, '丙')
+    check(
+      'P7c 最终只落续跑的半截（meta.error），无第二次续跑回复',
+      replies.length === 1 && replies[0].content.includes('续跑到一半') && String(replies[0].meta?.error ?? '').includes('运行超时'),
+      JSON.stringify(replies.map((m) => m.content.slice(0, 24))),
+    )
+  }
+
+  // (d) zero-text timeout ON the resume ride: settles with the failure
+  // notice but the surviving session row MUST stay (the wrong clearSession
+  // used to wipe it, turning every later turn into a full replay).
+  {
+    const room = await makeRoom(port, 'p7d-超时连挂零文本', work)
+    await makeCharacter(port, room.id, '丁', 'MOCK-超时连挂零文本')
+    await postMessage(port, room.id, '续跑也一声不吭')
+    await waitIdle(port, room.id, 40_000)
+    const messages = await roomMessages(room.id)
+    check('P7d 续跑零文本超时后不再续（播报仍恰 1 条）', systemNotices(messages, '自动续跑').length === 1, `实际 ${systemNotices(messages, '自动续跑').length}`)
+    check(
+      'P7d 最终以「运行失败」结算（零文本无角色消息可落）',
+      systemNotices(messages, '运行失败').length === 1 && characterMessages(messages, '丁').length === 0,
+      `${systemNotices(messages, '运行失败').length} 条失败播报`,
+    )
+    const row = sessionRows(dir, 'room_id = ?', room.id)[0]
+    check(
+      'P7d 会话行保留且续跑超时也记账（turns=2：写入发生、clearSession 未删）',
+      row && String(row.session_id).startsWith('mock-') && row.turns === 2,
+      JSON.stringify(row),
+    )
+  }
+}
+
 /* ------------------------------------------------------------------- main */
 
 try {
@@ -1015,6 +1122,7 @@ try {
   await scenarioIncrementalFetch()
   await scenarioFallback()
   await scenarioKillSwitch()
+  await scenarioTimeoutResume()
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)

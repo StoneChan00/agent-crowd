@@ -553,6 +553,67 @@ function enqueue(
 }
 
 /**
+ * M2 timeout resume — the continue-instruction rides the CLI's own session,
+ * so the model picks up where the watchdog cut it short instead of a manual
+ * rerun replaying the full transcript (fresh prompt, cold cache).
+ */
+const TIMEOUT_RESUME_INSTRUCTION =
+  '系统续跑指令：你的上一回合因超时被截断（进程已被停止，CLI 会话已恢复）。请从中断处继续完成原任务：已完成的部分不要重复，直接补完剩余工作并给出最终回复。'
+
+/** Eligibility for the one automatic timeout-resume ride (M2). */
+function timeoutResumeEligible(
+  output: { timedOut?: boolean; sessionId?: string },
+  adapter: { resumeArgs?: (id: string) => string[] | null },
+  item: QueueItem,
+): boolean {
+  return (
+    Boolean(output.timedOut && output.sessionId && adapter.resumeArgs) &&
+    !item.retry &&
+    process.env.AC_SESSION_RESUME !== '0'
+  )
+}
+
+/**
+ * A timed-out turn is usually a silent long tool call, not a dead session —
+ * the CLI's session survives the kill on disk. Eligibility: the adapter
+ * declared resume support AND the run surfaced a session id AND this is the
+ * turn's first strike (item.retry) — a resume that times out again settles
+ * like any other timeout. Returns whether the continue-instruction was
+ * queued.
+ */
+function maybeResumeAfterTimeout(
+  roomId: string,
+  character: Character,
+  item: QueueItem,
+  output: { timedOut?: boolean; sessionId?: string; error?: string },
+  adapter: { resumeArgs?: (id: string) => string[] | null },
+): boolean {
+  if (!timeoutResumeEligible(output, adapter, item)) return false
+  // Queue FIRST, announce after: enqueue silently no-ops when a same-character
+  // item is already waiting (a mid-turn @), and the P0-1 discipline (see
+  // enqueue's own comment) is to never promise an automatic retry that did
+  // not enter the queue — a notice without a ride would also contradict the
+  // failure settlement that follows.
+  const queued = enqueue(roomId, character.id, item.triggerMessageId, item.hop, TIMEOUT_RESUME_INSTRUCTION, {
+    allowActive: true,
+    retry: true,
+    isRoundSummary: item.isRoundSummary,
+    roundId: item.roundId ?? null,
+    taskId: item.taskId ?? null,
+  })
+  if (!queued) return false
+  const notice = db.addMessage({
+    roomId,
+    authorType: 'system',
+    authorName: '系统',
+    content: `⏳ ${character.name} 的回合超时被截断，已恢复其 CLI 会话自动续跑一次（${truncate(output.error ?? '运行超时', 80)}）。`,
+    meta: { generated: true },
+  })
+  broadcast(roomId, 'message', { roomId, message: notice })
+  return true
+}
+
+/**
  * Queue the members this reply hands off to, one relay level deeper. The list
  * is computed before the message is stored (see `pump`) so the row can carry
  * `meta.relayTo`, which is what the UI shows as "接力 → …": the browser
@@ -1280,6 +1341,25 @@ async function pump(roomId: string): Promise<void> {
         endedAt: Date.now(),
       })
       broadcast(roomId, 'turn', { roomId, turnId, characterId: character.id, status: 'error' })
+      // M2: a TIMEOUT (not a CLI rejection) keeps the session and rides one
+      // resume instead of settling. The error path returns above, so the
+      // session row the resume turn rides is written HERE. Bookkeeping is
+      // decoupled from the ride: `AC_SESSION_RESUME=0` or an already-retried
+      // turn still records the killed CLI's surviving session (the same
+      // record-only rule P6 pins for the normal path); the switch gates the
+      // RIDE, not the row.
+      if (output.timedOut && output.sessionId) {
+        db.setSession({
+          roomId,
+          characterId: character.id,
+          harness: character.harness,
+          model: character.model,
+          sessionId: output.sessionId,
+          consumedAt: built.nextCursor.at,
+          consumedSeq: built.nextCursor.seq,
+        })
+      }
+      if (maybeResumeAfterTimeout(roomId, character, item, output, adapter)) return
       // Session-continuity fallback (P0-1): a turn that died resuming its
       // CLI session clears the row first, so the rerun (and every later
       // turn) replays the FULL transcript. A resume rejection is plumbing,
@@ -1287,7 +1367,11 @@ async function pump(roomId: string): Promise<void> {
       // not, still under the same `item.retry` loop guard (never two).
       // And the rerun's reply IS the answer the user asked for, so no
       // failure notice goes out when the fallback is queued.
-      if (useResume) db.clearSession(roomId, character.id)
+      // M2: a TIMEOUT is not a resume rejection — the CLI session survives
+      // the kill, so the row must too (a zero-text timeout on the resume
+      // ride reaches here with item.retry set; wiping the row would turn
+      // every later turn into a full replay).
+      if (useResume && !output.timedOut) db.clearSession(roomId, character.id)
       const fallbackRetry = useResume && !item.retry
       const retryQueued =
         (fallbackRetry || isTransientFailure(output)) &&
@@ -1515,7 +1599,11 @@ async function pump(roomId: string): Promise<void> {
     // (duplication is recoverable, a skip is not). Rows are written even
     // under AC_SESSION_RESUME=0: the switch disables the RIDE, not the
     // bookkeeping, so flipping it back on resumes seamlessly.
-    if (!output.error && output.sessionId) {
+    // M2 exception: a TIMED-OUT turn also writes the row — the CLI session
+    // survives the kill and the model DID consume the input this prompt
+    // represented, so the cursor advance is honest; without the row the
+    // timeout resume below would find nothing to ride.
+    if ((!output.error || output.timedOut) && output.sessionId) {
       db.setSession({
         roomId,
         characterId: character.id,
@@ -1527,6 +1615,11 @@ async function pump(roomId: string): Promise<void> {
       })
     }
     enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null, item.taskId ?? null)
+    // M2: a timed-out turn with partial text lands as-is (meta.error flags
+    // the truncation) and the session row survives — hand the character one
+    // resume ride to finish what the watchdog cut short. Round identity and
+    // card link ride along (B03): the continuation is the SAME work.
+    maybeResumeAfterTimeout(roomId, character, item, output, adapter)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     console.error(`[agent-crowd] pump(${roomId}) failed:`, reason)

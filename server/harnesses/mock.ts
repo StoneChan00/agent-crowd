@@ -262,6 +262,43 @@ export const mockAdapter: HarnessAdapter = {
       }
       return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
+    // Test seam for session-check (M2 timeout resume): first strike returns a
+    // watchdog kill — timedOut with the session id SURVIVING (a killed CLI's
+    // session lives on disk). The orchestrator answers with the
+    // continue-instruction as an override, which arrives in the prompt —
+    // the resume turn then replies normally. Variants: `半截` makes the
+    // first strike land PARTIAL text (the lands-as-is path); `连挂` keeps
+    // timing out on the resume too (with partial text, exercising the
+    // once-per-turn guard); `连挂` + `零文本` makes the RESUME zero-text —
+    // the path where a wrong clearSession would wipe the surviving session.
+    if (input.character.persona.includes('MOCK-超时')) {
+      const resuming = input.prompt.includes('因超时被截断')
+      const stuck = input.character.persona.includes('连挂')
+      if (!resuming || stuck) {
+        const partial = resuming
+          ? input.character.persona.includes('零文本')
+            ? ''
+            : '续跑到一半的产出。'
+          : input.character.persona.includes('半截')
+            ? '首回合干到一半的产出。'
+            : ''
+        return {
+          text: partial,
+          error: '运行超时（10 分钟 无输出）',
+          timedOut: true,
+          sessionId: mockSessionId(input.character.id),
+          exitCode: -1,
+          durationMs: Date.now() - started,
+          tokens: { input: 0, output: partial.length, total: partial.length },
+        }
+      }
+      const resumedReply = `（mock 续跑）${input.character.name} 已从中断处继续并完成原任务。`
+      for (const chunk of resumedReply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: resumedReply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: resumedReply.length, total: resumedReply.length } }
+    }
     // Test seams for sop-check (SOP gate, P0-3): the character's PERSONA is
     // the behavior switch — one character per role in the fixture, no
     // prompt-text coupling to the user message.
