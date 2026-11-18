@@ -438,6 +438,15 @@ app.post('/api/rooms/:id/steer', (req, res) => {
   orchestrator.steer(room, character, message)
 })
 
+/* ------------------------------------------------------------------- usage */
+
+/** Per-character token usage for a room, aggregated from harness-reported data. */
+app.get('/api/rooms/:id/usage', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  res.json(db.getRoomUsage(room.id))
+})
+
 /* ---------------------------------------------------------------- memories */
 
 /**

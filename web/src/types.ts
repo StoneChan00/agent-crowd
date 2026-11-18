@@ -2,6 +2,7 @@ export type {
   AuthorType,
   Character,
   CharacterPreset,
+  CharacterUsage,
   HarnessKind,
   Memory,
   MemoryKind,
@@ -9,6 +10,7 @@ export type {
   Message,
   MessageMeta,
   Room,
+  RoomUsage,
   Skill,
   Task,
   TaskStatus,
@@ -16,6 +18,7 @@ export type {
   Triggers,
   Turn,
   TurnTokens,
+  UsageTotals,
 } from '../../server/types.ts'
 
 /** One skills/*.md entry WITHOUT the body — the editor's checkbox list item (B07). */

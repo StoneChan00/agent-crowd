@@ -1,11 +1,61 @@
 import { useEffect, useState } from 'react'
-import type { Character, Memory, Room } from '../types'
+import type { Character, HarnessMap, McpMap, Memory, Room } from '../types'
 import { api } from '../lib/api'
+import { modelShort } from '../lib/format'
 import { Modal } from './Modal'
+
+interface Readiness {
+  level: 'ok' | 'warn' | 'error' | 'off'
+  issues: string[]
+  mcpEnabled: number
+}
+
+/**
+ * A local, best-effort readiness check for one character: is its CLI on this
+ * machine, is the configured model in the harness's own candidate list, does
+ * DSH have credentials, and is a custom command actually filled in. It never
+ * calls the network — everything comes from the same probes /api/health uses.
+ */
+function readinessFor(
+  character: Character,
+  harnesses: HarnessMap,
+  models: Record<string, string[]>,
+  mcps: McpMap | null,
+): Readiness {
+  if (!character.enabled) return { level: 'off', issues: [], mcpEnabled: 0 }
+  const issues: string[] = []
+  const info = harnesses[character.harness]
+  if (!info?.available) issues.push(`CLI 不可用（${info?.detail ?? '未找到'}）`)
+  if (character.harness === 'custom' && !character.commandTemplate.trim()) {
+    issues.push('自定义命令未填写')
+  }
+  if (character.harness === 'dsh' && info?.detail?.includes('缺失')) {
+    issues.push('DeepSeek 凭据缺失')
+  }
+  const wanted = character.model.trim()
+  const candidates = models[character.harness] ?? []
+  if (wanted && candidates.length > 0) {
+    const short = (value: string) => value.split('/').pop() ?? value
+    const matched = candidates.some(
+      (candidate) => candidate === wanted || short(candidate) === wanted || short(candidate) === short(wanted),
+    )
+    if (!matched) issues.push(`模型 ${wanted} 不在候选列表`)
+  }
+  const mcpInfo = mcps?.[character.harness]
+  if (mcpInfo?.error) issues.push(`MCP 配置读取失败：${mcpInfo.error}`)
+  const mcpEnabled = mcpInfo?.servers.filter((server) => server.enabled).length ?? 0
+  return {
+    level: issues.length === 0 ? 'ok' : issues.some((issue) => /不可用|缺失|未填写/.test(issue)) ? 'error' : 'warn',
+    issues,
+    mcpEnabled,
+  }
+}
 
 interface RoomSettingsProps {
   room: Room | null
   characters: Character[]
+  harnesses: HarnessMap
+  models: Record<string, string[]>
   canDelete: boolean
   onClose: () => void
   onSave: (draft: {
@@ -25,7 +75,16 @@ const MEMORY_KINDS: { value: string; label: string }[] = [
   { value: 'preference', label: '约定' },
 ]
 
-export function RoomSettings({ room, characters, canDelete, onClose, onSave, onDelete }: RoomSettingsProps) {
+export function RoomSettings({
+  room,
+  characters,
+  harnesses,
+  models,
+  canDelete,
+  onClose,
+  onSave,
+  onDelete,
+}: RoomSettingsProps) {
   const [name, setName] = useState(room?.name ?? '')
   const [topic, setTopic] = useState(room?.topic ?? '')
   const [workingDir, setWorkingDir] = useState(room?.workingDir ?? '')
@@ -40,6 +99,23 @@ export function RoomSettings({ room, characters, canDelete, onClose, onSave, onD
   const [memoryInput, setMemoryInput] = useState('')
   const [memoryKind, setMemoryKind] = useState('decision')
   const [memoryBusy, setMemoryBusy] = useState(false)
+  /** MCP config per harness, for the readiness panel (best-effort: null = still reading). */
+  const [mcps, setMcps] = useState<McpMap | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .mcps()
+      .then((data) => {
+        if (!cancelled) setMcps(data.mcps)
+      })
+      .catch(() => {
+        if (!cancelled) setMcps({})
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     if (!room) {
@@ -128,6 +204,14 @@ export function RoomSettings({ room, characters, canDelete, onClose, onSave, onD
       setSaving(false)
     }
   }
+
+  const readiness = characters.map((character) => ({
+    character,
+    ...readinessFor(character, harnesses, models, mcps),
+  }))
+  const activeReadiness = readiness.filter((item) => item.level !== 'off')
+  const errorCount = activeReadiness.filter((item) => item.level === 'error').length
+  const warnCount = activeReadiness.filter((item) => item.level === 'warn').length
 
   return (
     <Modal
@@ -248,6 +332,42 @@ export function RoomSettings({ room, characters, canDelete, onClose, onSave, onD
           <span className="field-hint">
             指定后：REVIEW: PASS 必须来自该角色，且它与实现者不能是同一 harness（同一模型家族不算独立判断）。无论如何，实现者本人的自审 PASS 一律无效。
           </span>
+        </div>
+      )}
+
+      {room && characters.length > 0 && (
+        <div className="field">
+          <label>角色就绪检查</label>
+          <span className="field-hint">
+            只在本机探测 CLI、模型候选、凭据和 MCP 配置，不发起网络请求。
+            {activeReadiness.length > 0 &&
+              (errorCount > 0
+                ? ` 当前 ${errorCount} 个角色有阻塞问题${warnCount > 0 ? `，${warnCount} 个提示` : ''}。`
+                : warnCount > 0
+                  ? ` 当前 ${warnCount} 个提示，没有阻塞问题。`
+                  : ' 全部就绪。')}
+          </span>
+          <div className="readiness-list">
+            {readiness.map(({ character, level, issues, mcpEnabled }) => (
+              <div key={character.id} className={`readiness-row readiness-${level}`}>
+                <span className="readiness-dot" />
+                <span className="readiness-name">{character.name}</span>
+                <span className="readiness-harness">
+                  {harnesses[character.harness]?.label ?? character.harness} · {modelShort(character.model)}
+                </span>
+                {level !== 'off' && mcps?.[character.harness] && (
+                  <span className="readiness-mcp">MCP {mcpEnabled}</span>
+                )}
+                <span className="readiness-detail">
+                  {level === 'off'
+                    ? '未启用'
+                    : issues.length > 0
+                      ? issues.join('；')
+                      : '就绪'}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

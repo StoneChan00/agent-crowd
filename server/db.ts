@@ -3,11 +3,20 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { DATA_DIR } from './paths.ts'
 import { loadSeedAvatars } from './seed-avatars.ts'
-import { buildRoundEpisode, escapeLike, ftsQuote, planMemoryQuery, type RoundEpisodeFacts } from './memory.ts'
+import {
+  buildFailureEpisode,
+  buildRoundEpisode,
+  escapeLike,
+  FAILURE_LESSON_PREFIX,
+  ftsQuote,
+  planMemoryQuery,
+  type RoundEpisodeFacts,
+} from './memory.ts'
 import { DEFAULT_TRIGGERS,
   type AuthorType,
   type Character,
   type CharacterPreset,
+  type CharacterUsage,
   type HarnessKind,
   type Identity,
   type Memory,
@@ -17,11 +26,13 @@ import { DEFAULT_TRIGGERS,
   type MessageMeta,
   type Room,
   type RoundCheck,
+  type RoomUsage,
   type Session,
   type Task,
   type Triggers,
   type Turn,
   type TurnStatus,
+  type UsageTotals,
 } from './types.ts'
 import { pickDefined } from './util.ts'
 import { CALL_NAME_SOURCE } from './mentions.ts'
@@ -888,6 +899,68 @@ export function countMessages(roomId: string): number {
   return Number(row?.c ?? 0)
 }
 
+function emptyUsage(): UsageTotals {
+  return { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+}
+
+function addUsage(target: UsageTotals, tokens: NonNullable<MessageMeta['tokens']>): void {
+  const input = tokens.input ?? 0
+  const output = tokens.output ?? 0
+  target.turns += 1
+  target.input += input
+  target.output += output
+  target.cacheRead += tokens.cacheRead ?? 0
+  target.cacheWrite += tokens.cacheWrite ?? 0
+  target.total += tokens.total ?? input + output
+}
+
+/**
+ * Room token usage from the messages already on disk (B08): every assistant
+ * message whose harness reported `tokens` contributes. Harnesses that do not
+ * report usage (or old messages from before they did) simply contribute
+ * nothing — no estimation, no fabricated numbers.
+ */
+export function getRoomUsage(roomId: string): RoomUsage {
+  const live = new Map(listCharacters(roomId).map((character) => [character.id, character]))
+  const rows = db
+    .prepare(
+      `select character_id, author_name, meta from messages
+       where room_id = ? and author_type = 'character' and meta is not null
+       order by created_at asc, rowid asc`,
+    )
+    .all(roomId) as { character_id?: string | null; author_name?: string | null; meta?: string | null }[]
+  const totals = emptyUsage()
+  const byCharacter = new Map<string, CharacterUsage>()
+  for (const row of rows) {
+    let meta: MessageMeta
+    try {
+      meta = JSON.parse(String(row.meta)) as MessageMeta
+    } catch {
+      continue
+    }
+    if (!meta.tokens) continue
+    const characterId = String(row.character_id ?? '')
+    const character = live.get(characterId)
+    let entry = byCharacter.get(characterId)
+    if (!entry) {
+      entry = {
+        characterId,
+        name: character?.name ?? String(row.author_name ?? '未知角色'),
+        harness: character?.harness ?? meta.harness ?? 'mock',
+        model: character?.model ?? meta.model ?? '',
+        ...emptyUsage(),
+      }
+      byCharacter.set(characterId, entry)
+    }
+    addUsage(entry, meta.tokens)
+    addUsage(totals, meta.tokens)
+  }
+  return {
+    totals,
+    characters: [...byCharacter.values()].sort((a, b) => b.total - a.total || a.name.localeCompare(b.name)),
+  }
+}
+
 export function addMessage(input: {
   roomId: string
   authorType: AuthorType
@@ -1508,7 +1581,7 @@ export function ensureIdentityForCharacter(character: Character): Identity {
 
 /* ---------------------------------------------------------------- memories */
 
-const MEMORY_KINDS = new Set<MemoryKind>(['fact', 'decision', 'preference', 'episode'])
+const MEMORY_KINDS = new Set<MemoryKind>(['fact', 'decision', 'preference', 'episode', 'lesson'])
 
 function mapMemory(row: Record<string, unknown>): Memory {
   const kind = String(row.kind) as MemoryKind
@@ -1617,6 +1690,45 @@ export function addRoundEpisode(facts: RoundEpisodeFacts): { memory: Memory; exi
     sourceRoomId: facts.roomId,
     contentHash: hash,
   })
+}
+
+/**
+ * Record one failure lesson (B08) and keep only the latest one pinned: the
+ * next turn always sees the most recent root cause, while older lessons stay
+ * in the room's memory list (searchable, but no longer crowding the prompt).
+ * The pinned flag is what guarantees injection — the room's memory budget
+ * only limits unpinned entries.
+ *
+ * A repeated cause (A → B → A) hits the old row by content hash, so the hit
+ * itself must be re-pinned and the newer B unpinned; skipping that would keep
+ * injecting B after A happened again.
+ */
+export function addFailureEpisode(input: {
+  roomId: string
+  cause: string
+  changedPaths?: string[]
+}): { memory: Memory; existed: boolean } {
+  const { content, hash } = buildFailureEpisode(input)
+  const result = addMemory({
+    scope: 'room',
+    ownerId: input.roomId,
+    kind: 'lesson',
+    content,
+    sourceRoomId: input.roomId,
+    contentHash: hash,
+    pinned: true,
+  })
+  let memory = result.memory
+  if (result.existed && !memory.pinned) {
+    db.prepare('update memories set pinned = 1 where id = ?').run(memory.id)
+    memory = { ...memory, pinned: true }
+  }
+  db.prepare(
+    `update memories set pinned = 0
+     where scope = 'room' and owner_id = ? and kind = 'lesson' and pinned = 1
+       and id <> ? and content like ?`,
+  ).run(input.roomId, memory.id, `${FAILURE_LESSON_PREFIX}%`)
+  return { memory, existed: result.existed }
 }
 
 /**

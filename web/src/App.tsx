@@ -12,6 +12,7 @@ import { LibraryView } from './components/LibraryView'
 import { PresetPicker } from './components/PresetPicker'
 import { McpPanel } from './components/McpPanel'
 import { TaskPanel } from './components/TaskPanel'
+import { UsagePanel } from './components/UsagePanel'
 
 export default function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -32,6 +33,7 @@ export default function App() {
   // open tab in sync; the panel is a pure view over this state.
   const [tasks, setTasks] = useState<Task[]>([])
   const [showTasks, setShowTasks] = useState(false)
+  const [showUsage, setShowUsage] = useState(false)
   // Bumped after a successful send/steer: MessageList force-scrolls to the
   // bottom once per bump, so "I sent it but I'm reading history" ends with the
   // view at my message instead of wherever I was scrolled.
@@ -495,6 +497,7 @@ export default function App() {
               onEditRoom={() => setRoomForm('edit')}
               onTogglePanel={() => setPanelOpen((open) => !open)}
               onShowTasks={() => setShowTasks(true)}
+              onShowUsage={() => setShowUsage(true)}
               onToggleSidebar={() => setSidebarOpen((open) => !open)}
             />
 
@@ -549,6 +552,10 @@ export default function App() {
 
       {showMcps && <McpPanel onClose={() => setShowMcps(false)} />}
 
+      {showUsage && room && (
+        <UsagePanel roomId={room.id} roomName={room.name} onClose={() => setShowUsage(false)} />
+      )}
+
       {showTasks && room && (
         <TaskPanel
           roomId={room.id}
@@ -600,6 +607,8 @@ export default function App() {
         <RoomSettings
           room={roomForm === 'edit' ? room : null}
           characters={characters}
+          harnesses={bootstrap.harnesses}
+          models={bootstrap.models}
           canDelete={Boolean(room)}
           onClose={() => setRoomForm(null)}
           onSave={saveRoom}

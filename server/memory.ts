@@ -58,6 +58,29 @@ export function buildRoundEpisode(facts: RoundEpisodeFacts): { content: string; 
   return { content, hash: createHash('sha256').update(content).digest('hex') }
 }
 
+/**
+ * B08 failure lessons: a round that ended in error or was blocked by the SOP
+ * gate leaves one room-scope memory, so the next attempt sees the root cause
+ * instead of rediscovering it. Content is deterministic (cause + sorted
+ * paths) and the hash dedupes an exact-repeat failure.
+ */
+export const FAILURE_LESSON_PREFIX = '失败教训：'
+const FAILURE_CAUSE_MAX_CHARS = 240
+
+export interface FailureEpisodeFacts {
+  cause: string
+  changedPaths?: string[]
+}
+
+export function buildFailureEpisode(facts: FailureEpisodeFacts): { content: string; hash: string } {
+  const cause = facts.cause.replace(/\s+/g, ' ').trim().slice(0, FAILURE_CAUSE_MAX_CHARS) || '未知原因'
+  const paths = [...(facts.changedPaths ?? [])].sort()
+  const listed = paths.slice(0, EPISODE_PATH_LIMIT).join('、')
+  const pathText = paths.length > EPISODE_PATH_LIMIT ? `${listed} 等 ${paths.length} 个` : listed
+  const content = `${FAILURE_LESSON_PREFIX}${cause}${pathText ? `；改动：${pathText}` : ''}`.slice(0, EPISODE_MAX_CHARS)
+  return { content, hash: createHash('sha256').update(content).digest('hex') }
+}
+
 /** Escape a LIKE term; the SQL side pairs this with `escape '\'`. */
 export function escapeLike(term: string): string {
   return term.replace(/[\\%_]/g, (ch) => `\\${ch}`)

@@ -146,6 +146,8 @@ interface RoundState {
    * the summary of the round instead of the round itself.
    */
   lastDelivery?: string
+  /** Last real turn's error text (B08) — the failure lesson's root cause. */
+  lastError?: string
   /** Task card this round executes (B03); undefined on ordinary chat rounds. */
   taskId?: string
 }
@@ -808,6 +810,33 @@ function settleTaskClosed(roomId: string, round: RoundState): void {
   settleTaskForRound(roomId, round, round.lastTurnOutcome === 'ok' ? 'done' : 'error')
 }
 
+/** Short, actionable root causes for the failure lesson (B08). */
+const GATE_LESSON_TEXT: Record<GateBlockReason, string> = {
+  'no-verdict': '有代码改动但没有 review 结论，需要 review 角色单独一行给出 REVIEW: PASS',
+  changes: '最后一条 review 结论是 REVIEW: CHANGES',
+  'no-author': 'REVIEW: PASS 缺少作者信息，无法验证独立性',
+  'self-review': '实现者本人给出 REVIEW: PASS，自审无效',
+  'wrong-reviewer': 'REVIEW: PASS 不是指定 reviewer 给出',
+  'reviewer-ineligible': '指定 reviewer 已停用或是轮末总结角色，无法给出有效 PASS',
+  'same-harness': 'reviewer 与实现者使用同一 harness，不构成独立判断',
+  'verify-fail': '验证命令未通过',
+}
+
+/**
+ * Best-effort failure lesson: a round that never closes cleanly still leaves
+ * its root cause in room memory, so the next attempt starts from it. A
+ * memory failure must never take the round settlement down.
+ */
+function recordFailureLesson(roomId: string, round: RoundState, cause: string): void {
+  try {
+    db.addFailureEpisode({ roomId, cause, changedPaths: round.changedPaths })
+  } catch (error) {
+    console.warn(
+      `[agent-crowd] failure lesson memory failed (${roomId}): ${error instanceof Error ? error.message : error}`,
+    )
+  }
+}
+
 /**
  * B04: the round's normal close — one funnel for all three clean-close
  * sites. Order matters: settle the task card first (B03 semantics
@@ -836,6 +865,8 @@ function closeRoundNormally(roomId: string, round: RoundState): void {
         `[agent-crowd] round episode memory failed (${roomId}): ${error instanceof Error ? error.message : error}`,
       )
     }
+  } else if (round.lastTurnOutcome === 'error') {
+    recordFailureLesson(roomId, round, `角色回合执行失败：${round.lastError ?? '（没有错误信息）'}`)
   }
   rounds.delete(roomId)
 }
@@ -973,6 +1004,11 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
       // next round (deliberate — auto-requeue would gate-loop forever). The
       // card stays `running` with `result='blocked'` (B03) so the panel
       // offers a re-dispatch instead of a false done.
+      recordFailureLesson(
+        roomId,
+        round,
+        decision.reason ? GATE_LESSON_TEXT[decision.reason] : '本轮被 SOP 门禁拦截',
+      )
       settleTaskForRound(roomId, round, 'blocked')
       rounds.delete(roomId)
       return false
@@ -1003,6 +1039,13 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
             `🚧 SOP 门禁：验证命令未通过（exit ${result.exitCode ?? 'spawn-error'}${result.timedOut ? '，运行超时被终止' : ''}），本轮不做轮末总结。输出尾部：\n${tail(result.output.trim() || '（无输出）', VERIFY_DETAIL_CHARS)}`,
           )
         }
+        recordFailureLesson(
+          roomId,
+          round,
+          `验证命令未通过（exit ${result.exitCode ?? 'spawn-error'}${result.timedOut ? '，超时' : ''}）：${
+            tail(result.output.trim() || '（无输出）', 160)
+          }`,
+        )
         settleTaskForRound(roomId, round, 'blocked')
         rounds.delete(roomId)
         return false
@@ -1333,7 +1376,10 @@ async function pump(roomId: string): Promise<void> {
 
     if (output.error && !output.text.trim()) {
       // The round's last real turn errored (B03 review 2).
-      if (round && round.roundId === item.roundId && !item.isRoundSummary) round.lastTurnOutcome = 'error'
+      if (round && round.roundId === item.roundId && !item.isRoundSummary) {
+        round.lastTurnOutcome = 'error'
+        round.lastError = output.error
+      }
       db.updateTurn(turnId, {
         status: 'error',
         error: output.error,
@@ -1633,7 +1679,10 @@ async function pump(roomId: string): Promise<void> {
       // entry was replaced mid-crash, the old round never settles (the card
       // stays running for a re-dispatch — the safe direction).
       const round = rounds.get(roomId)
-      if (round && round.roundId === activeRoundId && !activeIsSummary) round.lastTurnOutcome = 'error'
+      if (round && round.roundId === activeRoundId && !activeIsSummary) {
+        round.lastTurnOutcome = 'error'
+        round.lastError = reason
+      }
       // Best-effort state repair — the db may itself be what's broken, so
       // each step is guarded; a second throw here would defeat the handler.
       try {

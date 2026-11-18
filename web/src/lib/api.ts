@@ -7,6 +7,7 @@ import type {
   Memory,
   Message,
   Room,
+  RoomUsage,
   SkillInfo,
   Task,
   TaskStatus,
@@ -108,6 +109,9 @@ export const api = {
 
   /** Which MCP servers each harness CLI loads (read from its own config). */
   mcps: () => request<{ mcps: McpMap }>('/api/mcps'),
+
+  /** B08: per-character token usage for a room (harness-reported only). */
+  usage: (roomId: string) => request<RoomUsage>(`/api/rooms/${roomId}/usage`),
 
   /* Long-term memory (docs/memory-plan.md): room-scope = shared, identity-scope = per character. */
   memories: (roomId: string) =>

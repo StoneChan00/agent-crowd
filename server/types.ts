@@ -93,13 +93,14 @@ export interface Identity {
 }
 
 export type MemoryScope = 'identity' | 'room'
-export type MemoryKind = 'fact' | 'decision' | 'preference' | 'episode'
+export type MemoryKind = 'fact' | 'decision' | 'preference' | 'episode' | 'lesson'
 
 export const MEMORY_KIND_LABELS: Record<MemoryKind, string> = {
   fact: '事实',
   decision: '决议',
   preference: '偏好',
   episode: '经历',
+  lesson: '教训',
 }
 
 /** One long-term memory entry; scope+owner decides who sees it. */
@@ -188,6 +189,30 @@ export interface TurnTokens {
   total?: number
   cacheRead?: number
   cacheWrite?: number
+}
+
+/** Aggregated token usage for a room (B08): harness-reported numbers only. */
+export interface UsageTotals {
+  /** Character messages that carried usage data. */
+  turns: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  /** Reported total, or input + output when the harness sent no total. */
+  total: number
+}
+
+export interface CharacterUsage extends UsageTotals {
+  characterId: string
+  name: string
+  harness: HarnessKind
+  model: string
+}
+
+export interface RoomUsage {
+  totals: UsageTotals
+  characters: CharacterUsage[]
 }
 
 export interface ToolTrace {
