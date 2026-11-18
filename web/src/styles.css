@@ -2685,3 +2685,98 @@ select {
     display: none;
   }
 }
+
+/* ------------------------------------------------- isolation (B09) */
+
+.isolation-state {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  border-radius: var(--radius-sm);
+  background: rgba(52, 211, 153, 0.06);
+}
+
+.isolation-state .btn {
+  align-self: flex-start;
+}
+
+.isolation-ok {
+  color: var(--green);
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.isolation-path,
+.isolation-meta code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.isolation-meta {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.isolation-warn {
+  display: block;
+  margin-top: 8px;
+  color: var(--amber);
+}
+
+/* ------------------------------------------------ templates (B09) */
+
+.template-section {
+  margin-bottom: 14px;
+}
+
+.template-heading {
+  margin: 4px 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.template-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.template-name {
+  font-weight: 600;
+}
+
+.template-desc {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.template-chars {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+}
+
+.template-card .btn {
+  align-self: flex-start;
+  margin-top: auto;
+}

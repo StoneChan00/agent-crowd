@@ -347,6 +347,8 @@ function mapRoom(row: Record<string, unknown>): Room {
       row.reviewer_character_id === null || row.reviewer_character_id === undefined
         ? null
         : String(row.reviewer_character_id),
+    isolationSource: String(row.isolation_source ?? ''),
+    isolationBranch: String(row.isolation_branch ?? ''),
     createdAt: Number(row.created_at),
   }
 }
@@ -376,6 +378,8 @@ export function createRoom(input: {
     maxHops: clampHops(input.maxHops),
     verifyCommand: clampVerifyCommand(input.verifyCommand),
     reviewerCharacterId: input.reviewerCharacterId ?? null,
+    isolationSource: '',
+    isolationBranch: '',
     createdAt: now(),
   }
   db.prepare(
@@ -413,6 +417,29 @@ export function updateRoom(
     'update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ?, reviewer_character_id = ? where id = ?',
   ).run(next.name, next.topic, next.workingDir, next.maxHops, next.verifyCommand, next.reviewerCharacterId, id)
   return next
+}
+
+/**
+ * B09: flip a room into / out of its isolation worktree. `workingDir` becomes
+ * the worktree path when isolating, and the source repo when clearing; the
+ * caller owns the actual git side effects (server/worktree.ts).
+ */
+export function setRoomIsolation(
+  id: string,
+  isolation: { workingDir: string; source: string; branch: string } | null,
+): Room | undefined {
+  const current = getRoom(id)
+  if (!current) return undefined
+  const workingDir = isolation ? isolation.workingDir : current.isolationSource || current.workingDir
+  const source = isolation ? isolation.source : ''
+  const branch = isolation ? isolation.branch : ''
+  db.prepare('update rooms set working_dir = ?, isolation_source = ?, isolation_branch = ? where id = ?').run(
+    workingDir,
+    source,
+    branch,
+    id,
+  )
+  return getRoom(id)
 }
 
 /** Verification commands are operator-supplied one-liners: trim, cap at 500, empty is legal (= gate skips verify). */

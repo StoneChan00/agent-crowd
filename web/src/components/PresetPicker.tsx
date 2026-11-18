@@ -1,5 +1,6 @@
-import { useState } from 'react'
-import type { CharacterPreset } from '../types'
+import { useEffect, useState } from 'react'
+import type { CharacterPreset, RoomTemplate } from '../types'
+import { api } from '../lib/api'
 import { Modal } from './Modal'
 import { Avatar } from './Avatar'
 import { HARNESS_META, modelShort, triggerSummary } from '../lib/format'
@@ -10,11 +11,50 @@ interface PresetPickerProps {
   roomName: string
   onClose: () => void
   onAdd: (presetIds: string[]) => Promise<void>
+  onAddTemplate: (templateId: string) => Promise<void>
 }
 
-export function PresetPicker({ presets, existingNames, roomName, onClose, onAdd }: PresetPickerProps) {
+export function PresetPicker({
+  presets,
+  existingNames,
+  roomName,
+  onClose,
+  onAdd,
+  onAddTemplate,
+}: PresetPickerProps) {
   const [selected, setSelected] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
+  const [templates, setTemplates] = useState<RoomTemplate[]>([])
+  const [templateBusy, setTemplateBusy] = useState<string | null>(null)
+  const [templateError, setTemplateError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .templates()
+      .then((data) => {
+        if (!cancelled) setTemplates(data.templates)
+      })
+      .catch(() => {
+        /* templates are optional; the preset list still works */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const applyTemplate = async (template: RoomTemplate) => {
+    setTemplateBusy(template.id)
+    setTemplateError('')
+    try {
+      await onAddTemplate(template.id)
+      onClose()
+    } catch (error) {
+      setTemplateError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setTemplateBusy(null)
+    }
+  }
 
   const already = new Set(existingNames)
   const toggle = (id: string) =>
@@ -33,8 +73,8 @@ export function PresetPicker({ presets, existingNames, roomName, onClose, onAdd 
 
   return (
     <Modal
-      title="从角色库添加"
-      subtitle={`把模板复制进「${roomName}」；已存在的同名角色会跳过`}
+      title="添加角色"
+      subtitle={`场景模板一键加入，或从角色库多选；已存在的同名角色会跳过（房间：${roomName}）`}
       onClose={onClose}
       footer={
         <>
@@ -48,6 +88,29 @@ export function PresetPicker({ presets, existingNames, roomName, onClose, onAdd 
         </>
       }
     >
+      {templateError && <div className="form-error">{templateError}</div>}
+      {templates.length > 0 && (
+        <div className="template-section">
+          <h4 className="template-heading">场景模板</h4>
+          <div className="template-grid">
+            {templates.map((template) => (
+              <div key={template.id} className="template-card">
+                <div className="template-name">{template.name}</div>
+                <p className="template-desc">{template.description}</p>
+                <div className="template-chars">{template.characters.map((character) => character.name).join(' · ')}</div>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  disabled={templateBusy !== null}
+                  onClick={() => void applyTemplate(template)}
+                >
+                  {templateBusy === template.id ? '添加中…' : '一键添加'}
+                </button>
+              </div>
+            ))}
+          </div>
+          <h4 className="template-heading">角色库</h4>
+        </div>
+      )}
       <div className="picker-list">
         {presets.map((preset) => {
           const exists = already.has(preset.name)

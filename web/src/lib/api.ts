@@ -7,6 +7,7 @@ import type {
   Memory,
   Message,
   Room,
+  RoomTemplate,
   RoomUsage,
   SkillInfo,
   Task,
@@ -112,6 +113,25 @@ export const api = {
 
   /** B08: per-character token usage for a room (harness-reported only). */
   usage: (roomId: string) => request<RoomUsage>(`/api/rooms/${roomId}/usage`),
+
+  /** B09: opt-in git worktree isolation (own checkout + branch per room). */
+  isolateRoom: (roomId: string) =>
+    request<{ room: Room; worktree: { source: string; path: string; branch: string } }>(
+      `/api/rooms/${roomId}/isolation`,
+      { method: 'POST' },
+    ),
+
+  unisolateRoom: (roomId: string) =>
+    request<{ room: Room }>(`/api/rooms/${roomId}/isolation`, { method: 'DELETE' }),
+
+  /** B09: scenario templates (dev squad / writing room / research cell). */
+  templates: () => request<{ templates: RoomTemplate[] }>('/api/templates'),
+
+  applyTemplate: (roomId: string, templateId: string) =>
+    request<{ created: Character[]; skipped: string[]; errors: string[] }>(
+      `/api/rooms/${roomId}/templates/${templateId}`,
+      { method: 'POST' },
+    ),
 
   /* Long-term memory (docs/memory-plan.md): room-scope = shared, identity-scope = per character. */
   memories: (roomId: string) =>

@@ -369,6 +369,20 @@ export default function App() {
     await refresh()
   }
 
+  const addTemplate = async (templateId: string) => {
+    if (!roomId) return
+    try {
+      const result = await api.applyTemplate(roomId, templateId)
+      await refresh()
+      const skipped = result.skipped.length ? `，跳过：${result.skipped.join('、')}` : ''
+      const errors = result.errors.length ? `；失败：${result.errors.join('；')}` : ''
+      setNotice(`已添加 ${result.created.length} 个角色${skipped}${errors}`)
+    } catch (error) {
+      setNotice(`添加模板失败：${error instanceof Error ? error.message : error}`)
+      throw error
+    }
+  }
+
   const addPresets = async (presetIds: string[]) => {
     if (!roomId) return
     try {
@@ -429,6 +443,20 @@ export default function App() {
     if (!window.confirm('删除这个房间及其全部角色和消息？')) return
     await api.deleteRoom(roomId)
     await refresh()
+  }
+
+  const isolateRoom = async () => {
+    if (!roomId) return
+    const result = await api.isolateRoom(roomId)
+    await refresh()
+    setNotice(`已创建隔离工作树：${result.worktree.path}（分支 ${result.worktree.branch}）`)
+  }
+
+  const unisolateRoom = async () => {
+    if (!roomId) return
+    await api.unisolateRoom(roomId)
+    await refresh()
+    setNotice('已解除隔离，工作目录恢复到源仓库')
   }
 
   if (!bootstrap) {
@@ -600,18 +628,22 @@ export default function App() {
           roomName={room.name}
           onClose={() => setPickingPresets(false)}
           onAdd={addPresets}
+          onAddTemplate={addTemplate}
         />
       )}
 
       {roomForm && (
         <RoomSettings
           room={roomForm === 'edit' ? room : null}
+          rooms={rooms}
           characters={characters}
           harnesses={bootstrap.harnesses}
           models={bootstrap.models}
           canDelete={Boolean(room)}
           onClose={() => setRoomForm(null)}
           onSave={saveRoom}
+          onIsolate={isolateRoom}
+          onUnisolate={unisolateRoom}
           onDelete={deleteRoom}
         />
       )}

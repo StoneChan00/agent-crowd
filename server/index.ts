@@ -25,6 +25,8 @@ import {
 import * as orchestrator from './orchestrator.ts'
 import { mediaFileHandler } from './media.ts'
 import { listMcps } from './mcps.ts'
+import { findRoomTemplate, ROOM_TEMPLATES } from './room-templates.ts'
+import { createIsolationWorktree, removeIsolationWorktree } from './worktree.ts'
 import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, SKILLS_DIR, WEB_DIST } from './paths.ts'
 import { loadSkills } from './skills.ts'
@@ -352,9 +354,99 @@ app.patch('/api/rooms/:id', (req, res) => {
 })
 
 app.delete('/api/rooms/:id', (req, res) => {
+  const room = db.getRoom(req.params.id)
+  if (room?.isolationBranch) {
+    return fail(res, 409, '该房间正在使用隔离工作树，请先解除隔离再删除房间')
+  }
   orchestrator.stopRoom(req.params.id)
   db.deleteRoom(req.params.id)
   res.json({ ok: true })
+})
+
+/* --------------------------------------------------------------- isolation */
+
+/**
+ * B09: opt-in git worktree isolation. Two rooms on one repository otherwise
+ * overwrite each other's files; this gives the room its own checkout and
+ * branch while auto-commit keeps working unchanged.
+ */
+app.post('/api/rooms/:id/isolation', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  if (room.isolationBranch) return fail(res, 409, `已启用隔离工作树（${room.isolationBranch}）`)
+  if (orchestrator.isBusy(room.id)) return fail(res, 409, '房间有回合在运行，请等它结束后再启用隔离')
+  try {
+    const worktree = createIsolationWorktree({ sourceDir: room.workingDir, roomId: room.id })
+    const updated = db.setRoomIsolation(room.id, {
+      workingDir: worktree.path,
+      source: worktree.source,
+      branch: worktree.branch,
+    })
+    if (!updated) return fail(res, 404, '房间不存在')
+    broadcast(room.id, 'room', { roomId: room.id, room: updated })
+    res.json({ room: updated, worktree })
+  } catch (error) {
+    fail(res, 400, error instanceof Error ? error.message : String(error))
+  }
+})
+
+app.delete('/api/rooms/:id/isolation', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  if (!room.isolationBranch) return fail(res, 409, '该房间没有启用隔离工作树')
+  if (orchestrator.isBusy(room.id)) return fail(res, 409, '房间有回合在运行，请等它结束后再解除隔离')
+  try {
+    removeIsolationWorktree({ worktreeDir: room.workingDir, sourceDir: room.isolationSource })
+    const updated = db.setRoomIsolation(room.id, null)
+    if (!updated) return fail(res, 404, '房间不存在')
+    broadcast(room.id, 'room', { roomId: room.id, room: updated })
+    res.json({ room: updated })
+  } catch (error) {
+    fail(res, 400, error instanceof Error ? error.message : String(error))
+  }
+})
+
+/* --------------------------------------------------------------- templates */
+
+app.get('/api/templates', (_req, res) => {
+  res.json({ templates: ROOM_TEMPLATES })
+})
+
+/** Add a scenario template's characters, skipping names already in the room. */
+app.post('/api/rooms/:id/templates/:templateId', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  const template = findRoomTemplate(req.params.templateId)
+  if (!template) return fail(res, 404, '场景模板不存在')
+  const existing = new Set(db.listCharacters(room.id).map((character) => character.name))
+  const created: Character[] = []
+  const skipped: string[] = []
+  const errors: string[] = []
+  for (const spec of template.characters) {
+    if (existing.has(spec.name)) {
+      skipped.push(spec.name)
+      continue
+    }
+    try {
+      created.push(
+        db.createCharacter({
+          roomId: room.id,
+          name: spec.name,
+          aliases: spec.aliases,
+          avatar: spec.avatar,
+          color: spec.color,
+          harness: spec.harness,
+          model: spec.model,
+          persona: spec.persona,
+          triggers: spec.triggers,
+          skills: spec.skills,
+        }),
+      )
+    } catch (error) {
+      errors.push(`${spec.name}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  res.json({ created, skipped, errors })
 })
 
 app.get('/api/rooms/:id/state', (req, res) => {

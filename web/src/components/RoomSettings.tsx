@@ -10,6 +10,12 @@ interface Readiness {
   mcpEnabled: number
 }
 
+/** Path comparison for the shared-directory warning: case/slash/trailing-slash insensitive. */
+function sameDir(a: string, b: string): boolean {
+  const normalize = (path: string) => path.trim().replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
+  return normalize(a) === normalize(b)
+}
+
 /**
  * A local, best-effort readiness check for one character: is its CLI on this
  * machine, is the configured model in the harness's own candidate list, does
@@ -53,6 +59,8 @@ function readinessFor(
 
 interface RoomSettingsProps {
   room: Room | null
+  /** Every room, for the shared-working-directory warning. */
+  rooms: Room[]
   characters: Character[]
   harnesses: HarnessMap
   models: Record<string, string[]>
@@ -66,6 +74,8 @@ interface RoomSettingsProps {
     verifyCommand: string
     reviewerCharacterId: string | null
   }) => Promise<void>
+  onIsolate: () => Promise<void>
+  onUnisolate: () => Promise<void>
   onDelete?: () => Promise<void>
 }
 
@@ -77,12 +87,15 @@ const MEMORY_KINDS: { value: string; label: string }[] = [
 
 export function RoomSettings({
   room,
+  rooms,
   characters,
   harnesses,
   models,
   canDelete,
   onClose,
   onSave,
+  onIsolate,
+  onUnisolate,
   onDelete,
 }: RoomSettingsProps) {
   const [name, setName] = useState(room?.name ?? '')
@@ -101,6 +114,20 @@ export function RoomSettings({
   const [memoryBusy, setMemoryBusy] = useState(false)
   /** MCP config per harness, for the readiness panel (best-effort: null = still reading). */
   const [mcps, setMcps] = useState<McpMap | null>(null)
+  const [isolationBusy, setIsolationBusy] = useState(false)
+  const [isolationError, setIsolationError] = useState('')
+
+  const runIsolation = async (action: () => Promise<void>) => {
+    setIsolationBusy(true)
+    setIsolationError('')
+    try {
+      await action()
+    } catch (error) {
+      setIsolationError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsolationBusy(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -205,6 +232,19 @@ export function RoomSettings({
     }
   }
 
+  // Two non-isolated rooms on the same directory will overwrite each other's
+  // files when both run; the warning names the other room so the user can
+  // isolate one side (or move it).
+  const sharedRooms =
+    room && !room.isolationBranch
+      ? rooms.filter(
+          (other) =>
+            other.id !== room.id &&
+            !other.isolationBranch &&
+            sameDir(other.workingDir, room.workingDir),
+        )
+      : []
+
   const readiness = characters.map((character) => ({
     character,
     ...readinessFor(character, harnesses, models, mcps),
@@ -269,6 +309,54 @@ export function RoomSettings({
         />
         <span className="field-hint">角色会在这个目录里读写文件、跑命令。</span>
       </div>
+      {room && (
+        <div className="field">
+          <label>工作目录隔离</label>
+          {room.isolationBranch ? (
+            <>
+              <div className="isolation-state">
+                <div>
+                  <span className="isolation-ok">✓ 独立工作树</span>
+                  <code className="isolation-path">{room.workingDir}</code>
+                </div>
+                <div className="isolation-meta">
+                  分支 <code>{room.isolationBranch}</code> · 来源 <code>{room.isolationSource}</code>
+                </div>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  disabled={isolationBusy}
+                  onClick={() => void runIsolation(onUnisolate)}
+                >
+                  {isolationBusy ? '处理中…' : '解除隔离'}
+                </button>
+              </div>
+              <span className="field-hint">
+                工作树的提交留在分支 {room.isolationBranch} 上，解除隔离不会删除该分支；合并由你决定。
+              </span>
+            </>
+          ) : (
+            <>
+              <button
+                className="btn btn-ghost btn-sm"
+                disabled={isolationBusy}
+                onClick={() => void runIsolation(onIsolate)}
+              >
+                {isolationBusy ? '创建中…' : '创建隔离工作树'}
+              </button>
+              <span className="field-hint">
+                为本房间切一个独立 worktree 和分支，适合多个房间指向同一个仓库。工作树从当前 HEAD 创建，
+                <b>源仓库里未提交的改动不会带过去</b>；需要时先在源仓库提交。
+              </span>
+            </>
+          )}
+          {isolationError && <div className="form-error">{isolationError}</div>}
+          {sharedRooms.length > 0 && (
+            <span className="field-hint isolation-warn">
+              ⚠ 与房间「{sharedRooms.map((other) => other.name).join('」「')}」共用工作目录：同时运行会互相覆盖文件、提交也会混在一起。建议至少给一侧创建隔离工作树。
+            </span>
+          )}
+        </div>
+      )}
       <div className="field">
         <label>单轮接力上限</label>
         <input

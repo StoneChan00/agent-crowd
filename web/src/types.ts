@@ -24,6 +24,8 @@ export type {
 /** One skills/*.md entry WITHOUT the body — the editor's checkbox list item (B07). */
 export type SkillInfo = Omit<import('../../server/types.ts').Skill, 'body'>
 
+export type { RoomTemplate, TemplateCharacter } from '../../server/room-templates.ts'
+
 export interface HarnessInfo {
   label: string
   available: boolean

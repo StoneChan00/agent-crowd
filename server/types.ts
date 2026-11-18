@@ -76,6 +76,14 @@ export interface Room {
    * implementer's (same harness ≠ independent judgment).
    */
   reviewerCharacterId: string | null
+  /**
+   * Isolation worktree (B09): when non-empty, `workingDir` points at a
+   * server-created git worktree and this field holds the repository the
+   * worktree was cut from. Empty = the room works directly in `workingDir`.
+   */
+  isolationSource: string
+  /** Branch checked out in the isolation worktree (empty when not isolated). */
+  isolationBranch: string
 }
 
 /**
