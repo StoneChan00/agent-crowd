@@ -158,6 +158,7 @@ export const hermesAdapter: HarnessAdapter = {
       exitCode: result.code ?? -1,
       durationMs: Date.now() - started,
       error: error || undefined,
+      timedOut: result.timedOut || undefined,
     }
   },
 

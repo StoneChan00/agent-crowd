@@ -205,6 +205,7 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
         exitCode: result.code ?? -1,
         durationMs: Date.now() - started,
         error: error || undefined,
+        timedOut: result.timedOut || undefined,
         thinking: !sawJson && stderrTail ? stderrTail.slice(0, 4000) : undefined,
       }
     },

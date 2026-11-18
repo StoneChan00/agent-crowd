@@ -48,6 +48,12 @@ export interface RunOutput {
    *   empty error from a failed run.
    */
   error?: string
+  /**
+   * True when the run was killed by the idle watchdog or the hard cap —
+   * the CLI's own session SURVIVES the kill on disk, so the orchestrator
+   * can resume it once instead of settling for the truncated reply.
+   */
+  timedOut?: boolean
 }
 
 export interface HarnessAdapter {
