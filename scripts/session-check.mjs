@@ -1107,6 +1107,47 @@ async function scenarioTimeoutResume() {
       JSON.stringify(row),
     )
   }
+
+  // (e) the announce-after-queue contract (M2 review 1): a mid-turn @ has
+  // the character queued when the first strike times out — the resume
+  // enqueue silently no-ops and NO "已自动续跑" notice may be posted; the
+  // failure settlement stays visible and the queued turn still runs. The @
+  // is injected on the first streamed delta (P4b's lesson): busy=true
+  // fires BEFORE prompt build, and an @ posted in that window leaks into
+  // the running turn's own prompt and voids the scenario.
+  {
+    const room = await makeRoom(port, 'p7e-超时慢击', work)
+    await makeCharacter(port, room.id, '戊', 'MOCK-超时慢击')
+    const watch = await sseWatch(port, room.id)
+    await postMessage(port, room.id, '开始一个慢任务')
+    const sawDelta = await (async () => {
+      const deadline = Date.now() + 20_000
+      while (Date.now() < deadline) {
+        if (watch.events.some((frame) => frame.event === 'delta' && frame.data?.kind === 'text')) return true
+        await sleep(100)
+      }
+      return false
+    })()
+    check('P7e 首回合已开始流式输出（prompt 快照已过）', sawDelta)
+    await postMessage(port, room.id, '@戊 插话标志：把剩下的做完')
+    await waitIdle(port, room.id, 40_000)
+    await watch.stop()
+    const messages = await roomMessages(room.id)
+    check(
+      'P7e 队列已有同角色时零续跑播报（先入队后播报，无假承诺）',
+      systemNotices(messages, '自动续跑').length === 0,
+      `实际 ${systemNotices(messages, '自动续跑').length}`,
+    )
+    check('P7e 失败结算可见（「运行失败」恰 1 条，不静默）', systemNotices(messages, '运行失败').length === 1, `实际 ${systemNotices(messages, '运行失败').length}`)
+    const replies = characterMessages(messages, '戊')
+    check(
+      'P7e 排队的插话回合正常完成（恰 1 条回复）',
+      replies.length === 1 && replies[0].content.includes('插话并正常完成'),
+      JSON.stringify(replies.map((m) => m.content.slice(0, 24))),
+    )
+    const row = sessionRows(dir, 'room_id = ?', room.id)[0]
+    check('P7e 会话行保留（慢击超时记账 + 插话回合记账，turns=2）', row && row.turns === 2, JSON.stringify(row))
+  }
 }
 
 /* ------------------------------------------------------------------- main */

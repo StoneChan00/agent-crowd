@@ -262,6 +262,39 @@ export const mockAdapter: HarnessAdapter = {
       }
       return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
+    // Test seam for session-check P7e (M2 review 1): the first strike SLEEPS
+    // so a mid-turn @ can queue a same-character item while the turn runs,
+    // then dies to the watchdog — the resume enqueue must silently no-op
+    // (queue already has the character) and NO "已自动续跑" notice may be
+    // posted: announce-after-queue is the whole contract. The queued turn's
+    // prompt carries the插话 marker and replies normally.
+    if (input.character.persona.includes('MOCK-超时慢击')) {
+      if (input.prompt.includes('插话标志')) {
+        const reply = `（mock 模式）${input.character.name} 收到插话并正常完成。`
+        for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+          input.emit({ kind: 'text', text: chunk })
+          await sleep(10)
+        }
+        return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+      }
+      // Stream ONE delta before sleeping: the delta is the deterministic
+      // injection point for the mid-turn @ — it fires inside adapter.run,
+      // i.e. strictly AFTER this turn's prompt was built, so the queued
+      // turn's marker can never leak into THIS turn's prompt (waiting on
+      // busy=true is too early: the busy broadcast precedes prompt build
+      // and the @ message lands inside it, P7e round 1).
+      input.emit({ kind: 'text', text: '慢击进行中…' })
+      await sleep(1500)
+      return {
+        text: '',
+        error: '运行超时（10 分钟 无输出）',
+        timedOut: true,
+        sessionId: mockSessionId(input.character.id),
+        exitCode: -1,
+        durationMs: Date.now() - started,
+        tokens: { input: 0, output: 0, total: 0 },
+      }
+    }
     // Test seam for session-check (M2 timeout resume): first strike returns a
     // watchdog kill — timedOut with the session id SURVIVING (a killed CLI's
     // session lives on disk). The orchestrator answers with the
