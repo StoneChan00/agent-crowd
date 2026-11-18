@@ -22,6 +22,17 @@ export interface RunInput {
   emit: (event: AdapterEvent) => void
   /** Receives the spawned CLI's pid, so the room can display it live. */
   onSpawn?: (pid: number) => void
+  /**
+   * M3 recovery ladder: the per-turn idle-watchdog budget (resume/report
+   * turns ride a much shorter one than ordinary turns). Absent = the global
+   * `AC_IDLE_TIMEOUT_MS` default.
+   */
+  idleTimeoutMs?: number
+  /**
+   * M3 liveness reporting, report-only: forwarded from the process layer at
+   * 50%/85% of the idle budget so the room can warn before the kill.
+   */
+  onSilence?: (info: { fraction: number; silenceMs: number; thresholdMs: number }) => void
 }
 
 export interface RunOutput {
@@ -54,6 +65,17 @@ export interface RunOutput {
    * can resume it once instead of settling for the truncated reply.
    */
   timedOut?: boolean
+  /**
+   * M3 timeout diagnostics: what the watchdog saw when it killed the run —
+   * which limit, how long the silence had been, and the tool call that was
+   * still RUNNING when the kill landed (the one a blind resume would rerun).
+   * The recovery instructions quote `lastTool` back to the model.
+   */
+  timeoutDetail?: {
+    kind: 'idle' | 'hard'
+    silenceMs: number
+    lastTool?: { name: string; title: string; runningMs: number }
+  }
 }
 
 export interface HarnessAdapter {

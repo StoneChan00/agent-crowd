@@ -98,7 +98,7 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
       })
 
       const textParts: { id: string; text: string }[] = []
-      const toolStarted = new Map<string, { name: string; at: number }>()
+      const toolStarted = new Map<string, { name: string; title: string; at: number }>()
       const tools: { name: string; ok: boolean; detail?: string; durationMs?: number }[] = []
       let sessionId: string | undefined
       let tokens: TurnTokens | undefined
@@ -109,8 +109,9 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
         cwd: input.cwd,
         signal: input.signal,
         timeoutMs: turnTimeoutMs(),
-        idleTimeoutMs: idleTimeoutMs(),
+        idleTimeoutMs: input.idleTimeoutMs ?? idleTimeoutMs(),
         onSpawn: input.onSpawn,
+        onSilence: input.onSilence,
         onStdoutLine: (line) => {
           const event = safeJsonParse<OpencodeEvent>(line)
           if (!event) return
@@ -149,11 +150,12 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
             const status = part.state?.status
             if (status === 'running' || status === 'pending') {
               if (!toolStarted.has(callId)) {
-                toolStarted.set(callId, { name, at: Date.now() })
+                toolStarted.set(callId, { name, title: String(part.state?.title ?? ''), at: Date.now() })
                 input.emit({ kind: 'tool', text: `调用 ${name}` })
               }
             } else if (status === 'completed' || status === 'error') {
               const startedAt = toolStarted.get(callId)
+              toolStarted.delete(callId)
               tools.push({
                 name,
                 ok: status === 'completed',
@@ -185,6 +187,21 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
         .filter((part) => part.trim().length > 0)
         .join('\n\n')
 
+      // M3: the tool call that was still RUNNING when the watchdog killed
+      // the run — the exact command a blind resume would re-execute verbatim.
+      // toolStarted only holds never-completed calls now (completed entries
+      // are deleted), so its last insertion is the stuck one.
+      const stuckTool = [...toolStarted.values()].at(-1)
+      const timeoutDetail = result.timedOut
+        ? {
+            kind: (result.timeoutKind ?? 'hard') as 'idle' | 'hard',
+            silenceMs: result.silenceMs ?? 0,
+            lastTool: stuckTool
+              ? { name: stuckTool.name, title: stuckTool.title, runningMs: Date.now() - stuckTool.at }
+              : undefined,
+          }
+        : undefined
+
       const stderrTail = result.stderr.trim()
       const error =
         apiError ??
@@ -206,6 +223,7 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
         durationMs: Date.now() - started,
         error: error || undefined,
         timedOut: result.timedOut || undefined,
+        timeoutDetail,
         thinking: !sawJson && stderrTail ? stderrTail.slice(0, 4000) : undefined,
       }
     },

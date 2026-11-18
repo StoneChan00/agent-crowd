@@ -115,7 +115,8 @@ export const claudeAdapter: HarnessAdapter = {
       cwd: input.cwd,
       signal: input.signal,
       timeoutMs: turnTimeoutMs(),
-      idleTimeoutMs: idleTimeoutMs(),
+      idleTimeoutMs: input.idleTimeoutMs ?? idleTimeoutMs(),
+      onSilence: input.onSilence,
       onSpawn: input.onSpawn,
       onStdoutLine: (line) => {
         const event = safeJsonParse<ClaudeEvent>(line)

@@ -295,42 +295,58 @@ export const mockAdapter: HarnessAdapter = {
         tokens: { input: 0, output: 0, total: 0 },
       }
     }
-    // Test seam for session-check (M2 timeout resume): first strike returns a
-    // watchdog kill — timedOut with the session id SURVIVING (a killed CLI's
-    // session lives on disk). The orchestrator answers with the
-    // continue-instruction as an override, which arrives in the prompt —
-    // the resume turn then replies normally. Variants: `半截` makes the
-    // first strike land PARTIAL text (the lands-as-is path); `连挂` keeps
-    // timing out on the resume too (with partial text, exercising the
-    // once-per-turn guard); `连挂` + `零文本` makes the RESUME zero-text —
-    // the path where a wrong clearSession would wipe the surviving session.
+    // Test seam for session-check (M3 recovery ladder): the first strike
+    // returns a watchdog kill — timedOut with the session id SURVIVING (a
+    // killed CLI's session lives on disk) and a timeoutDetail carrying the
+    // stuck tool (the never-returning command the rung-1 instruction must
+    // quote back and forbid). Recovery-round detection is BY INSTRUCTION
+    // MARKER, not by broadcast phrases: rung 1 rides "从中断处继续", rung 2
+    // rides "只把已有结果收尾", the fresh-session report round rides
+    // "汇报三件事" — the ⏳ notices carry "因超时被截断" into every later
+    // prompt, so phrase-based detection can't tell a recovery round from an
+    // ordinary one. Variants: `半截` first strike lands PARTIAL text;
+    // `连挂` times out on resume rounds too (partial text → the full
+    // 3-timeout ladder into the breaker); `连挂零文本` rung 1 makes ZERO
+    // progress → the report round; `连挂零文本汇报` also kills the report
+    // round (worst case: settle + breaker at 3).
     if (input.character.persona.includes('MOCK-超时')) {
-      const resuming = input.prompt.includes('因超时被截断')
+      const resumeRound = input.prompt.includes('从中断处继续') || input.prompt.includes('只把已有结果收尾')
+      const reportRound = input.prompt.includes('汇报三件事')
       const stuck = input.character.persona.includes('连挂')
-      if (!resuming || stuck) {
-        const partial = resuming
+      const kill = (!resumeRound && !reportRound) || (stuck && resumeRound) || (stuck && reportRound && input.character.persona.includes('汇报'))
+      if (kill) {
+        const partial = resumeRound
           ? input.character.persona.includes('零文本')
             ? ''
             : '续跑到一半的产出。'
           : input.character.persona.includes('半截')
             ? '首回合干到一半的产出。'
-            : ''
+            : reportRound
+              ? ''
+              : ''
         return {
           text: partial,
           error: '运行超时（10 分钟 无输出）',
           timedOut: true,
+          timeoutDetail: {
+            kind: 'idle',
+            silenceMs: 600_000,
+            lastTool: { name: 'bash', title: 'powershell Start-Process python -u agent_tools/ui_server.py', runningMs: 590_000 },
+          },
           sessionId: mockSessionId(input.character.id),
           exitCode: -1,
           durationMs: Date.now() - started,
           tokens: { input: 0, output: partial.length, total: partial.length },
         }
       }
-      const resumedReply = `（mock 续跑）${input.character.name} 已从中断处继续并完成原任务。`
-      for (const chunk of resumedReply.match(/[\s\S]{1,12}/g) ?? []) {
+      const reply = reportRound
+        ? `（mock 汇报）①已完成：部分工作 ②卡点：ui_server 重启命令不返回 ③建议：改用 restart_ui.ps1。`
+        : `（mock 续跑）${input.character.name} 已从中断处继续并完成原任务。`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
         input.emit({ kind: 'text', text: chunk })
         await sleep(10)
       }
-      return { text: resumedReply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: resumedReply.length, total: resumedReply.length } }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
     // Test seams for sop-check (SOP gate, P0-3): the character's PERSONA is
     // the behavior switch — one character per role in the fixture, no

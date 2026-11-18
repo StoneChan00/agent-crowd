@@ -372,6 +372,13 @@ export interface Turn {
   override: string | null
   /** Loop guard: marks the automatic second attempt so a restart never re-arms it. */
   retry: boolean
+  /**
+   * M3 timeout-recovery ladder: 0 = an ordinary turn, 1..N = the Nth
+   * automatic resume after a timeout, N+1 style high values mark the
+   * fresh-session report round. Persisted at enqueue so a reboot restores
+   * the rung instead of demoting a resume to a fresh turn.
+   */
+  resumeAttempt: number
   /** Round-end summary turns never relay and don't count as round activity. */
   isRoundSummary: boolean
   /**

@@ -27,7 +27,8 @@ export const customAdapter: HarnessAdapter = {
       cwd: input.cwd,
       signal: input.signal,
       timeoutMs: turnTimeoutMs(),
-      idleTimeoutMs: idleTimeoutMs(),
+      idleTimeoutMs: input.idleTimeoutMs ?? idleTimeoutMs(),
+      onSilence: input.onSilence,
       onSpawn: input.onSpawn,
       onStdoutLine: (line) => {
         stdout += line + '\n'

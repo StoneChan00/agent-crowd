@@ -203,7 +203,8 @@ async function attemptRun(
       cwd: input.cwd,
       signal: input.signal,
       timeoutMs: turnTimeoutMs(),
-      idleTimeoutMs: idleTimeoutMs(),
+      idleTimeoutMs: input.idleTimeoutMs ?? idleTimeoutMs(),
+      onSilence: input.onSilence,
       onSpawn: input.onSpawn,
       ...(apiKey ? { env: { DEEPSEEK_API_KEY: apiKey } } : {}),
       onStdoutLine: (line) => {

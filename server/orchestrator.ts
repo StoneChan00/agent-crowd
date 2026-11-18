@@ -4,7 +4,7 @@ import { mkdirSync } from 'node:fs'
 import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
-import { isTransientFailure } from './harnesses/process.ts'
+import { isTransientFailure, RESUME_BREAKER_LIMIT, resumeAttempts, resumeIdleTimeoutMs, timeoutRecoveryPlan } from './harnesses/process.ts'
 import { changedPathsBetween, commitPaths, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPromptDetailed } from './prompt.ts'
@@ -40,6 +40,14 @@ interface QueueItem {
    * output (loop guard: a failure is retried exactly once, never twice).
    */
   retry?: boolean
+  /**
+   * M3 timeout-recovery rung: 0/undefined = ordinary turn, 1..N = the Nth
+   * automatic resume, 2+ with a report instruction = the fresh-session
+   * wrap-up round. Persisted on the turn row so a reboot restores the rung;
+   * the run's idle budget derives from it (resume turns ride the shorter
+   * AC_RESUME_IDLE_TIMEOUT_MS watchdog).
+   */
+  resumeAttempt?: number
   /**
    * Marks a round-end summary turn. Summary turns are injected by the
    * orchestrator itself (not by any message) and must never count as round
@@ -456,9 +464,10 @@ export function restoreQueues(turns: Turn[]): void {
         continue
       }
       // Restored items keep their persisted scheduling flags (hop/override/
-      // retry/isRoundSummary/taskId): a restart must not zero the relay
-      // budget, re-aim a steer, re-arm the retry loop guard, let a summary
-      // turn start relaying, or drop a task card's association.
+      // retry/resumeAttempt/isRoundSummary/taskId): a restart must not zero
+      // the relay budget, re-aim a steer, re-arm the retry loop guard,
+      // demote an M3 recovery rung to an ordinary turn, let a summary turn
+      // start relaying, or drop a task card's association.
       queue.push({
         turnId: turn.id,
         characterId: turn.characterId,
@@ -466,6 +475,7 @@ export function restoreQueues(turns: Turn[]): void {
         hop: turn.hop,
         override: turn.override ?? undefined,
         retry: turn.retry || undefined,
+        resumeAttempt: turn.resumeAttempt || undefined,
         isRoundSummary: turn.isRoundSummary || undefined,
         roundId: turn.roundId,
         taskId: turn.taskId,
@@ -513,7 +523,15 @@ function enqueue(
   triggerMessageId: string | null,
   hop: number,
   override?: string,
-  options?: { allowActive?: boolean; retry?: boolean; isRoundSummary?: boolean; roundId?: string | null; taskId?: string | null },
+  options?: {
+    allowActive?: boolean
+    retry?: boolean
+    isRoundSummary?: boolean
+    roundId?: string | null
+    taskId?: string | null
+    /** M3 recovery rung for this queued turn (0/omitted = ordinary). */
+    resumeAttempt?: number
+  },
 ): boolean {
   const queue = queues.get(roomId) ?? []
   // Relay hand-offs dedupe against the running character (loop guard);
@@ -534,6 +552,7 @@ function enqueue(
     hop,
     override,
     retry: options?.retry || undefined,
+    resumeAttempt: options?.resumeAttempt || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
     roundId: options?.roundId ?? null,
     taskId: options?.taskId ?? null,
@@ -545,6 +564,7 @@ function enqueue(
     hop,
     override,
     retry: options?.retry || undefined,
+    resumeAttempt: options?.resumeAttempt || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
     roundId: options?.roundId ?? null,
     taskId: options?.taskId ?? null,
@@ -555,60 +575,106 @@ function enqueue(
 }
 
 /**
- * M2 timeout resume — the continue-instruction rides the CLI's own session,
- * so the model picks up where the watchdog cut it short instead of a manual
- * rerun replaying the full transcript (fresh prompt, cold cache).
+ * M3 timeout-recovery ladder: a timed-out turn is usually a silent long tool
+ * call, not a dead session — the CLI's session survives the kill on disk, so
+ * recovery RIDES it (incremental, cache-warm) instead of replaying the full
+ * transcript. The pure decision lives in process.ts (timeoutRecoveryPlan);
+ * this applies its side effects: streak bookkeeping, per-rung instructions,
+ * honest notices, and the queue-first-announce-after discipline (P7e).
  */
-const TIMEOUT_RESUME_INSTRUCTION =
-  '系统续跑指令：你的上一回合因超时被截断（进程已被停止，CLI 会话已恢复）。请从中断处继续完成原任务：已完成的部分不要重复，直接补完剩余工作并给出最终回复。'
+const timeoutStreaks = new Map<string, { count: number; durations: number[]; lastTool: string }>()
 
-/** Eligibility for the one automatic timeout-resume ride (M2). */
-function timeoutResumeEligible(
-  output: { timedOut?: boolean; sessionId?: string },
-  adapter: { resumeArgs?: (id: string) => string[] | null },
-  item: QueueItem,
-): boolean {
-  return (
-    Boolean(output.timedOut && output.sessionId && adapter.resumeArgs) &&
-    !item.retry &&
-    process.env.AC_SESSION_RESUME !== '0'
-  )
-}
-
-/**
- * A timed-out turn is usually a silent long tool call, not a dead session —
- * the CLI's session survives the kill on disk. Eligibility: the adapter
- * declared resume support AND the run surfaced a session id AND this is the
- * turn's first strike (item.retry) — a resume that times out again settles
- * like any other timeout. Returns whether the continue-instruction was
- * queued.
- */
-function maybeResumeAfterTimeout(
+function scheduleTimeoutRecovery(
   roomId: string,
   character: Character,
   item: QueueItem,
-  output: { timedOut?: boolean; sessionId?: string; error?: string },
+  output: {
+    timedOut?: boolean
+    sessionId?: string
+    error?: string
+    text: string
+    toolTraces?: unknown[]
+    durationMs?: number
+    timeoutDetail?: { kind: 'idle' | 'hard'; silenceMs: number; lastTool?: { name: string; title: string; runningMs: number } }
+  },
   adapter: { resumeArgs?: (id: string) => string[] | null },
 ): boolean {
-  if (!timeoutResumeEligible(output, adapter, item)) return false
+  if (!output.timedOut) return false
+  const key = `${roomId}:${character.id}`
+  const streak = timeoutStreaks.get(key) ?? { count: 0, durations: [], lastTool: '' }
+  streak.count += 1
+  streak.durations.push(Math.max(1, Math.round((output.durationMs ?? 0) / 60_000)))
+  const stuck = output.timeoutDetail?.lastTool
+  if (stuck) streak.lastTool = `${stuck.name}${stuck.title ? `（${stuck.title}）` : ''}`
+  timeoutStreaks.set(key, streak)
+
+  const attempts = resumeAttempts()
+  const action = timeoutRecoveryPlan({
+    attempts,
+    streakCount: streak.count,
+    rung: item.resumeAttempt ?? 0,
+    progressed: output.text.trim().length > 0 || (output.toolTraces?.length ?? 0) > 0,
+    canResume: Boolean(output.sessionId && adapter.resumeArgs) && process.env.AC_SESSION_RESUME !== '0',
+  })
+
+  if (action === 'breaker') {
+    // Announce once at trip time; later timeouts settle without another fanfare.
+    if (streak.count === RESUME_BREAKER_LIMIT) {
+      const notice = db.addMessage({
+        roomId,
+        authorType: 'system',
+        authorName: '系统',
+        content: `🛑 ${character.name} 已连续 ${streak.count} 次超时（分别约 ${streak.durations.slice(-RESUME_BREAKER_LIMIT).join('、')} 分钟），自动续跑已熔断，本次按超时结算。${streak.lastTool ? `最近卡住的工具：${streak.lastTool}——请人工排查该命令为何不返回。` : ''}`,
+        meta: { generated: true },
+      })
+      broadcast(roomId, 'message', { roomId, message: notice })
+    }
+    return false
+  }
+  if (action === 'settle') return false
+
+  const rung = (item.resumeAttempt ?? 0) + 1
+  const idleBudget = resumeIdleTimeoutMs()
+  const idleLabel = idleBudget > 0 ? `${Math.round(idleBudget / 60_000)} 分钟静默上限` : '无静默上限'
+  let instruction: string
+  let noticeText: string
+  if (action === 'report') {
+    // Zero progress on rung 1 = the session itself is suspect: do not ride it
+    // again — clear the row so the report turn runs on a FRESH session.
+    db.clearSession(roomId, character.id)
+    instruction =
+      '系统汇报指令：你的上一回合多次超时且无进展，已为你开启全新会话。不要再执行任何命令或工具，仅根据上下文汇报三件事：①已确认完成的工作 ②怀疑卡住的位置与原因 ③给用户的下一步建议。'
+    noticeText = `⏳ ${character.name} 的续跑无进展，已切换全新会话请求一轮纯汇报（不再执行任何命令，${idleLabel}）。`
+  } else if (rung === 1) {
+    const stuckLine = stuck
+      ? `上次卡在工具：${stuck.name}${stuck.title ? `（${truncate(stuck.title, 120)}）` : ''}——禁止原样重跑该命令，换一种方式绕过卡点（例如改用脚本、后台或跳过）。`
+      : ''
+    instruction = `系统续跑指令（第 1/${attempts} 次）：你的上一回合因超时被截断（进程已被停止，CLI 会话已恢复）。${stuckLine}请从中断处继续完成原任务：已完成的部分不要重复，直接补完剩余工作并给出最终回复。`
+    noticeText = `⏳ ${character.name} 的回合超时被截断，已恢复其 CLI 会话自动续跑（第 1/${attempts} 次，${idleLabel}）${stuck ? `；上次卡在工具：${stuck.name}` : ''}。`
+  } else {
+    instruction = `系统续跑指令（第 ${rung}/${attempts} 次，最后一次）：续跑仍有进展但再次超时。不要再执行任何新的长命令或工具，只把已有结果收尾：汇总已完成的改动与结论，给出最终回复。`
+    noticeText = `⏳ ${character.name} 的续跑有进展但再次超时，再续跑一次收尾（第 ${rung}/${attempts} 次，只汇总不执行新命令）。`
+  }
+
   // Queue FIRST, announce after: enqueue silently no-ops when a same-character
   // item is already waiting (a mid-turn @), and the P0-1 discipline (see
   // enqueue's own comment) is to never promise an automatic retry that did
   // not enter the queue — a notice without a ride would also contradict the
   // failure settlement that follows.
-  const queued = enqueue(roomId, character.id, item.triggerMessageId, item.hop, TIMEOUT_RESUME_INSTRUCTION, {
+  const queued = enqueue(roomId, character.id, item.triggerMessageId, item.hop, instruction, {
     allowActive: true,
     retry: true,
     isRoundSummary: item.isRoundSummary,
     roundId: item.roundId ?? null,
     taskId: item.taskId ?? null,
+    resumeAttempt: rung,
   })
   if (!queued) return false
   const notice = db.addMessage({
     roomId,
     authorType: 'system',
     authorName: '系统',
-    content: `⏳ ${character.name} 的回合超时被截断，已恢复其 CLI 会话自动续跑一次（${truncate(output.error ?? '运行超时', 80)}）。`,
+    content: noticeText,
     meta: { generated: true },
   })
   broadcast(roomId, 'message', { roomId, message: notice })
@@ -1294,6 +1360,8 @@ async function pump(roomId: string): Promise<void> {
     })
     const prompt = built.prompt
     db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))
+    /** M3 liveness: guards the single suspected-stall system message. */
+    let silenceWarned = false
 
     const output = await adapter.run({
       character,
@@ -1302,6 +1370,35 @@ async function pump(roomId: string): Promise<void> {
       cwd,
       resume: useResume && session ? { id: session.sessionId } : undefined,
       signal: controller.signal,
+      // M3: recovery turns (rung >= 1) ride their own much shorter idle
+      // watchdog so a stuck resume settles in minutes, not another full
+      // idle window.
+      idleTimeoutMs: (item.resumeAttempt ?? 0) > 0 ? resumeIdleTimeoutMs() : undefined,
+      // M3 liveness: report-only silence warnings at 50%/85% of the idle
+      // budget — the kill timer itself stays byte-accurate (process.ts).
+      onSilence: (info) => {
+        const kind = info.fraction >= 0.85 ? 'suspected_stall' : 'alive_but_silent'
+        broadcast(roomId, 'liveness', {
+          roomId,
+          characterId: character.id,
+          kind,
+          silenceMs: info.silenceMs,
+          thresholdMs: info.thresholdMs,
+        })
+        // At most ONE in-chat warning per turn, at the suspected-stall mark:
+        // the 50% ping is an SSE event for the UI, not a message.
+        if (kind === 'suspected_stall' && !silenceWarned) {
+          silenceWarned = true
+          const notice = db.addMessage({
+            roomId,
+            authorType: 'system',
+            authorName: '系统',
+            content: `⚠️ ${character.name} 的回合已静默 ${Math.max(1, Math.round(info.silenceMs / 60_000))} 分钟，疑似卡在某个长时间无输出的命令上。可继续等待自动超时，或用停止按钮中断。`,
+            meta: { generated: true },
+          })
+          broadcast(roomId, 'message', { roomId, message: notice })
+        }
+      },
       // Surface the CLI pid the moment it spawns: stored on the active turn
       // (for /state and reconnect snapshots) and broadcast so open clients
       // can show it while the turn runs.
@@ -1405,7 +1502,7 @@ async function pump(roomId: string): Promise<void> {
           consumedSeq: built.nextCursor.seq,
         })
       }
-      if (maybeResumeAfterTimeout(roomId, character, item, output, adapter)) return
+      if (scheduleTimeoutRecovery(roomId, character, item, output, adapter)) return
       // Session-continuity fallback (P0-1): a turn that died resuming its
       // CLI session clears the row first, so the rerun (and every later
       // turn) replays the FULL transcript. A resume rejection is plumbing,
@@ -1661,11 +1758,15 @@ async function pump(roomId: string): Promise<void> {
       })
     }
     enqueueFollowers(roomId, message.id, followers, item.hop + 1, item.roundId ?? null, item.taskId ?? null)
-    // M2: a timed-out turn with partial text lands as-is (meta.error flags
-    // the truncation) and the session row survives — hand the character one
-    // resume ride to finish what the watchdog cut short. Round identity and
-    // card link ride along (B03): the continuation is the SAME work.
-    maybeResumeAfterTimeout(roomId, character, item, output, adapter)
+    // M3: a timed-out turn with partial text lands as-is (meta.error flags
+    // the truncation) and the session row survives — the ladder decides the
+    // next rung (resume / report / breaker). A clean turn resets the
+    // room+character timeout streak (one success clears the breaker).
+    if (output.error) {
+      scheduleTimeoutRecovery(roomId, character, item, output, adapter)
+    } else {
+      timeoutStreaks.delete(`${roomId}:${character.id}`)
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     console.error(`[agent-crowd] pump(${roomId}) failed:`, reason)

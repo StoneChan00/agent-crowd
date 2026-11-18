@@ -75,6 +75,70 @@ export function idleTimeoutMs(): number {
   return parseDurationMs(raw, DEFAULT_IDLE_TIMEOUT_MS, MIN_IDLE_TIMEOUT_MS)
 }
 
+/**
+ * M3 recovery-ladder budget: how many automatic resumes a timed-out turn may
+ * ride (`AC_RESUME_ATTEMPTS`, default 2 — resume #1 "continue", resume #2
+ * "wrap up"; 0 disables the whole ladder). Unparseable/negative values fall
+ * back to the default, same footgun discipline as the timeouts above.
+ */
+export function resumeAttempts(): number {
+  const raw = process.env.AC_RESUME_ATTEMPTS
+  if (raw === undefined || raw === '') return 2
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 2
+}
+
+/**
+ * M3 recovery-ladder idle budget: the resume/report turns get their OWN
+ * (much shorter) watchdog (`AC_RESUME_IDLE_TIMEOUT_MS`, default 3 minutes)
+ * so a stuck recovery settles in minutes instead of burning another full
+ * idle window. Same grammar as `AC_IDLE_TIMEOUT_MS`, `0`/`off` disables.
+ */
+export function resumeIdleTimeoutMs(): number {
+  const raw = (process.env.AC_RESUME_IDLE_TIMEOUT_MS ?? '').trim().toLowerCase()
+  if (raw === '0' || raw === 'off' || raw === 'none') return 0
+  return parseDurationMs(raw, 3 * 60_000, MIN_IDLE_TIMEOUT_MS)
+}
+
+/** M3 circuit breaker: consecutive timeouts (per room+character) that trip it. */
+export const RESUME_BREAKER_LIMIT = 3
+
+/**
+ * M3 recovery decision as a PURE function (unit-tested; the orchestrator
+ * applies the side effects). Given the ladder knobs and one timeout's facts:
+ *  - 'breaker': the room+character streak hit RESUME_BREAKER_LIMIT — settle
+ *    with a diagnostic, no more automatic rides (the streak lives in the
+ *    server and deliberately survives every session swap — clowder F118
+ *    GAP-2 pins why: a swapped session must not reset the count, or the
+ *    breaker never trips and the loop runs forever);
+ *  - 'settle': ladder off (attempts 0) / rung exhausted / nothing to ride;
+ *  - 'report': rung 1 made ZERO progress — the session is suspect
+ *    (clowder KD-7 session-poison), so do NOT ride it again: clear the row
+ *    and ask a FRESH session for a read-only wrap-up;
+ *  - 'resume': ride the surviving CLI session with the next rung's
+ *    instruction (rung 1 = continue + never re-run the stuck tool verbatim,
+ *    rung >= 2 = wrap up only, no new long commands).
+ */
+export function timeoutRecoveryPlan(input: {
+  /** AC_RESUME_ATTEMPTS */
+  attempts: number
+  /** Consecutive timeouts for this room+character, INCLUDING this one. */
+  streakCount: number
+  /** The timed-out turn's rung (0 = ordinary turn, 1..N = resume rides). */
+  rung: number
+  /** Rung >= 1: did that run produce new text or newly completed tools? */
+  progressed: boolean
+  /** Adapter declared resume support AND the run surfaced a session id. */
+  canResume: boolean
+}): 'breaker' | 'settle' | 'report' | 'resume' {
+  if (input.streakCount >= RESUME_BREAKER_LIMIT) return 'breaker'
+  if (input.attempts <= 0) return 'settle'
+  if (input.rung >= input.attempts) return 'settle'
+  if (!input.canResume) return 'settle'
+  if (input.rung === 1 && !input.progressed) return 'report'
+  return 'resume'
+}
+
 /** Human label for whichever limit ended a turn (fed into error messages). */
 export function describeTimeout(result: { timedOut: boolean; timeoutKind?: 'idle' | 'hard' }): string | undefined {
   if (!result.timedOut) return undefined
@@ -295,6 +359,13 @@ export interface ProcessOptions {
   onStderrLine?: (line: string) => void
   /** Fires once with the spawned child's pid, so callers can surface it. */
   onSpawn?: (pid: number) => void
+  /**
+   * M3 liveness reporting (report-only, never resets the kill timer): fires
+   * at 50% and 85% of idleTimeoutMs of unbroken silence so the room can say
+   * "still alive but silent" / "suspected stall" instead of waiting for the
+   * kill in the dark. Silent when the idle watchdog is off.
+   */
+  onSilence?: (info: { fraction: number; silenceMs: number; thresholdMs: number }) => void
 }
 
 export interface ProcessResult {
@@ -304,6 +375,8 @@ export interface ProcessResult {
   timedOut: boolean
   /** Which limit fired: silent-too-long ('idle') or total runtime ('hard'). */
   timeoutKind?: 'idle' | 'hard'
+  /** Time since the last output byte at settlement (timed-out turns). */
+  silenceMs?: number
   aborted: boolean
   spawnError?: string
   /** Pid of the spawned child; absent when the signal aborted before spawn. */
@@ -329,13 +402,24 @@ export function runProcess(
     let aborted = false
     let settled = false
     let child: ChildProcess | undefined
+    let lastOutputAt = Date.now()
 
     const finish = (code: number | null, spawnError?: string) => {
       if (settled) return
       settled = true
       if (child) activeChildren.delete(child)
       cleanup()
-      resolvePromise({ code, stdout, stderr, timedOut, timeoutKind, aborted, spawnError, pid: child?.pid })
+      resolvePromise({
+        code,
+        stdout,
+        stderr,
+        timedOut,
+        timeoutKind,
+        silenceMs: timedOut ? Date.now() - lastOutputAt : undefined,
+        aborted,
+        spawnError,
+        pid: child?.pid,
+      })
     }
 
     const timer =
@@ -364,6 +448,37 @@ export function runProcess(
       }, options.idleTimeoutMs)
     }
 
+    // M3 liveness reporting — same reset points as the idle watchdog (every
+    // output byte), but strictly ADVISORY: these timers never kill anything
+    // and never touch idleTimer, so the kill decision stays byte-accurate.
+    let silenceStart = Date.now()
+    let silenceStage = 0
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined
+    const SILENCE_FRACTIONS = [0.5, 0.85]
+    const armSilence = () => {
+      if (settled) return
+      if (!options.idleTimeoutMs || options.idleTimeoutMs <= 0 || !options.onSilence) return
+      if (silenceTimer) clearTimeout(silenceTimer)
+      silenceStart = Date.now()
+      silenceStage = 0
+      scheduleSilence()
+    }
+    const scheduleSilence = () => {
+      const fraction = SILENCE_FRACTIONS[silenceStage]
+      if (fraction === undefined) return
+      const fireAt = silenceStart + options.idleTimeoutMs! * fraction
+      silenceTimer = setTimeout(() => {
+        if (settled) return
+        options.onSilence?.({
+          fraction,
+          silenceMs: Date.now() - silenceStart,
+          thresholdMs: options.idleTimeoutMs!,
+        })
+        silenceStage += 1
+        scheduleSilence()
+      }, Math.max(0, fireAt - Date.now()))
+    }
+
     const onAbort = () => {
       aborted = true
       killTree(child)
@@ -372,6 +487,7 @@ export function runProcess(
     function cleanup() {
       if (timer) clearTimeout(timer)
       if (idleTimer) clearTimeout(idleTimer)
+      if (silenceTimer) clearTimeout(silenceTimer)
       options.signal?.removeEventListener('abort', onAbort)
     }
 
@@ -394,6 +510,7 @@ export function runProcess(
       activeChildren.add(child)
       if (child.pid) options.onSpawn?.(child.pid)
       armIdle()
+      armSilence()
     } catch (error) {
       finish(null, error instanceof Error ? error.message : String(error))
       return
@@ -407,6 +524,8 @@ export function runProcess(
       child.stdout.setEncoding('utf8')
       child.stdout.on('data', (chunk: string) => {
         armIdle()
+        armSilence()
+        lastOutputAt = Date.now()
         stdout += chunk
         buffer += chunk
         let index = buffer.indexOf('\n')
@@ -428,6 +547,8 @@ export function runProcess(
       child.stderr.setEncoding('utf8')
       child.stderr.on('data', (chunk: string) => {
         armIdle()
+        armSilence()
+        lastOutputAt = Date.now()
         stderr += chunk
         buffer += chunk
         let index = buffer.indexOf('\n')

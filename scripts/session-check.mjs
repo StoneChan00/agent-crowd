@@ -47,7 +47,7 @@
  */
 import { spawn } from 'node:child_process'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -57,6 +57,7 @@ import { buildCodexArgs } from '../server/harnesses/codex.ts'
 import { buildDshArgs } from '../server/harnesses/dsh.ts'
 import { buildOpencodeLikeArgs } from '../server/harnesses/opencodeLike.ts'
 import { getAdapter } from '../server/harnesses/index.ts'
+import { RESUME_BREAKER_LIMIT, timeoutRecoveryPlan } from '../server/harnesses/process.ts'
 import {
   buildTurnPrompt,
   buildTurnPromptDetailed,
@@ -1002,6 +1003,44 @@ async function scenarioKillSwitch() {
   check('P6 开关只关乘坐不关记账（turns 仍累加到 2）', row && row.turns === 2, JSON.stringify(row))
 }
 
+/* ---------- P7u M3 recovery decision table (pure) + restore wiring */
+
+/**
+ * timeoutRecoveryPlan is the ladder's entire policy as a pure function —
+ * the decision table pins it: breaker first (the streak survives every
+ * session swap), attempts=0 settles (the kill switch), rung exhaustion
+ * settles, no session settles, rung-1 zero progress reports on a FRESH
+ * session, everything else resumes. Plus the restoreQueues wiring grep:
+ * a reboot must carry resume_attempt back onto the queue item.
+ */
+function scenarioRecoveryPlan() {
+  const base = { attempts: 2, canResume: true }
+  check('P7u 首击（rung0）→ resume', timeoutRecoveryPlan({ ...base, streakCount: 1, rung: 0, progressed: false }) === 'resume')
+  check('P7u rung1 有进展 → resume r2', timeoutRecoveryPlan({ ...base, streakCount: 2, rung: 1, progressed: true }) === 'resume')
+  check('P7u rung1 零进展 → report（换新会话）', timeoutRecoveryPlan({ ...base, streakCount: 2, rung: 1, progressed: false }) === 'report')
+  check('P7u rung2（阶梯耗尽）→ settle', timeoutRecoveryPlan({ ...base, streakCount: 2, rung: 2, progressed: true }) === 'settle')
+  check('P7u 阶梯关闭（attempts=0）→ settle', timeoutRecoveryPlan({ ...base, attempts: 0, streakCount: 1, rung: 0, progressed: false }) === 'settle')
+  check('P7u 无会话可乘（canResume=false）→ settle', timeoutRecoveryPlan({ ...base, canResume: false, streakCount: 1, rung: 0, progressed: false }) === 'settle')
+  check(`P7u 连续 ${RESUME_BREAKER_LIMIT} 次超时 → breaker（优先于一切）`, timeoutRecoveryPlan({ ...base, streakCount: RESUME_BREAKER_LIMIT, rung: 0, progressed: false }) === 'breaker')
+  check('P7u 熔断优先于汇报/续跑（rung1 零进展也熔断）', timeoutRecoveryPlan({ ...base, streakCount: RESUME_BREAKER_LIMIT, rung: 1, progressed: false }) === 'breaker')
+  check('P7u attempts=4 时 rung2 仍可续（阶梯可扩，rung<attempts 即续）', timeoutRecoveryPlan({ attempts: 4, canResume: true, streakCount: 2, rung: 2, progressed: true }) === 'resume')
+
+  // Wiring grep (mention-check precedent): the boot restore must carry the
+  // persisted rung back onto the queue item, or a reboot mid-ladder demotes
+  // a resume turn to a fresh ordinary turn.
+  const orchestrator = readFileSync(new URL('../server/orchestrator.ts', import.meta.url), 'utf8')
+  check(
+    'P7u restoreQueues 带回 resumeAttempt（重启不降档）',
+    orchestrator.includes('resumeAttempt: turn.resumeAttempt || undefined'),
+    'the restore mapping must read the persisted rung',
+  )
+  check(
+    'P7u 回合输入按档位切换静默预算（短看门狗只作用于恢复轮）',
+    orchestrator.includes("(item.resumeAttempt ?? 0) > 0 ? resumeIdleTimeoutMs() : undefined"),
+    'the idle budget derives from the rung at run time',
+  )
+}
+
 /* ----------------- P7 M2 timeout resume: the session survives the kill */
 
 /**
@@ -1069,43 +1108,71 @@ async function scenarioTimeoutResume() {
     check('P7b 续跑回合乘坐已存会话（meta.resume=true）', replies[1]?.meta?.resume === true, JSON.stringify(replies[1]?.meta?.resume))
   }
 
-  // (c) the guard: a resume that times out again settles — no second ride.
+  // (c) M3 full ladder: original timeout → rung 1 (progress, partial text)
+  // → rung 2 (progress, partial text) → 3rd timeout trips the breaker; the
+  // rungs persist as turns.resume_attempt 0/1/2 (a reboot restores the rung).
   {
     const room = await makeRoom(port, 'p7c-超时连挂', work)
-    await makeCharacter(port, room.id, '丙', 'MOCK-超时连挂')
+    const character = await makeCharacter(port, room.id, '丙', 'MOCK-超时连挂')
     await postMessage(port, room.id, '这个任务会一直卡住')
     await waitIdle(port, room.id, 40_000)
     const messages = await roomMessages(room.id)
-    check('P7c 续跑也超时后不再续（播报仍恰 1 条）', systemNotices(messages, '自动续跑').length === 1, `实际 ${systemNotices(messages, '自动续跑').length}`)
+    check('P7c 阶梯播报恰两次（第 1/2 次 + 第 2/2 次）', systemNotices(messages, '第 1/2 次').length === 1 && systemNotices(messages, '第 2/2 次').length === 1, JSON.stringify(systemNotices(messages, '续跑').map((m) => m.content.slice(0, 40))))
+    check('P7c 第 3 次超时熔断并诊断（🛑 恰 1 条，含卡住工具）', (() => { const hits = systemNotices(messages, '熔断'); return hits.length === 1 && hits[0].content.includes('bash') })(), JSON.stringify(systemNotices(messages, '熔断').map((m) => m.content.slice(0, 60))))
     const replies = characterMessages(messages, '丙')
     check(
-      'P7c 最终只落续跑的半截（meta.error），无第二次续跑回复',
-      replies.length === 1 && replies[0].content.includes('续跑到一半') && String(replies[0].meta?.error ?? '').includes('运行超时'),
+      'P7c 两段续跑的半截都落库（meta.error 标截断），无更多回复',
+      replies.length === 2 && replies.every((m) => m.content.includes('续跑到一半') && String(m.meta?.error ?? '').includes('运行超时')),
       JSON.stringify(replies.map((m) => m.content.slice(0, 24))),
+    )
+    const turns = turnRows(dir, 'character_id = ?', character.id)
+    check(
+      'P7c 恰 3 个回合，resume_attempt 0/1/2 逐级记录（重启恢复的依据）',
+      turns.length === 3 && turns.map((t) => t.resume_attempt).join(',') === '0,1,2',
+      JSON.stringify(turns.map((t) => ({ s: t.status, r: t.resume_attempt }))),
+    )
+    check(
+      'P7c 续跑指令含禁止重跑卡点命令（timeoutDetail → 指令回流）',
+      turns.map((t) => String(t.override ?? '')).some((ov) => ov.includes('ui_server.py') && ov.includes('禁止原样重跑')),
+      JSON.stringify(turns.map((t) => String(t.override ?? '').slice(0, 60))),
     )
   }
 
-  // (d) zero-text timeout ON the resume ride: settles with the failure
-  // notice but the surviving session row MUST stay (the wrong clearSession
-  // used to wipe it, turning every later turn into a full replay).
+  // (d) M3 zero-progress report round: rung 1 with NO new text/tools → the
+  // session is suspect → clearSession + a FRESH-session report round (no
+  // resume ride) that answers with the three-point report.
   {
     const room = await makeRoom(port, 'p7d-超时连挂零文本', work)
     await makeCharacter(port, room.id, '丁', 'MOCK-超时连挂零文本')
     await postMessage(port, room.id, '续跑也一声不吭')
     await waitIdle(port, room.id, 40_000)
     const messages = await roomMessages(room.id)
-    check('P7d 续跑零文本超时后不再续（播报仍恰 1 条）', systemNotices(messages, '自动续跑').length === 1, `实际 ${systemNotices(messages, '自动续跑').length}`)
+    check('P7d 续跑 1 次 + 汇报轮播报各恰 1 条（无「运行失败」）', systemNotices(messages, '第 1/2 次').length === 1 && systemNotices(messages, '纯汇报').length === 1 && systemNotices(messages, '运行失败').length === 0, JSON.stringify(systemNotices(messages, '续跑').concat(systemNotices(messages, '汇报')).map((m) => m.content.slice(0, 30))))
+    const replies = characterMessages(messages, '丁')
     check(
-      'P7d 最终以「运行失败」结算（零文本无角色消息可落）',
-      systemNotices(messages, '运行失败').length === 1 && characterMessages(messages, '丁').length === 0,
-      `${systemNotices(messages, '运行失败').length} 条失败播报`,
+      'P7d 汇报轮以全新会话完成（恰 1 条回复、meta.resume 未置位 = clearSession 生效、含三点汇报）',
+      replies.length === 1 && replies[0].meta?.resume !== true && replies[0].content.includes('卡点'),
+      JSON.stringify(replies.map((m) => ({ text: m.content.slice(0, 30), resume: m.meta?.resume ?? null }))),
     )
     const row = sessionRows(dir, 'room_id = ?', room.id)[0]
     check(
-      'P7d 会话行保留且续跑超时也记账（turns=2：写入发生、clearSession 未删）',
-      row && String(row.session_id).startsWith('mock-') && row.turns === 2,
+      'P7d 会话行为汇报轮的新会话（旧行被 clearSession、turns 从 1 重新计）',
+      row && String(row.session_id).startsWith('mock-') && row.turns === 1,
       JSON.stringify(row),
     )
+  }
+
+  // (d2) M3 worst case: the report round ALSO dies to the watchdog → 3rd
+  // timeout trips the breaker, the round settles with the failure notice,
+  // and the zero-text resume's session row stays recorded.
+  {
+    const room = await makeRoom(port, 'p7d2-超时连挂零文本汇报', work)
+    await makeCharacter(port, room.id, '丁二', 'MOCK-超时连挂零文本汇报')
+    await postMessage(port, room.id, '连汇报轮也卡死')
+    await waitIdle(port, room.id, 40_000)
+    const messages = await roomMessages(room.id)
+    check('P7d2 熔断恰 1 条且以「运行失败」结算', systemNotices(messages, '熔断').length === 1 && systemNotices(messages, '运行失败').length === 1, JSON.stringify(systemNotices(messages, '熔断').concat(systemNotices(messages, '运行失败')).map((m) => m.content.slice(0, 30))))
+    check('P7d2 零回复（原回合/续跑/汇报轮全零文本）', characterMessages(messages, '丁二').length === 0, `实际 ${characterMessages(messages, '丁二').length}`)
   }
 
   // (e) the announce-after-queue contract (M2 review 1): a mid-turn @ has
@@ -1148,6 +1215,88 @@ async function scenarioTimeoutResume() {
     const row = sessionRows(dir, 'room_id = ?', room.id)[0]
     check('P7e 会话行保留（慢击超时记账 + 插话回合记账，turns=2）', row && row.turns === 2, JSON.stringify(row))
   }
+
+  // (f) M3 diagnostics: the rung-1 instruction QUOTES the stuck tool from
+  // timeoutDetail back to the model and forbids re-running it verbatim —
+  // the anti-"blind resume re-executes the never-returning command" guard.
+  {
+    const room = await makeRoom(port, 'p7f-超时诊断', work)
+    const character = await makeCharacter(port, room.id, '己', 'MOCK-超时')
+    await postMessage(port, room.id, '重启一下 UI 服务')
+    await waitIdle(port, room.id, 40_000)
+    const messages = await roomMessages(room.id)
+    const turns = turnRows(dir, 'character_id = ?', character.id)
+    const rung1 = turns.find((t) => t.resume_attempt === 1)
+    check(
+      'P7f 续跑指令点名卡住工具并禁止原样重跑（含 ui_server.py 与禁止语）',
+      Boolean(rung1) && String(rung1?.override ?? '').includes('ui_server.py') && String(rung1?.override ?? '').includes('禁止原样重跑'),
+      JSON.stringify(turns.map((t) => ({ r: t.resume_attempt, ov: String(t.override ?? '').slice(0, 70) }))),
+    )
+    check(
+      'P7f 播报也带上卡住工具名（bash）',
+      systemNotices(messages, '第 1/2 次').length === 1 && systemNotices(messages, '第 1/2 次')[0].content.includes('bash'),
+      JSON.stringify(systemNotices(messages, '第 1/2 次').map((m) => m.content.slice(0, 60))),
+    )
+  }
+}
+
+/* --------------- P7i M3 silence warnings: real process via custom harness */
+
+/**
+ * The mock harness never spawns a process, so the two-stage silence warning
+ * (50% alive_but_silent / 85% suspected_stall) needs a REAL silent command:
+ * a custom-harness character whose template sleeps 90s, on a server booted
+ * with AC_IDLE_TIMEOUT_MS=10s — silence events at ~5s/8.5s, kill at 10s,
+ * one in-chat warning, and no recovery (custom declares no resumeArgs).
+ */
+async function scenarioSilenceWarning() {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-session-p7i-'))
+  tempDirs.push(dir)
+  const work = mkdtempSync(join(tmpdir(), 'ac-session-p7iw-'))
+  tempDirs.push(work)
+
+  const server = await bootServer(dir, { AC_IDLE_TIMEOUT_MS: '10s' })
+  const port = server.port
+  const room = await makeRoom(port, 'p7i-静默预警', work)
+  await req(port, `/api/rooms/${room.id}/characters`, {
+    method: 'POST',
+    body: JSON.stringify({
+      name: '静',
+      harness: 'custom',
+      model: '',
+      persona: '静默角色',
+      triggers: ON_USER_ONLY,
+      commandTemplate: 'powershell -NoProfile -Command Start-Sleep -Seconds 90',
+    }),
+  })
+
+  const watch = await sseWatch(port, room.id)
+  await postMessage(port, room.id, '跑一个安静的长命令')
+  await waitIdle(port, room.id, 40_000)
+  await watch.stop()
+
+  const liveness = watch.events.filter((frame) => frame.event === 'liveness')
+  const kinds = liveness.map((frame) => frame.data?.kind)
+  check(
+    'P7i 两段静默事件均发出（alive_but_silent → suspected_stall）',
+    kinds.includes('alive_but_silent') && kinds.includes('suspected_stall'),
+    JSON.stringify(kinds),
+  )
+  check(
+    'P7i 事件携带静默时长与阈值（可观测字段）',
+    liveness.every((frame) => typeof frame.data?.silenceMs === 'number' && frame.data?.thresholdMs === 10_000),
+    JSON.stringify(liveness.map((frame) => frame.data)),
+  )
+  const messages = (await req(port, `/api/rooms/${room.id}/messages?limit=100`)).messages
+  // Two turns run here (original + the <120s transient auto-retry, existing
+  // semantics) — each turn gets AT MOST ONE suspected-stall message.
+  check(
+    'P7i 疑似卡住恰 2 条系统消息（原回合 + 瞬态重试各 1 条，50% 只发 SSE 不发消息）',
+    systemNotices(messages, '已静默').length === 2,
+    JSON.stringify(systemNotices(messages, '已静默').map((m) => m.content.slice(0, 40))),
+  )
+  check('P7i custom 无续跑能力 → 零恢复播报', systemNotices(messages, '自动续跑').length === 0, `实际 ${systemNotices(messages, '自动续跑').length}`)
+  check('P7i 两回合均以超时结算（运行失败 2 条：原 + 瞬态重试）', systemNotices(messages, '运行失败').length === 2, `实际 ${systemNotices(messages, '运行失败').length}`)
 }
 
 /* ------------------------------------------------------------------- main */
@@ -1156,6 +1305,7 @@ try {
   scenarioIncrementalPrompt()
   scenarioResumeArgs()
   scenarioFullArgv()
+  scenarioRecoveryPlan()
   await scenarioIsolation()
   await scenarioIntegration()
   await scenarioMidRoundMessage()
@@ -1164,6 +1314,7 @@ try {
   await scenarioFallback()
   await scenarioKillSwitch()
   await scenarioTimeoutResume()
+  await scenarioSilenceWarning()
 } catch (error) {
   failed += 1
   console.log(`× script error: ${error instanceof Error ? (error.stack ?? error.message) : error}`)
