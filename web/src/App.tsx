@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Bootstrap, Character, CharacterPreset, Message, Room, Task } from './types'
+import type { Bootstrap, Character, CharacterPreset, Memory, Message, Room, Task } from './types'
 import { api } from './lib/api'
 import { Sidebar } from './components/Sidebar'
 import { ChatHeader } from './components/ChatHeader'
@@ -13,6 +13,7 @@ import { PresetPicker } from './components/PresetPicker'
 import { McpPanel } from './components/McpPanel'
 import { TaskPanel } from './components/TaskPanel'
 import { UsagePanel } from './components/UsagePanel'
+import { StatusPanel } from './components/StatusPanel'
 
 export default function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
@@ -34,10 +35,13 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [showTasks, setShowTasks] = useState(false)
   const [showUsage, setShowUsage] = useState(false)
+  const [showStatus, setShowStatus] = useState(false)
   // Bumped after a successful send/steer: MessageList force-scrolls to the
   // bottom once per bump, so "I sent it but I'm reading history" ends with the
   // view at my message instead of wherever I was scrolled.
   const [scrollSignal, setScrollSignal] = useState(0)
+  /** B10: memory provenance jump target; scrolls/highlights the source message. */
+  const [focusMessageId, setFocusMessageId] = useState<string | null>(null)
 
   const [editingCharacter, setEditingCharacter] = useState<Character | null | undefined>(undefined)
   const [editingPreset, setEditingPreset] = useState<CharacterPreset | null | undefined>(undefined)
@@ -79,6 +83,28 @@ export default function App() {
     const timer = setTimeout(() => setNotice(''), 4500)
     return () => clearTimeout(timer)
   }, [notice])
+
+  // Memory provenance jump: the row may belong to a room we just switched to,
+  // so this waits for `messages` and retries on each load. Give up with a
+  // notice when the source scrolled out of the 300-message window.
+  useEffect(() => {
+    if (!focusMessageId) return
+    const element = document.getElementById(`msg-${focusMessageId}`)
+    if (!element) {
+      const timer = setTimeout(() => {
+        setNotice('来源消息不在当前加载的聊天记录里')
+        setFocusMessageId(null)
+      }, 1500)
+      return () => clearTimeout(timer)
+    }
+    element.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    element.classList.add('msg-focus')
+    const timer = setTimeout(() => {
+      element.classList.remove('msg-focus')
+      setFocusMessageId(null)
+    }, 2500)
+    return () => clearTimeout(timer)
+  }, [focusMessageId, messages])
 
   // Messages + SSE follow the selected room.
   useEffect(() => {
@@ -369,6 +395,18 @@ export default function App() {
     await refresh()
   }
 
+  const locateMemory = (memory: Memory) => {
+    if (!memory.sourceMessageId) {
+      setNotice('这条记忆没有关联消息')
+      return
+    }
+    if (memory.sourceRoomId && memory.sourceRoomId !== roomId) {
+      setRoomId(memory.sourceRoomId)
+      setView('chat')
+    }
+    setFocusMessageId(memory.sourceMessageId)
+  }
+
   const addTemplate = async (templateId: string) => {
     if (!roomId) return
     try {
@@ -526,6 +564,7 @@ export default function App() {
               onTogglePanel={() => setPanelOpen((open) => !open)}
               onShowTasks={() => setShowTasks(true)}
               onShowUsage={() => setShowUsage(true)}
+              onShowStatus={() => setShowStatus(true)}
               onToggleSidebar={() => setSidebarOpen((open) => !open)}
             />
 
@@ -582,6 +621,10 @@ export default function App() {
 
       {showUsage && room && (
         <UsagePanel roomId={room.id} roomName={room.name} onClose={() => setShowUsage(false)} />
+      )}
+
+      {showStatus && room && (
+        <StatusPanel roomId={room.id} roomName={room.name} onClose={() => setShowStatus(false)} />
       )}
 
       {showTasks && room && (
@@ -644,6 +687,7 @@ export default function App() {
           onSave={saveRoom}
           onIsolate={isolateRoom}
           onUnisolate={unisolateRoom}
+          onLocateMemory={locateMemory}
           onDelete={deleteRoom}
         />
       )}

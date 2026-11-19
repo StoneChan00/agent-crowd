@@ -16,6 +16,7 @@ interface ChatHeaderProps {
   onTogglePanel: () => void
   onShowTasks: () => void
   onShowUsage: () => void
+  onShowStatus: () => void
   /** Mobile only: open the sidebar drawer (room list / library nav). */
   onToggleSidebar: () => void
 }
@@ -33,6 +34,7 @@ export function ChatHeader({
   onTogglePanel,
   onShowTasks,
   onShowUsage,
+  onShowStatus,
   onToggleSidebar,
 }: ChatHeaderProps) {
   const active = characters.find((character) => character.id === activeCharacterId)
@@ -100,6 +102,9 @@ export function ChatHeader({
         </button>
         <button className="btn btn-ghost" onClick={onShowUsage} disabled={!room} title="Token 用量">
           用量
+        </button>
+        <button className="btn btn-ghost" onClick={onShowStatus} disabled={!room} title="运行状态与轮次证据">
+          状态
         </button>
         <button className="btn btn-icon btn-ghost panel-toggle" onClick={onTogglePanel} title="角色面板">
           ◫

@@ -119,8 +119,17 @@ export interface Memory {
   kind: MemoryKind
   content: string
   sourceRoomId: string | null
+  /** Provenance (B10): the message this memory was filed from, when known. */
+  sourceMessageId: string | null
+  /** Provenance (B10): the round an automatic episode/lesson came from. */
+  sourceRoundId: string | null
   pinned: boolean
   useCount: number
+  /** Lesson lifecycle (B10): how many times the same failure was seen. */
+  repeatCount: number
+  /** A lesson repeated often enough to become a standing convention. */
+  promoted: boolean
+  lastSeenAt: number | null
   createdAt: number
   lastUsedAt: number | null
 }
@@ -423,17 +432,66 @@ export interface ParseResult<T> {
  * room's verification command (kind='verify'). The gate reads the round's
  * latest entries to decide whether a changed round may close.
  */
+/** Live round summary for the observability drawer (B10). */
+export interface RoundSummary {
+  roundId: string
+  hadTurn: boolean
+  verdict: 'none' | 'pass' | 'changes'
+  verifyState: 'none' | 'running' | 'pass' | 'fail'
+  changedPaths: string[]
+  lastTurnOutcome: 'ok' | 'error' | 'stopped'
+  endReason: 'completed' | 'limit'
+}
+
+export interface RoomObservability {
+  state: {
+    busy: boolean
+    activeCharacterId: string | null
+    activeCharacterName: string | null
+    activePid: number | null
+    gate: 'running' | 'idle'
+    queuedCharacterIds: string[]
+    queuedNames: string[]
+  }
+  round: RoundSummary | null
+  /** Newest first, capped by the server. */
+  checks: RoundCheck[]
+  /** Tail of the room's crash journal (empty when the file is missing). */
+  crash: string[]
+}
+
 export interface RoundCheck {
   id: string
   roomId: string
   roundId: string
-  kind: 'review' | 'verify'
+  kind: 'review' | 'verify' | 'commit'
   verdict: 'pass' | 'fail'
   characterId: string | null
   messageId: string | null
-  /** Verify runs keep the output tail here; review rows leave it null. */
+  /** Verify runs keep the output tail; commit rows keep the commit hash. */
   detail: string | null
   createdAt: number
+  /** Display-only: resolved by the API from characterId; never persisted. */
+  characterName?: string | null
+}
+
+/** One finished round's delivery report (B11): evidence collected across tables. */
+export interface RoundReport {
+  roundId: string
+  startedAt: number
+  endedAt: number | null
+  turnCount: number
+  changedPaths: string[]
+  /** Last real turn's reply (collapsed, capped) — what the round delivered. */
+  delivery: string
+  tokens: UsageTotals
+  /** Auto-commit hash, when the round landed one. */
+  commitHash: string | null
+  /** Last non-summary turn's author (B11 blind review independence). */
+  authorCharacterId: string | null
+  /** The user message that opened the round, when known. */
+  requestMessageId: string | null
+  checks: RoundCheck[]
 }
 
 /**

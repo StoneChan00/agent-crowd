@@ -1,5 +1,5 @@
 import express, { type NextFunction, type Request, type Response } from 'express'
-import { appendFileSync, existsSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as db from './db.ts'
 import { broadcast, send, subscribe } from './events.ts'
@@ -22,6 +22,7 @@ import {
   turnTimeoutMs,
   type LaunchMatch,
 } from './harnesses/process.ts'
+import { showCommit } from './gitstate.ts'
 import * as orchestrator from './orchestrator.ts'
 import { mediaFileHandler } from './media.ts'
 import { listMcps } from './mcps.ts'
@@ -30,7 +31,7 @@ import { createIsolationWorktree, removeIsolationWorktree } from './worktree.ts'
 import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, SKILLS_DIR, WEB_DIST } from './paths.ts'
 import { loadSkills } from './skills.ts'
-import type { Character, HarnessKind, Room, Task } from './types.ts'
+import type { Character, HarnessKind, Room, RoundReport, Task } from './types.ts'
 import { HARNESS_LABELS } from './types.ts'
 import { truncate } from './util.ts'
 
@@ -464,6 +465,116 @@ app.get('/api/rooms/:id/state', (req, res) => {
   })
 })
 
+/** B11 per-round evidence + diff: what the round changed and why it closed. */
+function withCharacterNames(roomId: string, reports: RoundReport[]): RoundReport[] {
+  const names = new Map(db.listCharacters(roomId).map((character) => [character.id, character.name]))
+  return reports.map((report) => ({
+    ...report,
+    checks: report.checks.map((check) => ({
+      ...check,
+      characterName: check.characterId ? (names.get(check.characterId) ?? '（已删除角色）') : null,
+    })),
+  }))
+}
+
+app.get('/api/rooms/:id/rounds', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  const limit = Number(req.query.limit ?? 20)
+  res.json({ rounds: withCharacterNames(room.id, db.listRoundReports(room.id, Number.isFinite(limit) ? limit : 20)) })
+})
+
+app.get('/api/rooms/:id/rounds/:roundId/diff', asyncRoute(async (req, res) => {
+  const room = requireRoom(res, String(req.params.id))
+  if (!room) return
+  const roundId = String(req.params.roundId)
+  const report = db.listRoundReports(room.id, 100).find((item) => item.roundId === roundId)
+  if (!report) return fail(res, 404, '轮次不存在')
+  if (!report.commitHash) return fail(res, 409, '这一轮没有自动提交，没有 diff 可看')
+  const shown = await showCommit(room.workingDir, report.commitHash)
+  if (!shown.ok) return fail(res, 400, shown.error ?? '读取 diff 失败')
+  res.json({ hash: report.commitHash, text: shown.text, truncated: shown.truncated })
+}))
+
+/**
+ * B11 advisory blind review: an independent reviewer reads only the original
+ * request + the round's commit diff, never the chat transcript. It runs as a
+ * normal (blind) turn — the verdict is posted as a new message; the already
+ * closed round is not rewritten.
+ */
+app.post('/api/rooms/:id/rounds/:roundId/blind-review', asyncRoute(async (req, res) => {
+  const room = requireRoom(res, String(req.params.id))
+  if (!room) return
+  if (orchestrator.isBusy(room.id)) return fail(res, 409, '房间有回合在运行，请等空闲后再盲审')
+  const roundId = String(req.params.roundId)
+  const report = db.listRoundReports(room.id, 100).find((item) => item.roundId === roundId)
+  if (!report) return fail(res, 404, '轮次不存在')
+  if (!report.commitHash) return fail(res, 409, '这一轮没有自动提交，没有 diff 可供盲审')
+
+  const author = report.authorCharacterId ? db.getCharacter(report.authorCharacterId) : undefined
+  const eligible = db
+    .listCharacters(room.id)
+    .filter(
+      (character) =>
+        character.enabled &&
+        !character.triggers.onRoundEnd &&
+        character.id !== report.authorCharacterId &&
+        character.harness !== author?.harness,
+    )
+  const designated = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
+  const reviewer = designated && eligible.some((item) => item.id === designated.id) ? designated : eligible[0]
+  if (!reviewer) return fail(res, 400, '没有可用的独立 reviewer（需要启用、非总结角色、且与实现者不同 harness）')
+
+  const shown = await showCommit(room.workingDir, report.commitHash)
+  if (!shown.ok) return fail(res, 400, shown.error ?? '读取 diff 失败')
+  const request = report.requestMessageId ? db.getMessageById(report.requestMessageId) : undefined
+  const spec = (request?.content?.trim() || report.delivery || '（未记录原始需求）').slice(0, 600)
+  const diff = shown.text.slice(0, 2400)
+  const override = [
+    '【盲审任务】你是独立 reviewer。群聊记录、记忆与交接已被隐藏，只能依据下面的需求和 diff 判断，不要假设实现者的叙述。',
+    `【原始需求】\n${spec}`,
+    `【改动文件】\n${report.changedPaths.length ? report.changedPaths.join('\n') : '（无）'}`,
+    `【Diff${shown.truncated || shown.text.length > diff.length ? '（已截断）' : ''}】\n${diff}`,
+    '请检查正确性、边界条件、回归风险与需求覆盖；不要改代码。最后单独一行给出 REVIEW: PASS 或 REVIEW: CHANGES。',
+  ].join('\n\n')
+  orchestrator.runCharacter(room, reviewer, override, { blind: true })
+  res.json({ ok: true, reviewer: { id: reviewer.id, name: reviewer.name, harness: reviewer.harness }, hash: report.commitHash })
+}))
+
+/** B10 observability drawer: live round + persisted checks + crash tail. */
+app.get('/api/rooms/:id/observability', (req, res) => {
+  const room = requireRoom(res, req.params.id)
+  if (!room) return
+  const activeCharacterId = orchestrator.activeCharacter(room.id)
+  const queuedCharacterIds = orchestrator.queuedCharacters(room.id)
+  const nameOf = (id: string | null | undefined): string | null => {
+    if (!id) return null
+    return db.getCharacter(id)?.name ?? '（已删除角色）'
+  }
+  let crash: string[] = []
+  try {
+    if (existsSync(CRASH_LOG)) {
+      crash = readFileSync(CRASH_LOG, 'utf8').trim().split(/\r?\n/).filter(Boolean).slice(-20)
+    }
+  } catch {
+    crash = []
+  }
+  res.json({
+    state: {
+      busy: orchestrator.isBusy(room.id),
+      activeCharacterId,
+      activeCharacterName: nameOf(activeCharacterId),
+      activePid: orchestrator.activePid(room.id) ?? null,
+      gate: orchestrator.gateActive(room.id) ? 'running' : 'idle',
+      queuedCharacterIds,
+      queuedNames: queuedCharacterIds.map((id) => nameOf(id) ?? '（已删除角色）'),
+    },
+    round: orchestrator.roundSummary(room.id),
+    checks: db.listRoundChecks(room.id).slice(-40).reverse(),
+    crash,
+  })
+})
+
 app.post('/api/rooms/:id/clear', (req, res) => {
   const room = requireRoom(res, req.params.id)
   if (!room) return
@@ -582,6 +693,7 @@ app.post('/api/rooms/:id/memories', (req, res) => {
           kind: 'episode',
           content: message.content,
           sourceRoomId: room.id,
+          sourceMessageId: message.id,
         })
       : db.addMemory({
           scope: 'room',
@@ -589,6 +701,7 @@ app.post('/api/rooms/:id/memories', (req, res) => {
           kind: 'fact',
           content: message.content,
           sourceRoomId: room.id,
+          sourceMessageId: message.id,
         })
     res.status(201).json({ ...result, scope: result.memory.scope })
     return

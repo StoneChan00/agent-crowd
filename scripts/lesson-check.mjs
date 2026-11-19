@@ -44,33 +44,62 @@ process.env.AC_DATA_DIR = dataDir
 const db = await import('../server/db.ts')
 const ROOM = 'room-lesson-check'
 
-const first = db.addFailureEpisode({ roomId: ROOM, cause: '自审无效', changedPaths: ['a.ts'] })
-check('L2 首次写入 → lesson + pinned', !first.existed && first.memory.pinned && first.memory.kind === 'lesson')
+const first = db.addFailureEpisode({ roomId: ROOM, cause: '自审无效', changedPaths: ['a.ts'], roundId: 'r-1' })
+check(
+  'L2 首次写入 → lesson + pinned + 来源轮次',
+  !first.existed && first.memory.pinned && first.memory.kind === 'lesson' && first.memory.sourceRoundId === 'r-1',
+)
 const repeat = db.addFailureEpisode({ roomId: ROOM, cause: '自审无效', changedPaths: ['a.ts'] })
 check('L2 完全相同 → 去重不再写', repeat.existed && repeat.memory.id === first.memory.id)
+
+const promotedA = db.getMemory(first.memory.id)
+check(
+  'L2 重复出现 → 计数 +1 并升级为常驻',
+  promotedA?.repeatCount === 2 && promotedA.promoted && promotedA.lastSeenAt !== null,
+  JSON.stringify(promotedA),
+)
 
 const second = db.addFailureEpisode({ roomId: ROOM, cause: '验证命令未通过', changedPaths: ['b.ts'] })
 const lessons = db.listMemories('room', ROOM).filter((memory) => memory.content.startsWith(mem.FAILURE_LESSON_PREFIX))
 const pinned = lessons.filter((memory) => memory.pinned)
-check('L2 新教训 → 最新一条被钉选', lessons.length === 2 && pinned.length === 1 && pinned[0].id === second.memory.id)
-check('L2 旧教训保留但不再钉选', lessons.some((memory) => memory.id === first.memory.id && !memory.pinned))
+check(
+  'L2 新教训 → 最新一条被钉选，常驻约定继续钉选',
+  lessons.length === 2 && pinned.length === 2 && pinned.some((memory) => memory.id === second.memory.id),
+)
+check('L2 旧教训升级后保留钉选', lessons.some((memory) => memory.id === first.memory.id && memory.pinned && memory.promoted))
 
-// A → B → A: the hash hit must be re-pinned and the newer B unpinned.
+// A → B → A: the hash hit must be re-pinned (promoted) and the newer B unpinned.
 const again = db.addFailureEpisode({ roomId: ROOM, cause: '自审无效', changedPaths: ['a.ts'] })
 const afterAgain = db.listMemories('room', ROOM).filter((memory) =>
   memory.content.startsWith(mem.FAILURE_LESSON_PREFIX),
 )
 const pinnedAfterAgain = afterAgain.filter((memory) => memory.pinned)
+check('L2 A→B→A：命中的旧教训计数继续累加', again.existed && again.memory.id === first.memory.id && again.memory.repeatCount === 3)
 check(
-  'L2 A→B→A：命中的旧教训被重新钉选',
-  again.existed && again.memory.id === first.memory.id && again.memory.pinned,
-)
-check(
-  'L2 A→B→A：仍只有一条钉选，B 已解除',
+  'L2 A→B→A：常驻约定保留，B 已解除',
   pinnedAfterAgain.length === 1 &&
     pinnedAfterAgain[0].id === first.memory.id &&
     afterAgain.some((memory) => memory.id === second.memory.id && !memory.pinned),
 )
+
+const fromMessage = db.addMemory({
+  scope: 'room',
+  ownerId: ROOM,
+  kind: 'fact',
+  content: '这条来自消息',
+  sourceRoomId: ROOM,
+  sourceMessageId: 'm-1',
+})
+check('L2 手动记忆保留来源消息', fromMessage.memory.sourceMessageId === 'm-1')
+
+const episode = db.addRoundEpisode({
+  roomId: ROOM,
+  changedPaths: ['a.ts'],
+  verify: 'pass',
+  delivery: '完成',
+  roundId: 'r-2',
+})
+check('L2 episode 保留来源轮次', episode.memory.sourceRoundId === 'r-2' && episode.memory.kind === 'episode')
 
 db.addMessage({
   roomId: ROOM,
@@ -113,6 +142,38 @@ check(
   JSON.stringify(c1),
 )
 check('L3 total 缺失时回退 input + output（100+20=120，50+10 用上报的 80）', c1?.total === 200)
+
+// --- L4: delivery report ------------------------------------------------
+const turn = db.createTurn({ roomId: ROOM, characterId: 'c1', triggerMessageId: null, roundId: 'r-9' })
+db.updateTurn(turn.id, {
+  status: 'done',
+  output: '本轮交付：修好了登录',
+  changed: ['b.ts', 'a.ts'],
+  endedAt: Date.now(),
+})
+db.addRoundCheck({ roomId: ROOM, roundId: 'r-9', kind: 'review', verdict: 'pass', characterId: 'c1' })
+db.addRoundCheck({ roomId: ROOM, roundId: 'r-9', kind: 'verify', verdict: 'pass', detail: 'exit 0' })
+db.addRoundCheck({ roomId: ROOM, roundId: 'r-9', kind: 'commit', verdict: 'pass', detail: 'abc1234' })
+db.addMessage({
+  roomId: ROOM,
+  authorType: 'character',
+  characterId: 'c1',
+  authorName: '审查者',
+  content: 'PASS',
+  meta: { turnId: turn.id, tokens: { input: 10, output: 5 } },
+})
+const report = db.listRoundReports(ROOM).find((item) => item.roundId === 'r-9')
+check(
+  'L4 轮次报告聚合改动/交付/token/commit/证据',
+  report?.turnCount === 1 &&
+    report.changedPaths.join() === 'a.ts,b.ts' &&
+    report.delivery.includes('修好了登录') &&
+    report.tokens.total === 15 &&
+    report.commitHash === 'abc1234' &&
+    report.checks.length === 3 &&
+    report.checks.some((check) => check.kind === 'commit'),
+  JSON.stringify(report),
+)
 
 // The DB handle keeps the temp dir open on Windows; prompt-check leaves its
 // temp dir in place too, so this script does the same.

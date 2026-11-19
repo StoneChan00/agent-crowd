@@ -209,7 +209,7 @@ function MessageRow({
 }) {
   if (message.authorType === 'system') {
     return (
-      <div className="msg msg-system">
+      <div className="msg msg-system" id={`msg-${message.id}`}>
         <span className={`system-pill${message.meta?.error ? ' is-error' : ''}`}>{message.content}</span>
       </div>
     )
@@ -218,7 +218,7 @@ function MessageRow({
   if (message.authorType === 'user') {
     const steer = message.meta?.steer
     return (
-      <div className="msg msg-user">
+      <div className="msg msg-user" id={`msg-${message.id}`}>
         <div className={`bubble bubble-user${steer ? ' bubble-steer' : ''}`}>
           {steer && <div className="steer-tag">⚡ 中途补充 → {steer.targetName}</div>}
           <div className="user-text">{message.content}</div>
@@ -246,7 +246,7 @@ function MessageRow({
   const hasDetail = Boolean(meta?.thinking || (meta?.tools && meta.tools.length > 0))
 
   return (
-    <div className="msg msg-character">
+    <div className="msg msg-character" id={`msg-${message.id}`}>
       <div className="msg-avatar">
         <Avatar emoji={message.authorAvatar || character?.avatar || '🤖'} color={color} size={38} />
       </div>

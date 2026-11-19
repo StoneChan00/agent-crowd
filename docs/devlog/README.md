@@ -37,4 +37,5 @@ review checklist 有一条固定问题：**「这轮该不该有 devlog？」** 
 | --- | --- | --- |
 | 0001 | 2026-10-30 | [三次没发生的重启：日志句柄锁与脱离进程存活](0001-restart-lockout.md) |
 | 0002 | 2026-11-06 | [一个 key 引发的房间叠加：React 19 remount 清理失效](0002-message-list-key-stacking.md) |
+| 0003 | 2026-11-19 | [从「群聊」到可复核的交付：M3 / B07–B11](0003-delivery-trust.md) |
 <!-- INDEX:END -->

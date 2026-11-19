@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
+import { resolve } from 'node:path'
 import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
@@ -17,7 +18,7 @@ import { gateDecision, parseReviewVerdict, type GateAuthor, type GateBlockReason
 import { rewriteMediaLines } from './media.ts'
 import { loadSkills } from './skills.ts'
 import { SKILLS_DIR } from './paths.ts'
-import type { Character, HarnessKind, Message, Room, Task, ToolTrace, Turn } from './types.ts'
+import type { Character, HarnessKind, Message, Room, RoundSummary, Task, ToolTrace, Turn } from './types.ts'
 import { tail, truncate } from './util.ts'
 
 interface QueueItem {
@@ -63,6 +64,8 @@ interface QueueItem {
   roundId?: string | null
   /** Task card this queued turn executes (B03), inherited by relay hand-offs. */
   taskId?: string | null
+  /** B11 blind review: suppress transcript/memory/skills for this turn. */
+  blind?: boolean
 }
 
 /** Replay buffer for the running turn, so clients that join mid-turn can catch up. */
@@ -180,6 +183,49 @@ export function gateActive(roomId: string): boolean {
   return (verifyRuns.get(roomId) ?? 0) > 0
 }
 
+/**
+ * Cross-room execution lock (B10): non-isolated rooms pointing at the same
+ * directory must not run turns concurrently — two CLIs writing the same files
+ * overwrite each other and mix commits. Isolated rooms have their own
+ * worktree, so they get no key and never wait.
+ */
+const workdirLocks = new Map<string, { roomId: string; count: number }>()
+
+function workdirKey(room: Room): string | null {
+  if (room.isolationBranch) return null
+  return resolve(room.workingDir).replace(/[\\/]+$/, '').toLowerCase()
+}
+
+function acquireWorkdir(room: Room): boolean {
+  const key = workdirKey(room)
+  if (!key) return true
+  const holder = workdirLocks.get(key)
+  if (holder && holder.roomId !== room.id) return false
+  if (holder) holder.count += 1
+  else workdirLocks.set(key, { roomId: room.id, count: 1 })
+  return true
+}
+
+/**
+ * Ref-counted release: one turn's finally can overlap the nested pump that
+ * already started the next turn (or the verify command), so the directory is
+ * handed to another room only when the LAST holder lets go.
+ */
+function releaseWorkdir(room: Room): void {
+  const key = workdirKey(room)
+  if (!key) return
+  const holder = workdirLocks.get(key)
+  if (!holder || holder.roomId !== room.id) return
+  holder.count -= 1
+  if (holder.count > 0) return
+  workdirLocks.delete(key)
+  for (const [otherId, queue] of queues) {
+    if (otherId === room.id || queue.length === 0) continue
+    const other = db.getRoom(otherId)
+    if (other && workdirKey(other) === key) void pump(otherId)
+  }
+}
+
 /** Fresh round state for a new human message / manual run (SOP gate fields included). */
 function newRoundState(taskId?: string): RoundState {
   return {
@@ -233,6 +279,21 @@ export function activePid(roomId: string): number | undefined {
 
 export function queuedCharacters(roomId: string): string[] {
   return (queues.get(roomId) ?? []).map((item) => item.characterId)
+}
+
+/** Snapshot of the room's live round for the observability drawer (B10). */
+export function roundSummary(roomId: string): RoundSummary | null {
+  const round = rounds.get(roomId)
+  if (!round) return null
+  return {
+    roundId: round.roundId,
+    hadTurn: round.hadTurn,
+    verdict: round.verdict,
+    verifyState: round.verifyState,
+    changedPaths: [...round.changedPaths],
+    lastTurnOutcome: round.lastTurnOutcome,
+    endReason: round.endReason,
+  }
 }
 
 /** Running-turn snapshot for clients that (re)join mid-turn. */
@@ -306,11 +367,20 @@ export function handleUserMessage(room: Room, message: Message): void {
 }
 
 /** Queue one character manually (the "让它发言" action). */
-export function runCharacter(room: Room, character: Character, override?: string): void {
+export function runCharacter(
+  room: Room,
+  character: Character,
+  override?: string,
+  options?: { blind?: boolean },
+): void {
   chains.set(room.id, { limitNoticeSent: false })
   const round = newRoundState()
   rounds.set(room.id, round)
-  enqueue(room.id, character.id, null, 1, override, { allowActive: true, roundId: round.roundId })
+  enqueue(room.id, character.id, null, 1, override, {
+    allowActive: true,
+    roundId: round.roundId,
+    blind: options?.blind,
+  })
   void pump(room.id)
 }
 
@@ -531,6 +601,8 @@ function enqueue(
     taskId?: string | null
     /** M3 recovery rung for this queued turn (0/omitted = ordinary). */
     resumeAttempt?: number
+    /** B11 blind review: do not carry chat context into this turn. */
+    blind?: boolean
   },
 ): boolean {
   const queue = queues.get(roomId) ?? []
@@ -568,6 +640,7 @@ function enqueue(
     isRoundSummary: options?.isRoundSummary || undefined,
     roundId: options?.roundId ?? null,
     taskId: options?.taskId ?? null,
+    blind: options?.blind || undefined,
   })
   queues.set(roomId, queue)
   broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
@@ -895,7 +968,7 @@ const GATE_LESSON_TEXT: Record<GateBlockReason, string> = {
  */
 function recordFailureLesson(roomId: string, round: RoundState, cause: string): void {
   try {
-    db.addFailureEpisode({ roomId, cause, changedPaths: round.changedPaths })
+    db.addFailureEpisode({ roomId, cause, changedPaths: round.changedPaths, roundId: round.roundId })
   } catch (error) {
     console.warn(
       `[agent-crowd] failure lesson memory failed (${roomId}): ${error instanceof Error ? error.message : error}`,
@@ -925,6 +998,7 @@ function closeRoundNormally(roomId: string, round: RoundState): void {
         changedPaths: round.changedPaths,
         verify: round.verifyState === 'pass' ? 'pass' : 'none',
         delivery: round.lastDelivery ?? '',
+        roundId: round.roundId,
       })
     } catch (error) {
       console.warn(
@@ -973,6 +1047,17 @@ async function autoCommitRound(room: Room, round: RoundState): Promise<void> {
       sendGateNotice(room.id, `⚠️ 自动提交失败：${result.error ?? '未知原因'}。改动仍在工作区，可手动提交。`)
     } else {
       const fileCount = result.files?.length ?? round.changedPaths.length
+      // B11: persist the commit hash as round evidence, so the report/diff
+      // view can find it long after the round's in-memory state is gone.
+      if (result.hash) {
+        db.addRoundCheck({
+          roomId: room.id,
+          roundId: round.roundId,
+          kind: 'commit',
+          verdict: 'pass',
+          detail: result.hash,
+        })
+      }
       sendGateNotice(
         room.id,
         `📦 本轮改动已自动提交：${result.hash} ${subject}（${fileCount} 个文件）。push 未执行，需要推送时说一声即可。`,
@@ -1184,14 +1269,21 @@ async function pump(roomId: string): Promise<void> {
   // the same reason as activeTurnId — the catch cannot see try-scoped vars.
   let activeRoundId: string | null = null
   let activeIsSummary = false
+  /** Room whose directory lock this pump holds (B10); released in finally. */
+  let activeRoom: Room | null = null
   try {
     const room = db.getRoom(roomId)
     if (!room) return
 
     const queue = queues.get(roomId) ?? []
-    const item = queue.shift()
-    queues.set(roomId, queue)
-    if (!item) {
+    if (queue.length === 0) {
+      queues.set(roomId, queue)
+      // The close-out may run the room's verify command in this directory —
+      // hold the same lock so it cannot overlap another room's turn.
+      if (rounds.has(roomId)) {
+        if (!acquireWorkdir(room)) return
+        activeRoom = room
+      }
       // Empty queue + no active turn: the round (if one was running) just
       // ended — either drained naturally or cut by the hop budget. Fire the
       // round-end summary (through the SOP gate) before declaring the room
@@ -1208,6 +1300,13 @@ async function pump(roomId: string): Promise<void> {
       }
       return
     }
+    // B10: another room on the same directory is running — leave this turn
+    // queued. Its release path wakes us; do not shift or broadcast.
+    if (!acquireWorkdir(room)) return
+    activeRoom = room
+    const item = queue.shift()
+    queues.set(roomId, queue)
+    if (!item) return
     consumed = true
     broadcast(roomId, 'queue', { roomId, characters: queue.map((entry) => entry.characterId) })
 
@@ -1288,6 +1387,7 @@ async function pump(roomId: string): Promise<void> {
     const adapter = getAdapter(character.harness)
     const session = db.getSession(room.id, character.id)
     const useResume =
+      !item.blind &&
       session !== undefined &&
       adapter.resumeArgs !== undefined &&
       process.env.AC_SESSION_RESUME !== '0' &&
@@ -1321,7 +1421,9 @@ async function pump(roomId: string): Promise<void> {
     // round keys on the round's trigger, never on the summary itself.
     const identity = db.ensureIdentityForCharacter(character)
     const memoryQuery = memoryQueryFromMessages(fetched)
-    const memories = db.pickMemoriesForPrompt(identity.id, room.id, undefined, memoryQuery)
+    const memories = item.blind
+      ? { identity: [], room: [] }
+      : db.pickMemoriesForPrompt(identity.id, room.id, undefined, memoryQuery)
     // The prompt layer owns both the text and what it represented (B01): the
     // cursor below is computed from the messages the prompt actually carries
     // (rendered or folded), never from what was merely fetched — a cursor
@@ -1335,7 +1437,7 @@ async function pump(roomId: string): Promise<void> {
     // latest room state). Fresh user-triggered turns read a user message →
     // no meta.handoff → no section, exactly as before.
     const triggerHandoff =
-      item.triggerMessageId !== null
+      !item.blind && item.triggerMessageId !== null
         ? db.getMessageById(item.triggerMessageId)?.meta?.handoff ?? null
         : null
     // B07: skills inject on demand — the catalog is read FRESH from the
@@ -1343,7 +1445,7 @@ async function pump(roomId: string): Promise<void> {
     // watcher, no cache). loadSkills is best-effort by contract: it never
     // throws, so a broken skills/ directory can't kill a round — bad files
     // were skipped with a one-time warning inside.
-    const skillCatalog = character.skills.length > 0 ? loadSkills(SKILLS_DIR) : []
+    const skillCatalog = !item.blind && character.skills.length > 0 ? loadSkills(SKILLS_DIR) : []
     const built = buildTurnPromptDetailed({
       room,
       character,
@@ -1357,6 +1459,7 @@ async function pump(roomId: string): Promise<void> {
       foldOverflow,
       handoff: triggerHandoff ?? undefined,
       skills: skillCatalog,
+      blind: item.blind,
     })
     const prompt = built.prompt
     db.touchMemories([...memories.identity, ...memories.room].map((memory) => memory.id))
@@ -1491,7 +1594,7 @@ async function pump(roomId: string): Promise<void> {
       // turn still records the killed CLI's surviving session (the same
       // record-only rule P6 pins for the normal path); the switch gates the
       // RIDE, not the row.
-      if (output.timedOut && output.sessionId) {
+      if (!item.blind && output.timedOut && output.sessionId) {
         db.setSession({
           roomId,
           characterId: character.id,
@@ -1502,7 +1605,7 @@ async function pump(roomId: string): Promise<void> {
           consumedSeq: built.nextCursor.seq,
         })
       }
-      if (scheduleTimeoutRecovery(roomId, character, item, output, adapter)) return
+      if (!item.blind && scheduleTimeoutRecovery(roomId, character, item, output, adapter)) return
       // Session-continuity fallback (P0-1): a turn that died resuming its
       // CLI session clears the row first, so the rerun (and every later
       // turn) replays the FULL transcript. A resume rejection is plumbing,
@@ -1746,7 +1849,7 @@ async function pump(roomId: string): Promise<void> {
     // survives the kill and the model DID consume the input this prompt
     // represented, so the cursor advance is honest; without the row the
     // timeout resume below would find nothing to ride.
-    if ((!output.error || output.timedOut) && output.sessionId) {
+    if (!item.blind && (!output.error || output.timedOut) && output.sessionId) {
       db.setSession({
         roomId,
         characterId: character.id,
@@ -1816,6 +1919,9 @@ async function pump(roomId: string): Promise<void> {
     // consumed here: re-pumping the empty-queue path would schedule itself
     // forever (each no-op pump would queue the next).
     if (consumed) void pump(roomId)
+    // B10: release this pump's own ref; a nested pump (next turn / verify)
+    // holds its own, so other rooms only gain the directory at count zero.
+    if (activeRoom) releaseWorkdir(activeRoom)
     // The relay chain reached its end and every queue is empty: this is the
     // all-idle moment a pending POST /api/restart waits for (server/restart.ts).
     maybeRestartNow()

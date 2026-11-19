@@ -34,6 +34,8 @@ export interface RoundEpisodeFacts {
   changedPaths: string[]
   verify: 'pass' | 'none'
   delivery: string
+  /** Provenance (B10): the round this episode came from. */
+  roundId?: string
 }
 
 /** Content cap: stays inside addMemory's 500-truncate so the hash the

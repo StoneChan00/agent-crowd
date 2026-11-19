@@ -47,6 +47,74 @@ check(
   }),
 )
 
+// --- S1b: blind review prompt -------------------------------------------------
+{
+  const { buildTurnPromptDetailed } = await import('../server/prompt.ts')
+  const { DEFAULT_TRIGGERS } = await import('../server/types.ts')
+  const built = buildTurnPromptDetailed({
+    room: {
+      id: 'r-blind',
+      name: '盲审室',
+      topic: '',
+      workingDir: 'C:/tmp',
+      maxHops: 6,
+      verifyCommand: '',
+      reviewerCharacterId: null,
+      isolationSource: '',
+      isolationBranch: '',
+      createdAt: 0,
+    },
+    character: {
+      id: 'c-blind',
+      roomId: 'r-blind',
+      name: '审查者',
+      aliases: [],
+      avatar: '🔍',
+      color: '#fff',
+      harness: 'mock',
+      model: '',
+      persona: '你是独立审查者。',
+      cwd: '',
+      triggers: DEFAULT_TRIGGERS,
+      commandTemplate: '',
+      autoApprove: true,
+      enabled: true,
+      identityId: null,
+      presetId: null,
+      skills: [],
+      createdAt: 0,
+    },
+    characters: [],
+    messages: [
+      {
+        id: 'm-secret',
+        roomId: 'r-blind',
+        authorType: 'user',
+        characterId: null,
+        authorName: '你',
+        authorAvatar: '',
+        color: '',
+        content: '机密聊天内容不应出现',
+        meta: null,
+        createdAt: 1,
+        seq: 1,
+      },
+    ],
+    cwd: 'C:/tmp',
+    override: '【原始需求】SPEC-TEXT\n\n【Diff】DIFF-TEXT',
+    blind: true,
+  })
+  check(
+    'S1b 盲审 prompt 隐藏聊天/记忆，只带需求与 diff',
+    !built.prompt.includes('机密聊天内容不应出现') &&
+      !built.prompt.includes('最近的群聊记录') &&
+      !built.prompt.includes('房间共享记忆') &&
+      built.prompt.includes('SPEC-TEXT') &&
+      built.prompt.includes('DIFF-TEXT'),
+    built.prompt.slice(0, 300),
+  )
+}
+
 // --- S2: worktrees --------------------------------------------------------
 const root = mkdtempSync(join(tmpdir(), 'ac-scenario-'))
 const repo = join(root, 'repo')
@@ -92,6 +160,14 @@ check('S2 解除后分支保留', git(repo, ['show-ref', '--verify', '--quiet', 
 const again = createIsolationWorktree({ sourceDir: repo, roomId: ROOM })
 check('S2 再次创建复用已有分支', again.branch === worktree.branch && existsSync(again.path))
 removeIsolationWorktree({ worktreeDir: again.path, sourceDir: repo })
+
+// --- S3: commit diff rendering ------------------------------------------
+const { showCommit } = await import('../server/gitstate.ts')
+const head = git(repo, ['rev-parse', 'HEAD'])
+const shown = await showCommit(repo, head)
+check('S3 showCommit 返回 stat + patch', shown.ok && shown.text.includes('tracked.txt') && shown.text.includes('+base'))
+const rejected = await showCommit(repo, '../etc/passwd')
+check('S3 非 hash 输入被拒绝', !rejected.ok)
 
 if (failed) {
   console.log(`\n${failed} case(s) failed`)

@@ -288,15 +288,26 @@ export function buildTurnPromptDetailed(input: {
    * advancing the cursor regardless) would skip them without even a count.
    */
   foldOverflow?: number
+  /**
+   * B11 blind review: show ONLY the persona and the caller's override
+   * (request + diff). Chat history, memory, handoff and skills are omitted —
+   * the point is to judge the diff without the implementer's narrative.
+   */
+  blind?: boolean
 }): TurnPromptBuild {
   const { room, character, cwd } = input
+  const blind = input.blind === true
   const others = input.characters.filter((member) => member.id !== character.id)
 
   // Session continuity (P0-1): a resumed turn ships ONLY what arrived after
   // the cursor. The comparison is (createdAt, seq) — a bare createdAt filter
   // would swallow same-millisecond siblings of the cursor message.
   const since: SessionCursor = input.since ?? { at: 0, seq: 0 }
-  const visible = input.resumed ? input.messages.filter((message) => isAfterCursor(message, since)) : input.messages
+  const visible = blind
+    ? []
+    : input.resumed
+      ? input.messages.filter((message) => isAfterCursor(message, since))
+      : input.messages
 
   const displayName = (member: Character): string => {
     const extras = member.aliases.length ? `（可 @别名：${member.aliases.join('、')}）` : ''
@@ -312,14 +323,14 @@ export function buildTurnPromptDetailed(input: {
     : character.name
 
   const memorySections: string[] = []
-  if (input.memories?.identity.length) {
+  if (!blind && input.memories?.identity.length) {
     memorySections.push(
       '【你的长期记忆】（跨房间随身携带，钉选📌条目最重要）',
       input.memories.identity.map(memoryLine).join('\n'),
       '',
     )
   }
-  if (input.memories?.room.length) {
+  if (!blind && input.memories?.room.length) {
     memorySections.push(
       '【房间共享记忆】（本房间团队的公共事实与决议）',
       input.memories.room.map(memoryLine).join('\n'),
@@ -333,7 +344,7 @@ export function buildTurnPromptDetailed(input: {
   // the one line the receiver cannot act without; What itself may be empty
   // (a verdict-only relay with no prior round delivery).
   const handoffSection: string[] = []
-  if (input.handoff) {
+  if (!blind && input.handoff) {
     handoffSection.push(
       '【交接】（上一棒交给你的现场；接力事实，接手前先读）',
       // Every field is an omitted line when empty (B06 review 3): a
@@ -359,23 +370,27 @@ export function buildTurnPromptDetailed(input: {
   // P1-1) get markdown-parsed — a fast path, not a per-message parse of the
   // whole history. `character.skills ?? []` keeps legacy fixtures (pre-B07
   // rows / test literals) loadable.
-  const skillsPlan = planSkills({
-    catalog: input.skills ?? [],
-    selected: character.skills ?? [],
-    text: visible.map((message) => message.content).join('\n'),
-    explicitText: visible
-      .filter((message) => message.content.toLowerCase().includes('@skill:'))
-      .map((message) => visibleText(message.content))
-      .join('\n'),
-  })
+  const skillsPlan = blind
+    ? null
+    : planSkills({
+        catalog: input.skills ?? [],
+        selected: character.skills ?? [],
+        text: visible.map((message) => message.content).join('\n'),
+        explicitText: visible
+          .filter((message) => message.content.toLowerCase().includes('@skill:'))
+          .map((message) => visibleText(message.content))
+          .join('\n'),
+      })
   const skillsSection: string[] = skillsPlan ? [...skillsPlan.lines, ''] : []
 
   // Session continuity (P0-1): a resumed turn tells the agent why the
   // transcript starts where it does — the older messages are not lost,
   // they live in the CLI's own session context this run continues.
-  const transcriptTitle = input.resumed
-    ? '【最近的群聊记录】（以下是你上次发言之后的新消息；更早内容已在同一会话上下文中）'
-    : '【最近的群聊记录】'
+  const transcriptTitle = blind
+    ? '【盲审模式】（群聊记录、记忆与交接已隐藏；只依据下面的任务说明和 diff 判断）'
+    : input.resumed
+      ? '【最近的群聊记录】（以下是你上次发言之后的新消息；更早内容已在同一会话上下文中）'
+      : '【最近的群聊记录】'
 
   // The head is everything but the transcript body (B01): when the 32k
   // guard must cut, it cuts HERE — the old layout put the transcript at the
@@ -436,7 +451,9 @@ export function buildTurnPromptDetailed(input: {
   const fixed = headText.length + transcriptTitle.length + 2 + tail.length
   const budget = Math.max(Math.min(TRANSCRIPT_CHAR_BUDGET, MAX_TOTAL_PROMPT - fixed), MIN_TRANSCRIPT_BUDGET)
   const plan = planTranscript(visible, budget, input.resumed === true, input.foldOverflow ?? 0)
-  const bodyText = plan.lines.join('\n') || (input.resumed ? '（无新消息）' : '（空）')
+  const bodyText = blind
+    ? '（盲审：不提供聊天上下文，请只依据任务说明与 diff）'
+    : plan.lines.join('\n') || (input.resumed ? '（无新消息）' : '（空）')
   const section = `${transcriptTitle}\n${bodyText}`
 
   let prompt = headText + section + '\n' + tail

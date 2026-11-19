@@ -65,7 +65,7 @@ function nextNumber() {
 
 function draft(since) {
   const log = git(['log', '--reverse', '--date=short', '--pretty=format:%h|%ad|%s', `${since}..HEAD`])
-  const commits = log ? log.split('\n').map((line) => line.split('|', 3)) : []
+  const commits = log ? log.split(/\r?\n/).map((line) => line.split('|', 3)) : []
   const head = git(['rev-parse', '--short', 'HEAD'])
   const num = String(nextNumber()).padStart(4, '0')
   const today = new Date().toISOString().slice(0, 10)
@@ -181,7 +181,7 @@ function check() {
     const text = readFileSync(file, 'utf8')
     const sections = new Map()
     let current = null
-    for (const line of text.split('\n')) {
+    for (const line of text.split(/\r?\n/)) {
       const match = line.match(/^## (.+)$/)
       if (match) {
         current = match[1].trim()

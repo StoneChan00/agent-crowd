@@ -250,6 +250,36 @@ export interface CommitPathsResult {
 /** Staging + commit can outrun a status probe on cold Windows spawns. */
 const COMMIT_TIMEOUT_MS = 30_000
 
+/** Diff view cap: enough for a normal round, small enough for one HTTP response. */
+const SHOW_MAX_CHARS = 200_000
+
+/**
+ * B11 delivery report: render one commit as stat + patch. Read-only, hash-only
+ * (`/^[0-9a-f]{7,40}$/`) — callers never pass a path or a git option here.
+ */
+export async function showCommit(
+  cwd: string,
+  hash: string,
+): Promise<{ ok: boolean; text: string; truncated: boolean; error?: string }> {
+  if (!/^[0-9a-f]{7,40}$/i.test(hash)) return { ok: false, text: '', truncated: false, error: '非法 commit hash' }
+  const top = await git(cwd, ['rev-parse', '--show-toplevel'])
+  if (!top.ok || !top.stdout.trim()) return { ok: false, text: '', truncated: false, error: '非 git 仓库或 git 不可用' }
+  const shown = await git(
+    top.stdout.trim(),
+    ['show', '--no-color', '--stat', '--patch', '--format=commit %H%nAuthor: %an%nDate: %ad%n%n%s%n%b', hash],
+    COMMIT_TIMEOUT_MS,
+  )
+  if (!shown.ok) {
+    return { ok: false, text: '', truncated: false, error: shown.stderr.trim() || '读取 commit 失败' }
+  }
+  const full = shown.stdout
+  return {
+    ok: true,
+    text: full.length > SHOW_MAX_CHARS ? `${full.slice(0, SHOW_MAX_CHARS)}\n…（diff 已截断）` : full,
+    truncated: full.length > SHOW_MAX_CHARS,
+  }
+}
+
 export async function commitPaths(
   cwd: string,
   paths: string[],

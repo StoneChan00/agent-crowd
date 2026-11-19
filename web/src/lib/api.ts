@@ -7,8 +7,10 @@ import type {
   Memory,
   Message,
   Room,
+  RoomObservability,
   RoomTemplate,
   RoomUsage,
+  RoundReport,
   SkillInfo,
   Task,
   TaskStatus,
@@ -113,6 +115,26 @@ export const api = {
 
   /** B08: per-character token usage for a room (harness-reported only). */
   usage: (roomId: string) => request<RoomUsage>(`/api/rooms/${roomId}/usage`),
+
+  /** B10: live round, persisted checks and crash tail for the status drawer. */
+  observability: (roomId: string) => request<RoomObservability>(`/api/rooms/${roomId}/observability`),
+
+  /** B11: finished-round evidence reports, newest first. */
+  rounds: (roomId: string, limit = 20) =>
+    request<{ rounds: RoundReport[] }>(`/api/rooms/${roomId}/rounds?limit=${limit}`),
+
+  /** B11: the round's auto-commit rendered as stat + patch. */
+  roundDiff: (roomId: string, roundId: string) =>
+    request<{ hash: string; text: string; truncated: boolean }>(
+      `/api/rooms/${roomId}/rounds/${roundId}/diff`,
+    ),
+
+  /** B11: advisory blind review of a committed round (request + diff only). */
+  blindReview: (roomId: string, roundId: string) =>
+    request<{ ok: boolean; reviewer: { id: string; name: string; harness: string }; hash: string }>(
+      `/api/rooms/${roomId}/rounds/${roundId}/blind-review`,
+      { method: 'POST' },
+    ),
 
   /** B09: opt-in git worktree isolation (own checkout + branch per room). */
   isolateRoom: (roomId: string) =>

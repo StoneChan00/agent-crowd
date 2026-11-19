@@ -76,6 +76,7 @@ interface RoomSettingsProps {
   }) => Promise<void>
   onIsolate: () => Promise<void>
   onUnisolate: () => Promise<void>
+  onLocateMemory: (memory: Memory) => void
   onDelete?: () => Promise<void>
 }
 
@@ -96,6 +97,7 @@ export function RoomSettings({
   onSave,
   onIsolate,
   onUnisolate,
+  onLocateMemory,
   onDelete,
 }: RoomSettingsProps) {
   const [name, setName] = useState(room?.name ?? '')
@@ -482,6 +484,28 @@ export function RoomSettings({
                   </button>
                   <span className="memory-kind">{memory.kind}</span>
                   <span className="memory-content">{memory.content}</span>
+                  {memory.repeatCount > 1 && (
+                    <span className="memory-repeat" title={`同一原因已出现 ${memory.repeatCount} 次`}>
+                      ×{memory.repeatCount}
+                    </span>
+                  )}
+                  {memory.promoted && (
+                    <span className="memory-promoted" title="重复出现，已升级为常驻约定">
+                      常驻
+                    </span>
+                  )}
+                  {memory.sourceMessageId && (
+                    <button
+                      className="memory-source"
+                      title="定位到来源消息"
+                      onClick={() => {
+                        onLocateMemory(memory)
+                        onClose()
+                      }}
+                    >
+                      来源
+                    </button>
+                  )}
                   <button className="memory-del" onClick={() => removeMemory(memory)} title="删除这条记忆">
                     ×
                   </button>

@@ -26,12 +26,14 @@ import { DEFAULT_TRIGGERS,
   type MessageMeta,
   type Room,
   type RoundCheck,
+  type RoundReport,
   type RoomUsage,
   type Session,
   type Task,
   type Triggers,
   type Turn,
   type TurnStatus,
+  type TurnTokens,
   type UsageTotals,
 } from './types.ts'
 import { pickDefined } from './util.ts'
@@ -261,6 +263,12 @@ db.prepare("update tasks set status = 'running' where status = 'approved'").run(
 // comes first, THEN the unique index (creating the index inside the schema
 // block above would crash a pre-B04 boot with a missing-column error).
 addColumnIfMissing('memories', 'content_hash', 'content_hash text')
+// B10 provenance + lesson lifecycle.
+addColumnIfMissing('memories', 'source_message_id', 'source_message_id text')
+addColumnIfMissing('memories', 'source_round_id', 'source_round_id text')
+addColumnIfMissing('memories', 'repeat_count', 'repeat_count integer not null default 1')
+addColumnIfMissing('memories', 'promoted', 'promoted integer not null default 0')
+addColumnIfMissing('memories', 'last_seen_at', 'last_seen_at integer')
 // Partial unique index: manually-created memories carry a null hash and stay
 // outside the constraint; automatic episodes dedupe on exact same facts.
 db
@@ -1289,7 +1297,8 @@ function mapRoundCheck(row: Record<string, unknown>): RoundCheck {
     id: String(row.id),
     roomId: String(row.room_id),
     roundId: String(row.round_id),
-    kind: String(row.kind) === 'verify' ? 'verify' : 'review',
+    kind:
+      String(row.kind) === 'verify' ? 'verify' : String(row.kind) === 'commit' ? 'commit' : 'review',
     verdict: String(row.verdict) === 'fail' ? 'fail' : 'pass',
     characterId: row.character_id === null || row.character_id === undefined ? null : String(row.character_id),
     messageId: row.message_id === null || row.message_id === undefined ? null : String(row.message_id),
@@ -1306,7 +1315,7 @@ function mapRoundCheck(row: Record<string, unknown>): RoundCheck {
 export function addRoundCheck(input: {
   roomId: string
   roundId: string
-  kind: 'review' | 'verify'
+  kind: 'review' | 'verify' | 'commit'
   verdict: 'pass' | 'fail'
   characterId?: string | null
   messageId?: string | null
@@ -1346,6 +1355,79 @@ export function listRoundChecks(roomId: string): RoundCheck[] {
     .prepare('select * from round_checks where room_id = ? order by created_at asc')
     .all(roomId)
     .map(mapRoundCheck)
+}
+
+/**
+ * Delivery reports (B11): one row per finished round, assembled from turns,
+ * messages and round_checks. Read-only and capped — this is the "what did the
+ * round actually do" view, not a second source of truth.
+ */
+export function listRoundReports(roomId: string, limit = 20): RoundReport[] {
+  const rounds = db
+    .prepare(
+      `select round_id, min(started_at) as started, max(coalesce(ended_at, started_at)) as ended, count(*) as total
+       from turns where room_id = ? and round_id is not null
+       group by round_id order by max(started_at) desc limit ?`,
+    )
+    .all(roomId, Math.min(100, Math.max(1, limit))) as {
+    round_id: string
+    started: number
+    ended: number | null
+    total: number
+  }[]
+
+  // Token usage is per message meta, not per turn row; index it once.
+  const tokensByTurn = new Map<string, TurnTokens>()
+  const metas = db
+    .prepare("select meta from messages where room_id = ? and meta is not null and meta like '%\"tokens\"%'")
+    .all(roomId) as { meta: string }[]
+  for (const row of metas) {
+    try {
+      const meta = JSON.parse(row.meta) as MessageMeta
+      if (meta.turnId && meta.tokens) tokensByTurn.set(meta.turnId, meta.tokens)
+    } catch {
+      /* malformed meta is ignored, never fatal */
+    }
+  }
+
+  return rounds.map((round) => {
+    const turns = db
+      .prepare('select * from turns where room_id = ? and round_id = ? order by started_at asc, rowid asc')
+      .all(roomId, round.round_id)
+      .map(mapTurn)
+    const changed = new Set<string>()
+    const tokens = emptyUsage()
+    let delivery = ''
+    let authorCharacterId: string | null = null
+    for (const turn of turns) {
+      for (const path of turn.changed ?? []) changed.add(path)
+      const turnTokens = tokensByTurn.get(turn.id)
+      if (turnTokens) {
+        addUsage(tokens, turnTokens)
+      }
+      if (!turn.isRoundSummary) {
+        authorCharacterId = turn.characterId
+        if (turn.output.trim()) delivery = turn.output.trim()
+      }
+    }
+    const checks = db
+      .prepare('select * from round_checks where room_id = ? and round_id = ? order by created_at asc')
+      .all(roomId, round.round_id)
+      .map(mapRoundCheck)
+    return {
+      roundId: round.round_id,
+      startedAt: Number(round.started),
+      endedAt: round.ended === null ? null : Number(round.ended),
+      turnCount: Number(round.total),
+      changedPaths: [...changed].sort(),
+      delivery: delivery.replace(/\s+/g, ' ').slice(0, 400),
+      tokens,
+      commitHash: checks.find((check) => check.kind === 'commit')?.detail ?? null,
+      authorCharacterId,
+      requestMessageId: turns[0]?.triggerMessageId ?? null,
+      checks,
+    }
+  })
 }
 
 /* ---------------------------------------------------------------- sessions */
@@ -1630,8 +1712,17 @@ function mapMemory(row: Record<string, unknown>): Memory {
     kind: MEMORY_KINDS.has(kind) ? kind : 'fact',
     content: String(row.content),
     sourceRoomId: row.source_room_id === null || row.source_room_id === undefined ? null : String(row.source_room_id),
+    sourceMessageId:
+      row.source_message_id === null || row.source_message_id === undefined
+        ? null
+        : String(row.source_message_id),
+    sourceRoundId:
+      row.source_round_id === null || row.source_round_id === undefined ? null : String(row.source_round_id),
     pinned: Number(row.pinned ?? 0) === 1,
     useCount: Number(row.use_count ?? 0),
+    repeatCount: Number(row.repeat_count ?? 1) || 1,
+    promoted: Number(row.promoted ?? 0) === 1,
+    lastSeenAt: row.last_seen_at === null || row.last_seen_at === undefined ? null : Number(row.last_seen_at),
     createdAt: Number(row.created_at),
     lastUsedAt: row.last_used_at === null || row.last_used_at === undefined ? null : Number(row.last_used_at),
   }
@@ -1664,6 +1755,8 @@ export function addMemory(input: {
   kind?: MemoryKind
   content: string
   sourceRoomId?: string | null
+  sourceMessageId?: string | null
+  sourceRoundId?: string | null
   pinned?: boolean
   contentHash?: string | null
 }): { memory: Memory; existed: boolean } {
@@ -1690,14 +1783,19 @@ export function addMemory(input: {
     kind: MEMORY_KINDS.has(input.kind as MemoryKind) ? (input.kind as MemoryKind) : 'fact',
     content: truncateText(content, 500),
     sourceRoomId: input.sourceRoomId ?? null,
+    sourceMessageId: input.sourceMessageId ?? null,
+    sourceRoundId: input.sourceRoundId ?? null,
     pinned: input.pinned ?? false,
     useCount: 0,
+    repeatCount: 1,
+    promoted: false,
+    lastSeenAt: now(),
     createdAt: now(),
     lastUsedAt: null,
   }
   db.prepare(
-    `insert into memories (id, scope, owner_id, kind, content, source_room_id, pinned, use_count, created_at, last_used_at, content_hash)
-     values (?, ?, ?, ?, ?, ?, ?, 0, ?, null, ?)`,
+    `insert into memories (id, scope, owner_id, kind, content, source_room_id, source_message_id, source_round_id, pinned, use_count, repeat_count, promoted, last_seen_at, created_at, last_used_at, content_hash)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 0, ?, ?, null, ?)`,
   ).run(
     memory.id,
     memory.scope,
@@ -1705,7 +1803,10 @@ export function addMemory(input: {
     memory.kind,
     memory.content,
     memory.sourceRoomId,
+    memory.sourceMessageId,
+    memory.sourceRoundId,
     memory.pinned ? 1 : 0,
+    memory.lastSeenAt,
     memory.createdAt,
     contentHash,
   )
@@ -1725,9 +1826,13 @@ export function addRoundEpisode(facts: RoundEpisodeFacts): { memory: Memory; exi
     kind: 'episode',
     content,
     sourceRoomId: facts.roomId,
+    sourceRoundId: facts.roundId,
     contentHash: hash,
   })
 }
+
+/** A promoted lesson not seen for 90 days is demoted (kept, no longer injected). */
+const LESSON_STALE_MS = 90 * 24 * 60 * 60 * 1000
 
 /**
  * Record one failure lesson (B08) and keep only the latest one pinned: the
@@ -1744,6 +1849,7 @@ export function addFailureEpisode(input: {
   roomId: string
   cause: string
   changedPaths?: string[]
+  roundId?: string | null
 }): { memory: Memory; existed: boolean } {
   const { content, hash } = buildFailureEpisode(input)
   const result = addMemory({
@@ -1752,18 +1858,37 @@ export function addFailureEpisode(input: {
     kind: 'lesson',
     content,
     sourceRoomId: input.roomId,
+    sourceRoundId: input.roundId ?? null,
     contentHash: hash,
     pinned: true,
   })
   let memory = result.memory
-  if (result.existed && !memory.pinned) {
-    db.prepare('update memories set pinned = 1 where id = ?').run(memory.id)
-    memory = { ...memory, pinned: true }
+  if (result.existed) {
+    // Same failure seen again: bump the lifecycle counters and keep it
+    // visible. The second occurrence promotes it to a standing convention
+    // (promoted lessons survive the "only latest pinned" rule).
+    db.prepare(
+      `update memories
+       set repeat_count = repeat_count + 1,
+           last_seen_at = ?,
+           pinned = 1,
+           promoted = case when repeat_count + 1 >= 2 then 1 else promoted end
+       where id = ?`,
+    ).run(Date.now(), memory.id)
+    memory = getMemory(memory.id) ?? memory
   }
+  const staleCutoff = Date.now() - LESSON_STALE_MS
+  // Demote stale promoted conventions (not seen for 90 days) — they stay in
+  // the list, but stop crowding every prompt.
+  db.prepare(
+    `update memories set pinned = 0, promoted = 0
+     where scope = 'room' and owner_id = ? and kind = 'lesson' and promoted = 1
+       and coalesce(last_seen_at, created_at) < ?`,
+  ).run(input.roomId, staleCutoff)
   db.prepare(
     `update memories set pinned = 0
      where scope = 'room' and owner_id = ? and kind = 'lesson' and pinned = 1
-       and id <> ? and content like ?`,
+       and promoted = 0 and id <> ? and content like ?`,
   ).run(input.roomId, memory.id, `${FAILURE_LESSON_PREFIX}%`)
   return { memory, existed: result.existed }
 }
