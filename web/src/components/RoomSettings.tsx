@@ -73,6 +73,7 @@ interface RoomSettingsProps {
     maxHops: number
     verifyCommand: string
     reviewerCharacterId: string | null
+    blindReview: boolean
   }) => Promise<void>
   onIsolate: () => Promise<void>
   onUnisolate: () => Promise<void>
@@ -107,6 +108,8 @@ export function RoomSettings({
   const [verifyCommand, setVerifyCommand] = useState(room?.verifyCommand ?? '')
   /** B05 self-review ban: the room's designated reviewer (empty = unrestricted). */
   const [reviewerCharacterId, setReviewerCharacterId] = useState(room?.reviewerCharacterId ?? '')
+  /** B11: auto-queue the designated reviewer with request + diff only. */
+  const [blindReview, setBlindReview] = useState(room?.blindReview ?? false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   /** Team memory (room scope): shared context every member sees in their prompt. */
@@ -225,6 +228,7 @@ export function RoomSettings({
         maxHops,
         verifyCommand: verifyCommand.trim(),
         reviewerCharacterId: reviewerCharacterId || null,
+        blindReview,
       })
       onClose()
     } catch (saveError) {
@@ -421,6 +425,18 @@ export function RoomSettings({
           })()}
           <span className="field-hint">
             指定后：REVIEW: PASS 必须来自该角色，且它与实现者不能是同一 harness（同一模型家族不算独立判断）。无论如何，实现者本人的自审 PASS 一律无效。
+          </span>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={blindReview}
+              disabled={!reviewerCharacterId}
+              onChange={(event) => setBlindReview(event.target.checked)}
+            />
+            改动后自动盲审
+          </label>
+          <span className="field-hint">
+            开启后，有代码改动的回合会自动把指定 reviewer 排进本轮：它只收到原始需求 + 当前未提交 diff，看不到聊天记录；它的 REVIEW 结论直接参与收尾门禁和自动提交。
           </span>
         </div>
       )}

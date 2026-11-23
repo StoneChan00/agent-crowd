@@ -316,7 +316,7 @@ app.post('/api/rooms', (req, res) => {
 })
 
 app.patch('/api/rooms/:id', (req, res) => {
-  const { name, topic, workingDir, maxHops, verifyCommand, reviewerCharacterId } = req.body ?? {}
+  const { name, topic, workingDir, maxHops, verifyCommand, reviewerCharacterId, blindReview } = req.body ?? {}
   if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
     return fail(res, 400, '房间名不能为空')
   }
@@ -340,6 +340,18 @@ app.patch('/api/rooms/:id', (req, res) => {
       return fail(res, 400, `指定 reviewer「${reviewer.name}」是轮末总结角色（收尾时才发言），无法给出有效 PASS，请另选他人`)
     }
   }
+  const current = db.getRoom(req.params.id)
+  if (!current) return fail(res, 404, '房间不存在')
+  // B11: blind review needs a designated reviewer at save time — otherwise
+  // the round would silently run without the gate's independent verdict.
+  const nextReviewerId =
+    reviewerCharacterId === undefined ? current.reviewerCharacterId : reviewerCharacterId || null
+  if (blindReview === true && !nextReviewerId) {
+    return fail(res, 400, '开启盲审前必须先指定 reviewer')
+  }
+  if (blindReview !== true && current.blindReview && reviewerCharacterId === null) {
+    return fail(res, 400, '请先关闭盲审，再清除 reviewer')
+  }
   const room = db.updateRoom(req.params.id, {
     ...(typeof name === 'string' ? { name: name.trim() } : {}),
     ...(typeof topic === 'string' ? { topic: topic.trim() } : {}),
@@ -347,6 +359,7 @@ app.patch('/api/rooms/:id', (req, res) => {
     ...(maxHops !== undefined ? { maxHops: normalizeMaxHops(maxHops) } : {}),
     ...(verifyCommand !== undefined ? { verifyCommand: normalizeVerifyCommand(verifyCommand) } : {}),
     ...(reviewerCharacterId !== undefined ? { reviewerCharacterId: reviewerCharacterId || null } : {}),
+    ...(blindReview !== undefined ? { blindReview: blindReview === true } : {}),
   })
   if (!room) return fail(res, 404, '房间不存在')
   // Other tabs of the same room only hear about settings changes via SSE.

@@ -18,9 +18,9 @@
  */
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 /** Per-command budget; git on a warm repo answers in ~50ms, big repos stay well under 3s. */
 const GIT_TIMEOUT_MS = 3_000
@@ -252,6 +252,53 @@ const COMMIT_TIMEOUT_MS = 30_000
 
 /** Diff view cap: enough for a normal round, small enough for one HTTP response. */
 const SHOW_MAX_CHARS = 200_000
+
+/**
+ * B11 pre-commit blind review: render the CURRENT worktree changes for the
+ * given paths. Tracked changes come from `git diff HEAD`; untracked files are
+ * appended as new-file pseudo-diffs because git diff never shows them.
+ */
+export async function renderWorktreeDiff(
+  cwd: string,
+  paths: string[],
+  maxChars = 2_400,
+): Promise<string> {
+  const top = await git(cwd, ['rev-parse', '--show-toplevel'])
+  if (!top.ok || !top.stdout.trim()) return ''
+  const root = top.stdout.trim()
+  const unique = [...new Set(paths.filter(Boolean))]
+  if (unique.length === 0) return ''
+  const tracked = await git(root, [
+    '--literal-pathspecs',
+    'diff',
+    '--no-color',
+    'HEAD',
+    '--',
+    ...unique,
+  ])
+  const parts = [tracked.ok ? tracked.stdout.trim() : '']
+  const others = await git(root, ['--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '--', ...unique])
+  for (const path of (others.ok ? others.stdout : '').split(/\r?\n/)) {
+    const relative = path.trim()
+    if (!relative) continue
+    const absolute = resolve(root, relative)
+    if (!absolute.startsWith(resolve(root, '.'))) continue
+    try {
+      const text = readFileSync(absolute, 'utf8')
+      if (text.includes('\0')) continue
+      const added = text
+        .split(/\r?\n/)
+        .slice(0, 200)
+        .map((line) => `+${line}`)
+        .join('\n')
+      parts.push(`--- /dev/null\n+++ b/${relative}\n@@ new file @@\n${added}`)
+    } catch {
+      /* vanished or unreadable untracked file — skip it */
+    }
+  }
+  const full = parts.filter(Boolean).join('\n\n')
+  return full.length > maxChars ? `${full.slice(0, maxChars)}\n…（diff 已截断）` : full
+}
 
 /**
  * B11 delivery report: render one commit as stat + patch. Read-only, hash-only

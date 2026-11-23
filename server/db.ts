@@ -235,6 +235,7 @@ addColumnIfMissing('rooms', 'verify_command', "verify_command text not null defa
 // from. Both empty = the room works directly in working_dir (legacy shape).
 addColumnIfMissing('rooms', 'isolation_source', "isolation_source text not null default ''")
 addColumnIfMissing('rooms', 'isolation_branch', "isolation_branch text not null default ''")
+addColumnIfMissing('rooms', 'blind_review', 'blind_review integer not null default 0')
 addColumnIfMissing('turns', 'round_id', 'round_id text')
 addColumnIfMissing('turns', 'changed', 'changed text')
 // Session continuity (P0-1 review): the cursor's same-millisecond tiebreaker.
@@ -357,6 +358,7 @@ function mapRoom(row: Record<string, unknown>): Room {
         : String(row.reviewer_character_id),
     isolationSource: String(row.isolation_source ?? ''),
     isolationBranch: String(row.isolation_branch ?? ''),
+    blindReview: Number(row.blind_review ?? 0) === 1,
     createdAt: Number(row.created_at),
   }
 }
@@ -388,6 +390,7 @@ export function createRoom(input: {
     reviewerCharacterId: input.reviewerCharacterId ?? null,
     isolationSource: '',
     isolationBranch: '',
+    blindReview: false,
     createdAt: now(),
   }
   db.prepare(
@@ -407,7 +410,9 @@ export function createRoom(input: {
 
 export function updateRoom(
   id: string,
-  patch: Partial<Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops' | 'verifyCommand' | 'reviewerCharacterId'>>,
+  patch: Partial<
+    Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops' | 'verifyCommand' | 'reviewerCharacterId' | 'blindReview'>
+  >,
 ): Room | undefined {
   const current = getRoom(id)
   if (!current) return undefined
@@ -420,10 +425,20 @@ export function updateRoom(
     // handles it; only undefined means "leave as is".
     reviewerCharacterId:
       patch.reviewerCharacterId === undefined ? current.reviewerCharacterId : patch.reviewerCharacterId || null,
+    blindReview: patch.blindReview === undefined ? current.blindReview : patch.blindReview,
   }
   db.prepare(
-    'update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ?, reviewer_character_id = ? where id = ?',
-  ).run(next.name, next.topic, next.workingDir, next.maxHops, next.verifyCommand, next.reviewerCharacterId, id)
+    'update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ?, reviewer_character_id = ?, blind_review = ? where id = ?',
+  ).run(
+    next.name,
+    next.topic,
+    next.workingDir,
+    next.maxHops,
+    next.verifyCommand,
+    next.reviewerCharacterId,
+    next.blindReview ? 1 : 0,
+    id,
+  )
   return next
 }
 

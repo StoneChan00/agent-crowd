@@ -23,7 +23,7 @@
 - **B09 模板与隔离**：三套场景模板一键加角色；房间可创建独立 git worktree + `ac/<room>` 分支，源仓库未提交改动不带入，解除隔离保留分支；共用目录的房间给警告。
 - **B10 溯源、生命周期、观测、执行锁**：记忆记录 `source_message_id` / `source_round_id`，UI 可跳回原消息；教训重复 2 次升为常驻，90 天未出现自动降权；新增运行状态抽屉（实时回合、round_checks、crash 日志）；非隔离同目录房间用 ref-count 执行锁串行，verify 也持锁。
 - **B11 轮次报告**：自动提交成功时把 hash 写入 `round_checks(kind=commit)`；新增轮次报告接口，聚合回合、改动、交付、token、review/verify/commit 证据，并可按 hash 只读渲染 `git show --stat --patch`，前端可展开 diff、导出 markdown。
-- **B11 事后盲审**：轮次报告里可一键唤醒独立 reviewer，prompt 层提供 `blind` 模式（隐藏聊天记录、记忆、交接和技能），只注入原始需求 + 已提交 diff；结论作为新消息发出。
+- **B11 盲审**：prompt 层提供 `blind` 模式（隐藏聊天记录、记忆、交接和技能）。房间开启「改动后自动盲审」时，有改动的回合会自动把指定 reviewer 排进**同一轮**，只注入原始需求 + 当前未提交 diff，其 VERDICT 直接参与收尾门禁和自动提交；轮次报告里另提供对已提交轮次的事后盲审。
 
 ## 关键决策
 
@@ -42,7 +42,7 @@
 
 ## 验证
 
-- `npm test` 全绿：sop 147/147、session 127/127、task 53/53、queue 29/29；`lesson-check` 覆盖教训去重/升级/A→B→A、用量聚合、轮次报告；`scenario-check` 覆盖模板、盲审 prompt、worktree 创建/复用/解除、commit diff；`collision-check` 覆盖同目录两房间从不并发、B 排队后自动继续。
+- `npm test` 全绿：sop 147/147、session 127/127、task 53/53、queue 29/29；`lesson-check` 覆盖教训去重/升级/A→B→A、用量聚合、轮次报告；`scenario-check` 覆盖模板、盲审 prompt、worktree 创建/复用/解除、commit diff；`collision-check` 覆盖同目录两房间从不并发、B 排队后自动继续；`blind-check` 覆盖自动盲审进入同一轮、BLIND-OK、门禁放行、自动提交与报告证据。
 - `npm run typecheck`、`npm run build` 通过。
 - 临时仓库 + 临时端口实测模板添加、隔离创建/解除、轮次报告接口。
 - 未做浏览器端 E2E；状态面板、来源跳转、diff 展开、导出按钮只过了构建与接口验证。
@@ -50,7 +50,8 @@
 ## 遗留
 
 - 轮次报告目前只覆盖有 `round_id` 的回合；B03 之前的历史轮次没有 round 归属，不会出现在列表里。
-- 盲审目前是**事后复核**：基于已提交 diff，不参与已收尾轮次的门禁。轮前盲审需要渲染未提交 diff 并自动触发 reviewer，留作下一步。
+- 自动盲审只在**有代码改动**的回合触发；纯聊天轮不需要，也不会触发。
+- 事后盲审（轮次报告按钮）仍是咨询性质，不回滚已收尾轮次；真正的门禁结论来自轮前自动盲审。
 - `blind` 标记只在内存队列里；服务器在盲审排队期间重启，该回合会退化成普通回合（override 仍在，但会重新带上聊天记录）。
 - 仓库级共享记忆未做；同一仓库的多个房间目前只共享执行锁，不共享事实。
 - 没有鉴权：`AC_HOST=0.0.0.0` 时整个 API（含文件端点）对局域网可读，仍只适合本机/可信网络。

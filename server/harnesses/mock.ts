@@ -364,6 +364,20 @@ export const mockAdapter: HarnessAdapter = {
       }
       return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
+    //   MOCK-盲审     → BLIND-OK iff the prompt is the blind shape (no chat
+    //                  transcript), then a PASS verdict (B11 gate test)
+    if (input.character.persona.includes('MOCK-盲审')) {
+      const blind =
+        input.prompt.includes('【盲审模式】') &&
+        !input.prompt.includes('【最近的群聊记录】') &&
+        !input.prompt.includes('【房间共享记忆】')
+      const reply = `（mock 模式）盲审检测：${blind ? 'BLIND-OK' : 'BLIND-FAIL'}\nREVIEW: PASS`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
     if (input.character.persona.includes('MOCK-评审')) {
       const verdict = input.character.persona.includes('MOCK-评审返修') ? 'REVIEW: CHANGES' : 'REVIEW: PASS'
       const reply = `（mock 模式）${input.character.name} 的 review：改动看起来没问题，同意收尾。\n${verdict}`

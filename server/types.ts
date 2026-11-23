@@ -84,6 +84,12 @@ export interface Room {
   isolationSource: string
   /** Branch checked out in the isolation worktree (empty when not isolated). */
   isolationBranch: string
+  /**
+   * B11 pre-commit blind review: after a changed turn, automatically queue
+   * the designated reviewer with the worktree diff only (no transcript), so
+   * its verdict can satisfy the SOP gate before auto-commit.
+   */
+  blindReview: boolean
 }
 
 /**

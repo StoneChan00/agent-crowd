@@ -19,7 +19,7 @@
 选 C。
 
 - 房间可在设置里「创建隔离工作树」：`data/worktrees/<roomId>`，分支 `ac/<roomId 前 8 位>`，从 HEAD 切出；源仓库未提交改动不带入；解除隔离删 worktree、保留分支。
-- 非隔离房间按 `resolve(workingDir)` 作为 key 加 ref-count 执行锁；同 key 的其他房间排队，持锁方空闲后唤醒。verify 命令执行期间同样持锁。隔离房间没有 key，永不等待。
+- 非隔离房间按**仓库根**（`git rev-parse --show-toplevel`，非 git 目录回落到 `resolve(workingDir)`）作为 key 加 ref-count 执行锁；同 key 的其他房间排队，持锁方空闲后唤醒。按仓库根而不是配置目录，是因为两个房间常指向同一仓库的不同子目录。verify 命令执行期间同样持锁。隔离房间没有 key，永不等待。
 
 ## 后果
 

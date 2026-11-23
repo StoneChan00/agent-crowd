@@ -456,6 +456,7 @@ export default function App() {
     maxHops: number
     verifyCommand: string
     reviewerCharacterId: string | null
+    blindReview: boolean
   }) => {
     if (roomForm === 'create') {
       const created = await api.createRoom({

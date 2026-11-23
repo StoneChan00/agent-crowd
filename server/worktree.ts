@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { DATA_DIR } from './paths.ts'
 
 /**
@@ -38,6 +38,21 @@ export function repoRoot(dir: string): string | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Cached repo-root lookup for the execution lock's hot path (every acquire/
+ * release/wake). A directory's repo membership does not change during a
+ * server run; `null` means "plain directory, key on the path itself".
+ */
+const rootCache = new Map<string, string | null>()
+
+export function repoRootCached(dir: string): string | null {
+  const key = resolve(dir)
+  if (rootCache.has(key)) return rootCache.get(key) ?? null
+  const root = repoRoot(key)
+  rootCache.set(key, root)
+  return root
 }
 
 function branchExists(root: string, branch: string): boolean {

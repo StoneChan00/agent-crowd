@@ -9,8 +9,8 @@
  *     (sampled states: never both busy at once).
  * C2  A's release wakes B, and B finishes on its own.
  */
-import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -103,6 +103,16 @@ async function waitMessages(port, roomId, predicate, timeoutMs = 30_000) {
 
 const dataDir = mkdtempSync(join(tmpdir(), 'ac-collision-'))
 const sharedDir = mkdtempSync(join(tmpdir(), 'ac-collision-work-'))
+// Same repository, different room directories: the lock must key on the repo
+// root, not the configured subdirectory.
+execFileSync('git', ['init', '-q'], { cwd: sharedDir, windowsHide: true })
+execFileSync('git', ['config', 'user.email', 'lock@example.test'], { cwd: sharedDir, windowsHide: true })
+execFileSync('git', ['config', 'user.name', 'lock'], { cwd: sharedDir, windowsHide: true })
+writeFileSync(join(sharedDir, 'seed.txt'), 'seed\n')
+execFileSync('git', ['add', 'seed.txt'], { cwd: sharedDir, windowsHide: true })
+execFileSync('git', ['commit', '-q', '-m', 'seed'], { cwd: sharedDir, windowsHide: true })
+const subDir = join(sharedDir, 'sub')
+mkdirSync(subDir, { recursive: true })
 const proc = await bootServer(dataDir)
 const port = proc.port
 
@@ -113,7 +123,7 @@ try {
   })
   const roomB = await req(port, '/api/rooms', {
     method: 'POST',
-    body: JSON.stringify({ name: '房间B', workingDir: sharedDir, maxHops: 2 }),
+    body: JSON.stringify({ name: '房间B', workingDir: subDir, maxHops: 2 }),
   })
   for (const [room, name] of [
     [roomA, '甲'],

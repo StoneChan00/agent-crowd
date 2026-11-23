@@ -6,7 +6,7 @@ import * as db from './db.ts'
 import { broadcast } from './events.ts'
 import { getAdapter } from './harnesses/index.ts'
 import { isTransientFailure, RESUME_BREAKER_LIMIT, resumeAttempts, resumeIdleTimeoutMs, timeoutRecoveryPlan } from './harnesses/process.ts'
-import { changedPathsBetween, commitPaths, snapshotWorktree } from './gitstate.ts'
+import { changedPathsBetween, commitPaths, renderWorktreeDiff, snapshotWorktree } from './gitstate.ts'
 import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPromptDetailed } from './prompt.ts'
 import { episodeDelivery, memoryQueryFromMessages } from './memory.ts'
@@ -14,6 +14,7 @@ import { buildHandoff, type HandoffInput } from './handoff.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
+import { repoRootCached } from './worktree.ts'
 import { gateDecision, parseReviewVerdict, type GateAuthor, type GateBlockReason } from './sop.ts'
 import { rewriteMediaLines } from './media.ts'
 import { loadSkills } from './skills.ts'
@@ -159,6 +160,10 @@ interface RoundState {
   lastDelivery?: string
   /** Last real turn's error text (B08) — the failure lesson's root cause. */
   lastError?: string
+  /** B11: this round already queued its pre-commit blind review. */
+  blindReviewQueued?: boolean
+  /** B11: the ineligible-reviewer notice fires at most once per round. */
+  blindWarned?: boolean
   /** Task card this round executes (B03); undefined on ordinary chat rounds. */
   taskId?: string
 }
@@ -193,7 +198,11 @@ const workdirLocks = new Map<string, { roomId: string; count: number }>()
 
 function workdirKey(room: Room): string | null {
   if (room.isolationBranch) return null
-  return resolve(room.workingDir).replace(/[\\/]+$/, '').toLowerCase()
+  // Key on the REPOSITORY root, not the configured directory: two rooms may
+  // point at the same repo through different subdirectories (a common setup)
+  // and still overwrite each other's files.
+  const root = repoRootCached(room.workingDir) ?? room.workingDir
+  return resolve(root).replace(/[\\/]+$/, '').toLowerCase()
 }
 
 function acquireWorkdir(room: Room): boolean {
@@ -1835,6 +1844,58 @@ async function pump(roomId: string): Promise<void> {
       // excluded (they are the round's closing act, not its work).
       if (!item.isRoundSummary) {
         round.changedAuthor = { id: character.id, harness: character.harness }
+      }
+    }
+    // B11 pre-commit blind review: once a changed, successful turn settles,
+    // queue the designated independent reviewer with ONLY the request + the
+    // current worktree diff. Its verdict is what the SOP gate will read, so
+    // the round can still close (and auto-commit) without a chat-context
+    // review. Runs at most once per round; blind turns never re-trigger it.
+    if (
+      room.blindReview &&
+      !item.blind &&
+      !item.isRoundSummary &&
+      !output.error &&
+      round &&
+      round.roundId === item.roundId &&
+      !round.blindReviewQueued &&
+      changedPaths &&
+      changedPaths.length > 0
+    ) {
+      const reviewer = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
+      const eligible =
+        reviewer !== undefined &&
+        reviewer.enabled &&
+        !reviewer.triggers.onRoundEnd &&
+        reviewer.id !== character.id &&
+        reviewer.harness !== character.harness
+      if (!eligible) {
+        if (!round.blindWarned) {
+          round.blindWarned = true
+          sendGateNotice(
+            roomId,
+            '⚠️ 已开启盲审，但指定 reviewer 不可用（停用 / 轮末总结角色 / 与实现者同 harness），本轮按原流程处理。',
+          )
+        }
+      } else if (rounds.get(roomId) === round) {
+        round.blindReviewQueued = true
+        const diff = await renderWorktreeDiff(cwd, round.changedPaths, 2_400)
+        if (rounds.get(roomId) !== round) return
+        const request = [...fetched].reverse().find((entry) => entry.authorType === 'user')?.content?.trim() ?? ''
+        const override = [
+          '【盲审任务】你是独立 reviewer。群聊记录、记忆与交接已被隐藏，只能依据下面的需求和 diff 判断，不要假设实现者的叙述。',
+          `【原始需求】\n${request.slice(0, 600) || '（未记录原始需求）'}`,
+          `【改动文件】\n${round.changedPaths.join('\n') || '（无）'}`,
+          `【Diff】\n${diff || '（无文本 diff，可能是二进制文件）'}`,
+          '请检查正确性、边界条件、回归风险与需求覆盖；不要改代码。最后单独一行给出 REVIEW: PASS 或 REVIEW: CHANGES。',
+        ].join('\n\n')
+        enqueue(roomId, reviewer.id, message.id, item.hop, override, {
+          allowActive: true,
+          blind: true,
+          roundId: item.roundId,
+          taskId: item.taskId,
+        })
+        sendGateNotice(roomId, `🔍 已排入盲审：${reviewer.name} 只接收原始需求与 diff，结论决定本轮能否收尾。`)
       }
     }
     // Session continuity (P0-1): a clean turn that surfaced a CLI session id
