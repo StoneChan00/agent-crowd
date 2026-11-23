@@ -67,6 +67,8 @@ interface QueueItem {
   taskId?: string | null
   /** B11 blind review: suppress transcript/memory/skills for this turn. */
   blind?: boolean
+  /** B12: 1 = this turn continues a restart-interrupted turn (no re-recovery). */
+  restartRecovery?: number
 }
 
 /** Replay buffer for the running turn, so clients that join mid-turn can catch up. */
@@ -376,6 +378,79 @@ export function handleUserMessage(room: Room, message: Message): void {
 }
 
 /** Queue one character manually (the "让它发言" action). */
+/**
+ * B12 restart self-healing: continue the turns a hard restart interrupted.
+ * Only the PARTIAL-OUTPUT case is auto-recovered — a turn killed before any
+ * text is better left to the human (auto-retrying it could redo a side-effect
+ * action blindly). The continuation runs as a normal turn in a fresh round;
+ * its prompt still carries the transcript (including the partial reply posted
+ * below) and the recovery instruction. `restartRecovery=1` prevents a second
+ * interruption from looping.
+ */
+export function recoverInterrupted(turns: Turn[]): void {
+  if (process.env.AC_RESTART_RECOVERY === '0') {
+    if (turns.length > 0) console.log('[agent-crowd] restart recovery disabled (AC_RESTART_RECOVERY=0)')
+    return
+  }
+  const seenRooms = new Set<string>()
+  for (const turn of turns) {
+    if (turn.isRoundSummary || turn.restartRecovery > 0) continue
+    if (seenRooms.has(turn.roomId)) continue
+    const partial = turn.output.trim()
+    if (!partial) continue
+    const room = db.getRoom(turn.roomId)
+    const character = db.getCharacter(turn.characterId)
+    if (!room || !character || !character.enabled) continue
+    // Pending queued work wins: mixing a recovery round with restored queue
+    // turns would attach them to the wrong RoundState. The user already has
+    // work waiting; the interrupted turn stays in the normal error path.
+    if (db.listQueuedTurns(room.id).length > 0) continue
+    seenRooms.add(room.id)
+
+    const partialMessage = db.addMessage({
+      roomId: room.id,
+      authorType: 'character',
+      characterId: character.id,
+      authorName: character.name,
+      authorAvatar: character.avatar,
+      color: character.color,
+      content: partial,
+      meta: {
+        harness: character.harness,
+        model: character.model,
+        turnId: turn.id,
+        generated: true,
+        error: '服务器重启中断的部分输出',
+      },
+    })
+    broadcast(room.id, 'message', { roomId: room.id, message: partialMessage })
+
+    const override = [
+      '系统恢复任务：你上一回合因服务器重启被强制中断（CLI 进程已结束）。',
+      '上面那条带「服务器重启中断的部分输出」标记的消息，是中断前已经产出的内容；请从中断处继续完成原任务。',
+      '已完成的部分不要重复，直接补完剩余工作并给出最终回复；如果原任务其实已经完成，明确说明并收尾。',
+    ].join('\n')
+    chains.set(room.id, { limitNoticeSent: false })
+    const round = newRoundState(turn.taskId ?? undefined)
+    rounds.set(room.id, round)
+    enqueue(room.id, character.id, null, 1, override, {
+      allowActive: true,
+      roundId: round.roundId,
+      taskId: turn.taskId ?? null,
+      restartRecovery: 1,
+    })
+    const notice = db.addMessage({
+      roomId: room.id,
+      authorType: 'system',
+      authorName: '系统',
+      content: `🔁 检测到「${character.name}」上一回合因重启中断，已自动续跑一次（保留部分输出）。`,
+      meta: { generated: true },
+    })
+    broadcast(room.id, 'message', { roomId: room.id, message: notice })
+    void pump(room.id)
+  }
+}
+
 export function runCharacter(
   room: Room,
   character: Character,
@@ -555,6 +630,7 @@ export function restoreQueues(turns: Turn[]): void {
         override: turn.override ?? undefined,
         retry: turn.retry || undefined,
         resumeAttempt: turn.resumeAttempt || undefined,
+        restartRecovery: turn.restartRecovery || undefined,
         isRoundSummary: turn.isRoundSummary || undefined,
         roundId: turn.roundId,
         taskId: turn.taskId,
@@ -612,6 +688,8 @@ function enqueue(
     resumeAttempt?: number
     /** B11 blind review: do not carry chat context into this turn. */
     blind?: boolean
+    /** B12 restart recovery: mark the continuation turn. */
+    restartRecovery?: number
   },
 ): boolean {
   const queue = queues.get(roomId) ?? []
@@ -634,6 +712,7 @@ function enqueue(
     override,
     retry: options?.retry || undefined,
     resumeAttempt: options?.resumeAttempt || undefined,
+    restartRecovery: options?.restartRecovery || undefined,
     isRoundSummary: options?.isRoundSummary || undefined,
     roundId: options?.roundId ?? null,
     taskId: options?.taskId ?? null,
@@ -650,6 +729,7 @@ function enqueue(
     roundId: options?.roundId ?? null,
     taskId: options?.taskId ?? null,
     blind: options?.blind || undefined,
+    restartRecovery: options?.restartRecovery || undefined,
   })
   queues.set(roomId, queue)
   broadcast(roomId, 'queue', { roomId, characters: queue.map((item) => item.characterId) })
@@ -1361,6 +1441,8 @@ async function pump(roomId: string): Promise<void> {
     activeIsSummary = item.isRoundSummary ?? false
     const controller = new AbortController()
     const replay: TurnReplay = { text: '', thinking: [], tools: [] }
+    /** B12: throttle partial-output checkpoints (hard kill writes nothing). */
+    let lastCheckpointAt = 0
     active.set(roomId, {
       turnId,
       characterId: character.id,
@@ -1537,6 +1619,19 @@ async function pump(roomId: string): Promise<void> {
         } else {
           replay.tools.push(event.text)
           if (replay.tools.length > REPLAY_CAP) replay.tools.splice(0, replay.tools.length - REPLAY_CAP)
+        }
+        // B12: a hard kill runs no exit hook, so streamed text only survives
+        // a restart if it is checkpointed while the turn runs. 2s is enough
+        // for the recovery prompt to keep the useful tail; the final write
+        // still stores the full output.
+        const checkpointAt = Date.now()
+        if (replay.text && checkpointAt - lastCheckpointAt >= 2_000) {
+          lastCheckpointAt = checkpointAt
+          try {
+            db.updateTurn(turnId, { output: replay.text })
+          } catch {
+            /* db hiccup — the final write still runs on a clean exit */
+          }
         }
         broadcast(roomId, 'delta', {
           roomId,

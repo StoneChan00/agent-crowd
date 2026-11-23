@@ -31,7 +31,7 @@ import { createIsolationWorktree, removeIsolationWorktree } from './worktree.ts'
 import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, SKILLS_DIR, WEB_DIST } from './paths.ts'
 import { loadSkills } from './skills.ts'
-import type { Character, HarnessKind, Room, RoundReport, Task } from './types.ts'
+import type { Character, HarnessKind, Room, RoundReport, Task, Turn } from './types.ts'
 import { HARNESS_LABELS } from './types.ts'
 import { truncate } from './util.ts'
 
@@ -127,7 +127,7 @@ function longestTemplateLiteral(template: string): string | null {
   return chunks.reduce((best, chunk) => (chunk.length > best.length ? chunk : best))
 }
 
-function recoverInterruptedTurns(): void {
+function recoverInterruptedTurns(): Turn[] {
   // 'running' rows are interrupted and swept below; 'queued' rows are left
   // untouched and re-queued after listen (orchestrator.restoreQueues) — they
   // were never started, so their work simply continues instead of dying
@@ -136,7 +136,7 @@ function recoverInterruptedTurns(): void {
   if (queued.length > 0) {
     console.log(`[agent-crowd] startup recovery: ${queued.length} queued turn(s) will be restored`)
   }
-  if (stale.length === 0) return
+  if (stale.length === 0) return stale
   const byRoom = new Map<string, { count: number; killed: number; skipped: number }>()
   for (const item of stale) {
     let killed = 0
@@ -174,13 +174,14 @@ function recoverInterruptedTurns(): void {
       roomId,
       authorType: 'system',
       authorName: '系统',
-      content: `⚠️ 服务器重启，${entry.count} 个进行中的回合已中断${entry.killed > 0 ? `，${entry.killed} 个残留进程已清理` : ''}${entry.skipped > 0 ? `，${entry.skipped} 个进程未能确认归属、已跳过清理` : ''}。需要继续请重新发送，或用「中途补充」补充指令。`,
+      content: `⚠️ 服务器重启，${entry.count} 个进行中的回合已中断${entry.killed > 0 ? `，${entry.killed} 个残留进程已清理` : ''}${entry.skipped > 0 ? `，${entry.skipped} 个进程未能确认归属、已跳过清理` : ''}。有部分产出的回合会自动续跑一次；没有产出的请重新发送。`,
       meta: { generated: true },
     })
   }
   console.log(`[agent-crowd] startup recovery: ${stale.length} interrupted turn(s) swept`)
+  return stale
 }
-recoverInterruptedTurns()
+const interruptedAtBoot = recoverInterruptedTurns()
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
@@ -1263,4 +1264,6 @@ app.listen(PORT, HOST, () => {
   // the turns they spawn must not outrun the port they answer through.
   const queuedTurns = db.listAllQueuedTurns()
   if (queuedTurns.length > 0) orchestrator.restoreQueues(queuedTurns)
+  // B12: continue turns a hard restart interrupted (partial output only).
+  if (interruptedAtBoot.length > 0) orchestrator.recoverInterrupted(interruptedAtBoot)
 })

@@ -402,6 +402,12 @@ export interface Turn {
    * the rung instead of demoting a resume to a fresh turn.
    */
   resumeAttempt: number
+  /**
+   * B12 restart recovery: 1 = this turn was created to continue a turn that a
+   * server restart interrupted. Such a turn is never auto-recovered again, so
+   * repeated restarts can't loop.
+   */
+  restartRecovery: number
   /** Round-end summary turns never relay and don't count as round activity. */
   isRoundSummary: boolean
   /**

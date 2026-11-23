@@ -228,6 +228,7 @@ addColumnIfMissing('turns', 'hop', 'hop integer not null default 1')
 addColumnIfMissing('turns', 'override', 'override text')
 addColumnIfMissing('turns', 'retry', 'retry integer not null default 0')
 addColumnIfMissing('turns', 'resume_attempt', 'resume_attempt integer not null default 0')
+addColumnIfMissing('turns', 'restart_recovery', 'restart_recovery integer not null default 0')
 addColumnIfMissing('turns', 'is_round_summary', 'is_round_summary integer not null default 0')
 // SOP gate (P0-3): per-room verification command + per-round evidence.
 addColumnIfMissing('rooms', 'verify_command', "verify_command text not null default ''")
@@ -1100,6 +1101,7 @@ function mapTurn(row: Record<string, unknown>): Turn {
     override: row.override === null || row.override === undefined ? null : String(row.override),
     retry: Number(row.retry ?? 0) === 1,
     resumeAttempt: Number(row.resume_attempt ?? 0) || 0,
+    restartRecovery: Number(row.restart_recovery ?? 0) || 0,
     isRoundSummary: Number(row.is_round_summary ?? 0) === 1,
     roundId: row.round_id === null || row.round_id === undefined ? null : String(row.round_id),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
@@ -1121,6 +1123,8 @@ export function createTurn(input: {
   retry?: boolean
   /** M3 timeout-recovery rung (0 = ordinary turn); persisted for boot restore. */
   resumeAttempt?: number
+  /** B12: 1 = this turn continues a restart-interrupted turn (no re-recovery). */
+  restartRecovery?: number
   isRoundSummary?: boolean
   /** Round this turn belongs to (SOP gate, P0-3); null on restored/legacy rows. */
   roundId?: string | null
@@ -1140,6 +1144,7 @@ export function createTurn(input: {
     override: input.override ?? null,
     retry: input.retry ?? false,
     resumeAttempt: input.resumeAttempt ?? 0,
+    restartRecovery: input.restartRecovery ?? 0,
     isRoundSummary: input.isRoundSummary ?? false,
     roundId: input.roundId ?? null,
     taskId: input.taskId ?? null,
@@ -1149,8 +1154,8 @@ export function createTurn(input: {
   }
   db.prepare(
     `insert into turns
-       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, resume_attempt, is_round_summary, round_id, task_id, changed, started_at, ended_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, room_id, character_id, status, trigger_message_id, output, error, hop, override, retry, resume_attempt, restart_recovery, is_round_summary, round_id, task_id, changed, started_at, ended_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     turn.id,
     turn.roomId,
@@ -1163,6 +1168,7 @@ export function createTurn(input: {
     turn.override,
     turn.retry ? 1 : 0,
     turn.resumeAttempt,
+    turn.restartRecovery,
     turn.isRoundSummary ? 1 : 0,
     turn.roundId,
     turn.taskId,

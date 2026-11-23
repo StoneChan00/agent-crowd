@@ -256,11 +256,21 @@ async function scenarioRestoreAndIdempotent() {
   )
   const yiMsgs = characterMessages(messages, '乙')
   check('Q1 乙 消息恰 1 条（不重跑）', yiMsgs.length === 1, `实际 ${yiMsgs.length} 条`)
-  const jiaTurns = turnRowsWhere(dir, 'character_id = ?', jia.id)
+  const jiaTurns = turnRowsWhere(dir, 'character_id = ? order by started_at asc, rowid asc', jia.id)
   check(
-    'Q1 甲 turn 被中断为 error',
-    jiaTurns.length === 1 && jiaTurns[0].status === 'error' && jiaTurns[0].error === '服务器重启，回合中断',
-    JSON.stringify(jiaTurns.map((row) => [row.status, row.error])),
+    'Q1 甲 turn 被中断为 error，且有部分产出',
+    jiaTurns[0]?.status === 'error' &&
+      jiaTurns[0].error === '服务器重启，回合中断' &&
+      String(jiaTurns[0].output ?? '').trim().length > 0,
+    JSON.stringify(jiaTurns.map((row) => [row.status, row.error, String(row.output ?? '').length])),
+  )
+  // B12: the interrupted turn with partial output is auto-continued once.
+  check(
+    'Q1 甲 中断回合自动续跑一次并完成',
+    jiaTurns.length === 2 &&
+      jiaTurns[1].restart_recovery === 1 &&
+      jiaTurns[1].status === 'done',
+    JSON.stringify(jiaTurns.map((row) => [row.status, row.restart_recovery])),
   )
   const interrupts = systemNotices(messages, '已中断')
   check(
