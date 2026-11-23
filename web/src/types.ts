@@ -1,8 +1,10 @@
 export type {
+  AdapterCapabilities,
   AuthorType,
   Character,
   CharacterPreset,
   CharacterUsage,
+  CliEvent,
   HarnessKind,
   Memory,
   MemoryKind,
@@ -34,6 +36,8 @@ export interface HarnessInfo {
   label: string
   available: boolean
   detail: string | null
+  /** B13: what the CLI can report (drives the readiness panel, not UI forks). */
+  capabilities?: import('../../server/types.ts').AdapterCapabilities
 }
 
 export type HarnessMap = Record<string, HarnessInfo>

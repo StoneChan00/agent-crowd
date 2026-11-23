@@ -206,12 +206,33 @@ export interface CharacterPreset {
   createdAt: number
 }
 
+/**
+ * Canonical token usage (B13): `input` is TOTAL input — new tokens plus cache
+ * reads/writes — and `cacheRead`/`cacheWrite` are subsets of it. Adapters
+ * normalize their provider's convention at the boundary so the usage panel
+ * and cost math see one meaning. `total` is input + output unless a provider
+ * reports its own total.
+ */
 export interface TurnTokens {
   input?: number
   output?: number
   total?: number
   cacheRead?: number
   cacheWrite?: number
+}
+
+/** One structured CLI event (B13): persisted so the UI renders a timeline. */
+export type CliEvent =
+  | { kind: 'tool_use'; id: string; name: string; input?: string; at: number }
+  | { kind: 'tool_result'; id: string; name: string; ok: boolean; output?: string; durationMs?: number; at: number }
+
+/** What a harness can actually report (B13) — differences become data, not UI forks. */
+export interface AdapterCapabilities {
+  thinking: boolean
+  /** 'structured' = tool_use/tool_result timeline; 'text' = names only; 'none'. */
+  tools: 'structured' | 'text' | 'none'
+  tokens: boolean
+  sessionResume: boolean
 }
 
 /** Aggregated token usage for a room (B08): harness-reported numbers only. */
@@ -243,6 +264,10 @@ export interface ToolTrace {
   ok: boolean
   detail?: string
   durationMs?: number
+  /** B13: call id, so the UI can pair use/result even without the event list. */
+  id?: string
+  /** Primary argument / command shown inline with the tool name. */
+  input?: string
 }
 
 /** Marks a user message as a mid-turn steer note aimed at one character. */
@@ -286,6 +311,8 @@ export interface MessageMeta {
   thinking?: string
   error?: string
   tools?: ToolTrace[]
+  /** B13: ordered tool timeline (use/result pairs) for the unified CLI view. */
+  events?: CliEvent[]
   /** True when the message was written by a character's harness run. */
   generated?: boolean
   /**

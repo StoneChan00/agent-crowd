@@ -1,15 +1,18 @@
 import { resolveClaude } from './bins.ts'
 import { describeTimeout, idleTimeoutMs, runProcess, turnTimeoutMs } from './process.ts'
+import { beginTool, createTimeline, endTool } from './timeline.ts'
 import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
-import type { ToolTrace, TurnTokens } from '../types.ts'
+import type { TurnTokens } from '../types.ts'
 import { safeJsonParse } from '../util.ts'
 
 /** One content block inside an assistant/user message (Claude Code stream-json). */
 interface ClaudeBlock {
   type?: string
   text?: string
+  thinking?: string
   id?: string
   name?: string
+  input?: unknown
   tool_use_id?: string
   content?: unknown
   is_error?: boolean
@@ -81,6 +84,7 @@ export function buildClaudeArgs(input: {
 export const claudeAdapter: HarnessAdapter = {
   id: 'claude',
   label: 'Claude Code',
+  capabilities: { thinking: true, tools: 'structured', tokens: true, sessionResume: true },
   resumeArgs: claudeResumeArgs,
 
   async run(input: RunInput): Promise<RunOutput> {
@@ -105,10 +109,7 @@ export const claudeAdapter: HarnessAdapter = {
     let sessionId: string | undefined
     let tokens: TurnTokens | undefined
     let eventError: string | undefined
-    const tools: ToolTrace[] = []
-    const toolNames = new Map<string, string>()
-    const toolStartedAt = new Map<string, number>()
-    const announcedTools = new Set<string>()
+    const timeline = createTimeline()
     let lastAssistantText = ''
 
     const result = await runProcess(spec.command, args, {
@@ -145,13 +146,13 @@ export const claudeAdapter: HarnessAdapter = {
             input.emit({ kind: 'text', text: delta })
           }
           for (const block of blocks) {
+            if (block.type === 'thinking' && block.thinking) {
+              input.emit({ kind: 'thinking', text: block.thinking })
+            }
             if (block.type === 'tool_use' && block.id) {
-              toolNames.set(block.id, block.name ?? 'tool')
-              if (!announcedTools.has(block.id)) {
-                announcedTools.add(block.id)
-                toolStartedAt.set(block.id, Date.now())
-                input.emit({ kind: 'tool', text: `调用 ${block.name ?? 'tool'}` })
-              }
+              const inputText =
+                typeof block.input === 'string' ? block.input : block.input ? JSON.stringify(block.input) : undefined
+              input.emit(beginTool(timeline, block.id, block.name ?? 'tool', inputText))
             }
           }
           return
@@ -159,16 +160,9 @@ export const claudeAdapter: HarnessAdapter = {
         if (type === 'user') {
           for (const block of event.message?.content ?? []) {
             if (block.type === 'tool_result' && block.tool_use_id) {
-              const name = toolNames.get(block.tool_use_id) ?? 'tool'
-              const at = toolStartedAt.get(block.tool_use_id)
+              const name = timeline.open.get(block.tool_use_id)?.name ?? 'tool'
               const output = typeof block.content === 'string' ? block.content : JSON.stringify(block.content)
-              tools.push({
-                name,
-                ok: !block.is_error,
-                durationMs: at ? Date.now() - at : undefined,
-                detail: output?.slice(0, 300),
-              })
-              input.emit({ kind: 'tool', text: `${block.is_error ? '失败' : '完成'} ${name}` })
+              input.emit(endTool(timeline, block.tool_use_id, name, !block.is_error, output))
             }
           }
           return
@@ -177,11 +171,19 @@ export const claudeAdapter: HarnessAdapter = {
           if (event.session_id) sessionId = event.session_id
           if (typeof event.result === 'string' && event.result.trim()) finalText = event.result
           if (event.usage) {
+            // B13 canonical semantics: input = new + cache read + cache write;
+            // cache fields stay as subsets for the usage panel.
+            const input = event.usage.input_tokens ?? 0
+            const output = event.usage.output_tokens ?? 0
+            const cacheRead = event.usage.cache_read_input_tokens ?? 0
+            const cacheWrite = event.usage.cache_creation_input_tokens ?? 0
+            const totalInput = input + cacheRead + cacheWrite
             tokens = {
-              input: event.usage.input_tokens,
-              output: event.usage.output_tokens,
-              cacheRead: event.usage.cache_read_input_tokens,
-              cacheWrite: event.usage.cache_creation_input_tokens,
+              input: totalInput,
+              output,
+              cacheRead,
+              cacheWrite,
+              total: totalInput + output,
             }
           }
           // stream-json error results often carry only subtype+result (e.g.
@@ -215,7 +217,8 @@ export const claudeAdapter: HarnessAdapter = {
       sessionId,
       pid: result.pid,
       tokens,
-      toolTraces: tools,
+      toolTraces: timeline.tools,
+      events: timeline.events,
       exitCode: result.code ?? -1,
       durationMs: Date.now() - started,
       error: error || undefined,

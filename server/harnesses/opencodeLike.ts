@@ -1,4 +1,5 @@
 import { describeTimeout, idleTimeoutMs, runProcess, turnTimeoutMs } from './process.ts'
+import { beginTool, createTimeline, endTool } from './timeline.ts'
 import type { AdapterEvent, HarnessAdapter, RunInput, RunOutput } from './types.ts'
 import { safeJsonParse } from '../util.ts'
 import type { HarnessKind, TurnTokens } from '../types.ts'
@@ -80,6 +81,7 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
   return {
     id: options.id,
     label: options.label,
+    capabilities: { thinking: false, tools: 'structured', tokens: true, sessionResume: true },
     resumeArgs: sessionArgs,
 
     async run(input: RunInput): Promise<RunOutput> {
@@ -99,7 +101,7 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
 
       const textParts: { id: string; text: string }[] = []
       const toolStarted = new Map<string, { name: string; title: string; at: number }>()
-      const tools: { name: string; ok: boolean; detail?: string; durationMs?: number }[] = []
+      const timeline = createTimeline()
       let sessionId: string | undefined
       let tokens: TurnTokens | undefined
       let apiError: string | undefined
@@ -148,21 +150,21 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
             const name = String(part.tool ?? part.title ?? 'tool')
             const callId = String(part.callID ?? part.id ?? name)
             const status = part.state?.status
+            const inputText =
+              typeof part.state?.input === 'string'
+                ? part.state.input
+                : part.state?.input
+                  ? JSON.stringify(part.state.input)
+                  : String(part.state?.title ?? '')
             if (status === 'running' || status === 'pending') {
               if (!toolStarted.has(callId)) {
                 toolStarted.set(callId, { name, title: String(part.state?.title ?? ''), at: Date.now() })
-                input.emit({ kind: 'tool', text: `调用 ${name}` })
+                input.emit(beginTool(timeline, callId, name, inputText))
               }
             } else if (status === 'completed' || status === 'error') {
-              const startedAt = toolStarted.get(callId)
               toolStarted.delete(callId)
-              tools.push({
-                name,
-                ok: status === 'completed',
-                durationMs: startedAt ? Date.now() - startedAt.at : undefined,
-                detail: part.state?.title,
-              })
-              input.emit({ kind: 'tool', text: `${status === 'completed' ? '完成' : '失败'} ${name}` })
+              const output = part.state?.output ?? part.state?.error ?? part.state?.title
+              input.emit(endTool(timeline, callId, name, status === 'completed', output))
             }
             return
           }
@@ -170,10 +172,11 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
           if (type === 'step_finish') {
             const raw = event.part?.tokens
             if (raw) {
+              // OpenCode reports its own total; keep it and pass cache through.
               tokens = {
                 input: raw.input,
                 output: raw.output,
-                total: raw.total,
+                total: raw.total ?? (raw.input ?? 0) + (raw.output ?? 0),
                 cacheRead: raw.cache?.read,
                 cacheWrite: raw.cache?.write,
               }
@@ -218,7 +221,8 @@ export function createOpencodeLikeAdapter(options: OpencodeLikeOptions): Harness
         sessionId,
         pid: result.pid,
         tokens,
-        toolTraces: tools,
+        toolTraces: timeline.tools,
+        events: timeline.events,
         exitCode: result.code ?? -1,
         durationMs: Date.now() - started,
         error: error || undefined,

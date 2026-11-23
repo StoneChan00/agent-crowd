@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Bootstrap, Character, CharacterPreset, Memory, Message, Room, Task } from './types'
+import type { Bootstrap, Character, CharacterPreset, CliEvent, Memory, Message, Room, Task } from './types'
 import { api } from './lib/api'
 import { Sidebar } from './components/Sidebar'
 import { ChatHeader } from './components/ChatHeader'
@@ -172,9 +172,37 @@ export default function App() {
       const payload = JSON.parse((event as MessageEvent).data) as {
         turnId: string
         characterId: string
-        kind: 'text' | 'thinking' | 'tool' | 'status'
+        kind: 'text' | 'thinking' | 'tool' | 'status' | 'session' | 'usage'
         text: string
+        phase?: 'use' | 'result'
+        toolId?: string
+        toolName?: string
+        toolInput?: string
+        toolOk?: boolean
+        toolOutput?: string
+        toolDurationMs?: number
+        at?: number
       }
+      const cliEvent: CliEvent | null =
+        payload.kind === 'tool' && payload.toolId && payload.toolName && payload.phase
+          ? payload.phase === 'use'
+            ? {
+                kind: 'tool_use',
+                id: payload.toolId,
+                name: payload.toolName,
+                input: payload.toolInput,
+                at: payload.at ?? Date.now(),
+              }
+            : {
+                kind: 'tool_result',
+                id: payload.toolId,
+                name: payload.toolName,
+                ok: payload.toolOk ?? true,
+                output: payload.toolOutput,
+                durationMs: payload.toolDurationMs,
+                at: payload.at ?? Date.now(),
+              }
+          : null
       setLive((current) => {
         if (!current || current.turnId !== payload.turnId) {
           return {
@@ -183,13 +211,21 @@ export default function App() {
             text: payload.kind === 'text' ? payload.text : '',
             thinking: payload.kind === 'thinking' ? [payload.text] : [],
             tools: payload.kind === 'tool' || payload.kind === 'status' ? [payload.text] : [],
+            events: cliEvent ? [cliEvent] : [],
             startedAt: Date.now(),
           }
         }
         if (payload.kind === 'text') return { ...current, text: current.text + payload.text }
         if (payload.kind === 'thinking')
           return { ...current, thinking: [...current.thinking, payload.text].slice(-60) }
-        return { ...current, tools: [...current.tools, payload.text].slice(-60) }
+        if (payload.kind === 'tool' || payload.kind === 'status') {
+          return {
+            ...current,
+            tools: [...current.tools, payload.text].slice(-60),
+            events: cliEvent ? [...(current.events ?? []), cliEvent].slice(-200) : current.events,
+          }
+        }
+        return current
       })
     })
 

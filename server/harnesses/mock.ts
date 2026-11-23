@@ -1,4 +1,5 @@
 import { writeFileSync } from 'node:fs'
+import { beginTool, createTimeline, endTool } from './timeline.ts'
 import { join } from 'node:path'
 import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
 
@@ -18,6 +19,7 @@ const mockSessionId = (characterId: string): string => `mock-${characterId.slice
 export const mockAdapter: HarnessAdapter = {
   id: 'mock',
   label: 'Mock',
+  capabilities: { thinking: false, tools: 'none', tokens: true, sessionResume: true },
   // Symbolic only — mock runs in-process, nothing is ever spawned. The
   // fragment exists so the orchestrator's resume capability gate (and
   // session-check P3) treat mock as resume-capable; the seam itself reads
@@ -363,6 +365,24 @@ export const mockAdapter: HarnessAdapter = {
         await sleep(10)
       }
       return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
+    }
+    //   MOCK-结构化   → emits a paired tool_use/tool_result timeline (B13)
+    if (input.character.persona.includes('MOCK-结构化')) {
+      const timeline = createTimeline()
+      input.emit(beginTool(timeline, 'call-1', 'Read', 'a.ts'))
+      await sleep(80)
+      input.emit(endTool(timeline, 'call-1', 'Read', true, 'file body', 80))
+      const reply = '（mock 模式）结构化事件已发出。'
+      input.emit({ kind: 'text', text: reply })
+      return {
+        text: reply,
+        exitCode: 0,
+        sessionId: mockSessionId(input.character.id),
+        durationMs: Date.now() - started,
+        tokens: { input: 0, output: reply.length, total: reply.length },
+        toolTraces: timeline.tools,
+        events: timeline.events,
+      }
     }
     //   MOCK-盲审     → BLIND-OK iff the prompt is the blind shape (no chat
     //                  transcript), then a PASS verdict (B11 gate test)

@@ -1633,12 +1633,13 @@ async function pump(roomId: string): Promise<void> {
             /* db hiccup — the final write still runs on a clean exit */
           }
         }
+        // B13: forward the whole structured event; legacy clients only read
+        // kind/text, the CLI timeline also gets phase/tool fields.
         broadcast(roomId, 'delta', {
+          ...event,
           roomId,
           turnId,
           characterId: character.id,
-          kind: event.kind,
-          text: event.text,
         })
       },
     })
@@ -1855,6 +1856,7 @@ async function pump(roomId: string): Promise<void> {
         tokens: output.tokens,
         thinking: output.thinking ? truncate(output.thinking, 4000) : undefined,
         tools: output.toolTraces as ToolTrace[] | undefined,
+        events: output.events?.length ? output.events.slice(-200) : undefined,
         error: output.error,
         relayTo: followers.length > 0 ? followers.map((member) => member.name) : undefined,
         // Session continuity (P0-1): flags whether this reply came from a

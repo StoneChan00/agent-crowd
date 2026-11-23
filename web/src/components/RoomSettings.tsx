@@ -8,6 +8,8 @@ interface Readiness {
   level: 'ok' | 'warn' | 'error' | 'off'
   issues: string[]
   mcpEnabled: number
+  /** B13: what this CLI can report — differences made explicit. */
+  caps: string
 }
 
 /** Path comparison for the shared-directory warning: case/slash/trailing-slash insensitive. */
@@ -28,7 +30,7 @@ function readinessFor(
   models: Record<string, string[]>,
   mcps: McpMap | null,
 ): Readiness {
-  if (!character.enabled) return { level: 'off', issues: [], mcpEnabled: 0 }
+  if (!character.enabled) return { level: 'off', issues: [], mcpEnabled: 0, caps: '' }
   const issues: string[] = []
   const info = harnesses[character.harness]
   if (!info?.available) issues.push(`CLI 不可用（${info?.detail ?? '未找到'}）`)
@@ -50,10 +52,17 @@ function readinessFor(
   const mcpInfo = mcps?.[character.harness]
   if (mcpInfo?.error) issues.push(`MCP 配置读取失败：${mcpInfo.error}`)
   const mcpEnabled = mcpInfo?.servers.filter((server) => server.enabled).length ?? 0
+  const capability = info?.capabilities
+  const caps = capability
+    ? `工具${capability.tools === 'structured' ? '✓' : capability.tools === 'text' ? '~' : '×'} · 思考${
+        capability.thinking ? '✓' : '×'
+      } · token${capability.tokens ? '✓' : '×'} · 续传${capability.sessionResume ? '✓' : '×'}`
+    : ''
   return {
     level: issues.length === 0 ? 'ok' : issues.some((issue) => /不可用|缺失|未填写/.test(issue)) ? 'error' : 'warn',
     issues,
     mcpEnabled,
+    caps,
   }
 }
 
@@ -454,7 +463,7 @@ export function RoomSettings({
                   : ' 全部就绪。')}
           </span>
           <div className="readiness-list">
-            {readiness.map(({ character, level, issues, mcpEnabled }) => (
+            {readiness.map(({ character, level, issues, mcpEnabled, caps }) => (
               <div key={character.id} className={`readiness-row readiness-${level}`}>
                 <span className="readiness-dot" />
                 <span className="readiness-name">{character.name}</span>
@@ -463,6 +472,11 @@ export function RoomSettings({
                 </span>
                 {level !== 'off' && mcps?.[character.harness] && (
                   <span className="readiness-mcp">MCP {mcpEnabled}</span>
+                )}
+                {level !== 'off' && caps && (
+                  <span className="readiness-caps" title="CLI 能力：工具时间线 / 思考 / token / 会话续传">
+                    {caps}
+                  </span>
                 )}
                 <span className="readiness-detail">
                   {level === 'off'

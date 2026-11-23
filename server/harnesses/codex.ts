@@ -1,7 +1,8 @@
 import { resolveCodex } from './bins.ts'
 import { describeTimeout, idleTimeoutMs, runProcess, turnTimeoutMs } from './process.ts'
+import { beginTool, createTimeline, endTool } from './timeline.ts'
 import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
-import type { ToolTrace, TurnTokens } from '../types.ts'
+import type { TurnTokens } from '../types.ts'
 import { safeJsonParse } from '../util.ts'
 
 /** One work item of a codex turn (agent_message / reasoning / command_execution / ...). */
@@ -105,6 +106,7 @@ export function buildCodexArgs(input: {
 export const codexAdapter: HarnessAdapter = {
   id: 'codex',
   label: 'Codex',
+  capabilities: { thinking: true, tools: 'structured', tokens: true, sessionResume: true },
   resumeArgs: codexResumeArgs,
 
   async run(input: RunInput): Promise<RunOutput> {
@@ -128,8 +130,7 @@ export const codexAdapter: HarnessAdapter = {
     let sessionId: string | undefined
     let tokens: TurnTokens | undefined
     let eventError: string | undefined
-    const tools: ToolTrace[] = []
-    const toolStartedAt = new Map<string, number>()
+    const timeline = createTimeline()
 
     const result = await runProcess(spec.command, args, {
       cwd: input.cwd,
@@ -150,8 +151,7 @@ export const codexAdapter: HarnessAdapter = {
           const item = event.item
           if (item?.type === 'command_execution' && item.command) {
             const key = item.id ?? item.command
-            toolStartedAt.set(key, Date.now())
-            input.emit({ kind: 'tool', text: `运行 ${item.command.slice(0, 80)}` })
+            input.emit(beginTool(timeline, key, 'command', item.command))
           }
           return
         }
@@ -168,21 +168,13 @@ export const codexAdapter: HarnessAdapter = {
           }
           if (item.type === 'reasoning') {
             const text = item.text ?? ''
-            if (text) input.emit({ kind: 'thinking', text: text.slice(0, 400) })
+            if (text) input.emit({ kind: 'thinking', text: text.slice(0, 2_000) })
             return
           }
           if (item.type === 'command_execution') {
-            const name = (item.command ?? 'command').slice(0, 80)
-            const key = item.id ?? name
-            const at = toolStartedAt.get(key)
+            const key = item.id ?? item.command ?? 'command'
             const ok = item.status !== 'failed' && (item.exit_code ?? 0) === 0
-            tools.push({
-              name,
-              ok,
-              durationMs: at ? Date.now() - at : undefined,
-              detail: (item.aggregated_output ?? '').slice(0, 300),
-            })
-            input.emit({ kind: 'tool', text: `${ok ? '完成' : '失败'} ${name}` })
+            input.emit(endTool(timeline, key, 'command', ok, item.aggregated_output))
             return
           }
           if (item.type === 'file_change') {
@@ -190,8 +182,9 @@ export const codexAdapter: HarnessAdapter = {
               .map((change) => change.path ?? '')
               .filter(Boolean)
               .join(', ')
-            tools.push({ name: 'file_change', ok: item.status !== 'failed', detail: paths.slice(0, 300) })
-            input.emit({ kind: 'tool', text: paths ? `修改文件 ${paths.slice(0, 80)}` : '修改文件' })
+            const id = `file_change:${item.id ?? paths}`
+            input.emit(beginTool(timeline, id, 'file_change', paths))
+            input.emit(endTool(timeline, id, 'file_change', item.status !== 'failed', paths))
             return
           }
           if (item.type === 'mcp_tool_call') {
@@ -200,25 +193,32 @@ export const codexAdapter: HarnessAdapter = {
             const detailSource =
               item.error ??
               (typeof item.result === 'string' ? item.result : item.result ? JSON.stringify(item.result) : '')
-            tools.push({ name, ok: !failed, detail: detailSource.slice(0, 300) })
-            input.emit({ kind: 'tool', text: `${failed ? '失败' : '完成'} ${name}` })
+            const id = `mcp:${item.id ?? name}`
+            input.emit(beginTool(timeline, id, name))
+            input.emit(endTool(timeline, id, name, !failed, detailSource))
             return
           }
           if (item.type === 'web_search') {
             const query = item.query ?? ''
-            tools.push({ name: 'web_search', ok: true, detail: query.slice(0, 300) })
-            input.emit({ kind: 'tool', text: query ? `搜索 ${query.slice(0, 60)}` : '联网搜索' })
+            const id = `web_search:${item.id ?? query}`
+            input.emit(beginTool(timeline, id, 'web_search', query))
+            input.emit(endTool(timeline, id, 'web_search', true, query))
             return
           }
           return
         }
         if (type === 'turn.completed') {
           if (event.usage) {
+            // OpenAI input_tokens already includes cached tokens; cache fields
+            // are subsets. Normalize here so TurnTokens has one meaning.
+            const input = event.usage.input_tokens ?? 0
+            const output = event.usage.output_tokens ?? 0
             tokens = {
-              input: event.usage.input_tokens,
-              output: event.usage.output_tokens,
+              input,
+              output,
               cacheRead: event.usage.cached_input_tokens,
               cacheWrite: event.usage.cache_write_input_tokens,
+              total: input + output,
             }
           }
           return
@@ -252,7 +252,8 @@ export const codexAdapter: HarnessAdapter = {
       sessionId,
       pid: result.pid,
       tokens,
-      toolTraces: tools,
+      toolTraces: timeline.tools,
+      events: timeline.events,
       exitCode: result.code ?? -1,
       durationMs: Date.now() - started,
       error: error || undefined,

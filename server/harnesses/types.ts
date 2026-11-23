@@ -1,8 +1,33 @@
-import type { Character, HarnessKind, Room, ToolTrace, TurnTokens } from '../types.ts'
+import type {
+  AdapterCapabilities,
+  Character,
+  CliEvent,
+  HarnessKind,
+  Room,
+  ToolTrace,
+  TurnTokens,
+} from '../types.ts'
 
+/**
+ * B13 unified event: every adapter maps its raw stream into this shape. The
+ * legacy `text` field is still the display line, so old clients/tests keep
+ * working; the structured fields let the CLI timeline pair use/result.
+ */
 export interface AdapterEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'status'
+  kind: 'text' | 'thinking' | 'tool' | 'status' | 'session' | 'usage'
   text: string
+  /** Structured tool events (kind='tool'). */
+  phase?: 'use' | 'result'
+  toolId?: string
+  toolName?: string
+  toolInput?: string
+  toolOk?: boolean
+  toolOutput?: string
+  toolDurationMs?: number
+  /** Structured session/usage events. */
+  sessionId?: string
+  tokens?: TurnTokens
+  at?: number
 }
 
 export interface RunInput {
@@ -39,6 +64,8 @@ export interface RunOutput {
   text: string
   thinking?: string
   toolTraces?: ToolTrace[]
+  /** B13: ordered tool timeline (use/result) for the unified CLI view. */
+  events?: CliEvent[]
   sessionId?: string
   /** Pid of the CLI process that served this turn. */
   pid?: number
@@ -81,6 +108,8 @@ export interface RunOutput {
 export interface HarnessAdapter {
   id: HarnessKind
   label: string
+  /** What this CLI can report; the readiness panel surfaces it. */
+  capabilities: AdapterCapabilities
   run(input: RunInput): Promise<RunOutput>
   /**
    * Session continuity (P0-1): the argv fragment that resumes a prior CLI

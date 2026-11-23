@@ -2,8 +2,9 @@ import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { MENTION_HREF_PREFIX, markdownRemarkPlugins, mentionTokenFromHref } from '../lib/markdown'
 import { resolveMention } from '../lib/mentions'
-import type { Character, Message } from '../types'
+import type { Character, CliEvent, Message } from '../types'
 import { Avatar } from './Avatar'
+import { CliTimeline } from './CliTimeline'
 import { HARNESS_META, clock, formatDuration, modelShort, readableTextColor, tokenSummary } from '../lib/format'
 
 export interface LiveTurn {
@@ -12,6 +13,8 @@ export interface LiveTurn {
   text: string
   thinking: string[]
   tools: string[]
+  /** B13 structured tool timeline; replay snapshots may omit it. */
+  events?: CliEvent[]
   startedAt: number
   /** Pid of the CLI process running this turn, once announced. */
   pid?: number
@@ -149,14 +152,18 @@ export function MessageList({
                 )}
               </div>
 
-              {live.tools.length > 0 && (
-                <div className="live-tools">
-                  {live.tools.slice(-4).map((tool, index) => (
-                    <div className="tool-line" key={`${tool}-${index}`}>
-                      ⚙ {tool}
-                    </div>
-                  ))}
-                </div>
+              {live.events && live.events.length > 0 ? (
+                <CliTimeline events={live.events.slice(-8)} compact />
+              ) : (
+                live.tools.length > 0 && (
+                  <div className="live-tools">
+                    {live.tools.slice(-4).map((tool, index) => (
+                      <div className="tool-line" key={`${tool}-${index}`}>
+                        ⚙ {tool}
+                      </div>
+                    ))}
+                  </div>
+                )
               )}
 
               {live.text ? (
@@ -243,7 +250,9 @@ function MessageRow({
   const color = message.color || harnessMeta?.color || '#8b76f6'
   const duration = formatDuration(meta?.durationMs)
   const tokens = tokenSummary(meta)
-  const hasDetail = Boolean(meta?.thinking || (meta?.tools && meta.tools.length > 0))
+  const hasDetail = Boolean(
+    meta?.thinking || (meta?.tools && meta.tools.length > 0) || (meta?.events && meta.events.length > 0),
+  )
 
   return (
     <div className="msg msg-character" id={`msg-${message.id}`}>
@@ -349,15 +358,8 @@ function MessageRow({
           </details>
         )}
 
-        {showThinking && meta?.tools && meta.tools.length > 0 && (
-          <div className="tool-traces">
-            {meta.tools.map((tool, index) => (
-              <div className="tool-line" key={`${tool.name}-${index}`}>
-                {tool.ok ? '✓' : '×'} {tool.name}
-                {tool.durationMs ? ` · ${formatDuration(tool.durationMs)}` : ''}
-              </div>
-            ))}
-          </div>
+        {showThinking && (meta?.events?.length || (meta?.tools && meta.tools.length > 0)) && (
+          <CliTimeline events={meta?.events} tools={meta?.tools} />
         )}
       </div>
     </div>

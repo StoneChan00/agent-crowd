@@ -25,6 +25,7 @@
 - **B11 轮次报告**：自动提交成功时把 hash 写入 `round_checks(kind=commit)`；新增轮次报告接口，聚合回合、改动、交付、token、review/verify/commit 证据，并可按 hash 只读渲染 `git show --stat --patch`，前端可展开 diff、导出 markdown。
 - **B11 盲审**：prompt 层提供 `blind` 模式（隐藏聊天记录、记忆、交接和技能）。房间开启「改动后自动盲审」时，有改动的回合会自动把指定 reviewer 排进**同一轮**，只注入原始需求 + 当前未提交 diff，其 VERDICT 直接参与收尾门禁和自动提交；轮次报告里另提供对已提交轮次的事后盲审。
 - **B12 重启自愈**：运行中的回合每 2 秒把已流出的文本 checkpoint 到 `turns.output`；重启后 `startupRecovery` 仍然把 running 标成 error，但启动后对有部分产出的中断回合自动排一次续跑（`restart_recovery=1`）：先把部分输出作为带标记的聊天消息放回上下文，再让同一角色带着「从中断处继续」的 override 重跑。零产出、总结回合、同房间还有排队回合时跳过；续跑回合再次被中断也不会二次自动恢复（防循环）。
+- **B13 统一 CLI 事件**：`AdapterEvent` 扩展为带结构字段的事件（phase/toolId/toolName/toolInput/toolOk/toolOutput/toolDurationMs），每个适配器通过共享 `timeline.ts` 记录 `CliEvent[]`；`RunOutput.events` 随消息落库，SSE delta 也带上结构化字段。前端新增 `buildCliRows` + `CliTimeline`，按 id 配对 use/result，旧消息回退到 `tools`。每个 adapter 增加 `capabilities`（thinking/tools/tokens/sessionResume）并在就绪面板展示；Claude/Codex 的 token 在适配器边界归一化为总输入（含 cache）。
 
 ## 关键决策
 
@@ -44,7 +45,7 @@
 
 ## 验证
 
-- `npm test` 全绿：sop 147/147、session 127/127、task 53/53、queue 29/29；`lesson-check` 覆盖教训去重/升级/A→B→A、用量聚合、轮次报告；`scenario-check` 覆盖模板、盲审 prompt、worktree 创建/复用/解除、commit diff；`collision-check` 覆盖同目录两房间从不并发、B 排队后自动继续；`blind-check` 覆盖自动盲审进入同一轮、BLIND-OK、门禁放行、自动提交与报告证据；`restart-recovery-check` 覆盖硬杀后的部分输出 checkpoint、自动续跑、原回合 error 与续跑回合完成。
+- `npm test` 全绿：sop 147/147、session 127/127、task 53/53、queue 29/29；`lesson-check` 覆盖教训去重/升级/A→B→A、用量聚合、轮次报告；`scenario-check` 覆盖模板、盲审 prompt、worktree 创建/复用/解除、commit diff；`collision-check` 覆盖同目录两房间从不并发、B 排队后自动继续；`blind-check` 覆盖自动盲审进入同一轮、BLIND-OK、门禁放行、自动提交与报告证据；`restart-recovery-check` 覆盖硬杀后的部分输出 checkpoint、自动续跑、原回合 error 与续跑回合完成；`cli-events-check` 覆盖结构化工具事件从 adapter 到 message.meta.events 的落库；`scenario-check` 覆盖时间线配对与旧 tools 回退。
 - `npm run typecheck`、`npm run build` 通过。
 - 临时仓库 + 临时端口实测模板添加、隔离创建/解除、轮次报告接口。
 - 未做浏览器端 E2E；状态面板、来源跳转、diff 展开、导出按钮只过了构建与接口验证。
@@ -56,6 +57,7 @@
 - 事后盲审（轮次报告按钮）仍是咨询性质，不回滚已收尾轮次；真正的门禁结论来自轮前自动盲审。
 - `blind` 标记只在内存队列里；服务器在盲审排队期间重启，该回合会退化成普通回合（override 仍在，但会重新带上聊天记录）。
 - 重启自愈只续跑有部分文本产出的在飞回合，零产出/总结/有排队回合的房间不续跑；续跑是全新 CLI 会话（完整重放 + 部分输出），不是恢复被杀会话。`AC_RESTART_RECOVERY=0` 可关闭。
+- B13 只能展示 CLI 真正上报的数据：DSH 没有结构化工具流和 token，custom 只有 stdout/stderr；能力标记只是把差异说清楚，不补造事件。
 - 仓库级共享记忆未做；同一仓库的多个房间目前只共享执行锁，不共享事实。
 - 没有鉴权：`AC_HOST=0.0.0.0` 时整个 API（含文件端点）对局域网可读，仍只适合本机/可信网络。
 

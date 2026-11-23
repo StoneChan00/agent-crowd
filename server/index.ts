@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as db from './db.ts'
 import { broadcast, send, subscribe } from './events.ts'
-import { cachedModels, listAdapters, listModels } from './harnesses/index.ts'
+import { cachedModels, getAdapter, listAdapters, listModels } from './harnesses/index.ts'
 import {
   resolveCannbot,
   resolveClaude,
@@ -225,19 +225,21 @@ function harnessInfo() {
   const hermes = resolveHermes()
   const claude = resolveClaude()
   const codex = resolveCodex()
+  const info = (kind: HarnessKind, available: boolean, detail: string | null) => ({
+    label: HARNESS_LABELS[kind],
+    available,
+    detail,
+    capabilities: getAdapter(kind).capabilities,
+  })
   return {
-    opencode: { label: HARNESS_LABELS.opencode, available: Boolean(opencode), detail: opencode?.source ?? null },
-    cannbot: { label: HARNESS_LABELS.cannbot, available: Boolean(cannbot), detail: cannbot?.source ?? null },
-    dsh: {
-      label: HARNESS_LABELS.dsh,
-      available: Boolean(dsh),
-      detail: dsh ? `${dsh.source} · DeepSeek 凭据：${credentialLabel()}` : null,
-    },
-    hermes: { label: HARNESS_LABELS.hermes, available: Boolean(hermes), detail: hermes?.source ?? null },
-    claude: { label: HARNESS_LABELS.claude, available: Boolean(claude), detail: claude?.source ?? null },
-    codex: { label: HARNESS_LABELS.codex, available: Boolean(codex), detail: codex?.source ?? null },
-    mock: { label: HARNESS_LABELS.mock, available: true, detail: 'built-in' },
-    custom: { label: HARNESS_LABELS.custom, available: true, detail: 'cmd.exe' },
+    opencode: info('opencode', Boolean(opencode), opencode?.source ?? null),
+    cannbot: info('cannbot', Boolean(cannbot), cannbot?.source ?? null),
+    dsh: info('dsh', Boolean(dsh), dsh ? `${dsh.source} · DeepSeek 凭据：${credentialLabel()}` : null),
+    hermes: info('hermes', Boolean(hermes), hermes?.source ?? null),
+    claude: info('claude', Boolean(claude), claude?.source ?? null),
+    codex: info('codex', Boolean(codex), codex?.source ?? null),
+    mock: info('mock', true, 'built-in'),
+    custom: info('custom', true, 'cmd.exe'),
   }
 }
 

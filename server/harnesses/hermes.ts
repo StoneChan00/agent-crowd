@@ -3,8 +3,9 @@ import { join } from 'node:path'
 import { resolveHermes } from './bins.ts'
 import { describeTimeout, idleTimeoutMs, runProcess, turnTimeoutMs } from './process.ts'
 import { runtimeDir } from '../paths.ts'
+import { beginTool, createTimeline, endTool } from './timeline.ts'
 import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
-import type { ToolTrace, TurnTokens } from '../types.ts'
+import type { TurnTokens } from '../types.ts'
 import { safeJsonParse } from '../util.ts'
 
 interface HermesEvent {
@@ -34,6 +35,7 @@ const HERMES_MODELS = ['deepseek-flash', 'deepseek/deepseek-flash', 'deepseek/de
 export const hermesAdapter: HarnessAdapter = {
   id: 'hermes',
   label: 'Hermes',
+  capabilities: { thinking: false, tools: 'structured', tokens: true, sessionResume: false },
 
   async run(input: RunInput): Promise<RunOutput> {
     const spec = resolveHermes()
@@ -68,8 +70,7 @@ export const hermesAdapter: HarnessAdapter = {
     let sessionId: string | undefined
     let tokens: TurnTokens | undefined
     let eventError: string | undefined
-    const tools: ToolTrace[] = []
-    const toolStarted = new Map<string, { name: string; at: number }>()
+    const timeline = createTimeline()
 
     const result = await runProcess(spec.command, args, {
       cwd: input.cwd,
@@ -101,31 +102,26 @@ export const hermesAdapter: HarnessAdapter = {
         if (type === 'tool_use') {
           const name = event.name ?? 'tool'
           const key = event.tool_call_id ?? name
-          toolStarted.set(key, { name, at: Date.now() })
-          input.emit({ kind: 'tool', text: `调用 ${name}` })
+          const inputText =
+            typeof event.input === 'string' ? event.input : event.input ? JSON.stringify(event.input) : undefined
+          input.emit(beginTool(timeline, key, name, inputText))
           return
         }
         if (type === 'tool_result') {
           const name = event.name ?? 'tool'
           const key = event.tool_call_id ?? name
-          const startedAt = toolStarted.get(key)
-          tools.push({
-            name,
-            ok: !event.is_error,
-            durationMs: event.duration_ms ?? (startedAt ? Date.now() - startedAt.at : undefined),
-            detail: event.output?.slice(0, 300),
-          })
-          input.emit({ kind: 'tool', text: `${event.is_error ? '失败' : '完成'} ${name}` })
+          input.emit(endTool(timeline, key, name, !event.is_error, event.output, event.duration_ms))
           return
         }
         if (type === 'result') {
           if (event.session_id) sessionId = event.session_id
           if (typeof event.text === 'string' && event.text.trim()) finalText = event.text
           if (event.tokens) {
+            // Hermes reports its own total; cache fields are passed through.
             tokens = {
               input: event.tokens.input,
               output: event.tokens.output,
-              total: event.tokens.total,
+              total: event.tokens.total ?? (event.tokens.input ?? 0) + (event.tokens.output ?? 0),
               cacheRead: event.tokens.cache_read,
               cacheWrite: event.tokens.cache_write,
             }
@@ -155,7 +151,8 @@ export const hermesAdapter: HarnessAdapter = {
       sessionId,
       pid: result.pid,
       tokens,
-      toolTraces: tools,
+      toolTraces: timeline.tools,
+      events: timeline.events,
       exitCode: result.code ?? -1,
       durationMs: Date.now() - started,
       error: error || undefined,

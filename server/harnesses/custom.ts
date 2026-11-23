@@ -9,6 +9,8 @@ import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
 export const customAdapter: HarnessAdapter = {
   id: 'custom',
   label: '自定义命令',
+  // Raw stdout/stderr only: no structured tools, usage or session id.
+  capabilities: { thinking: true, tools: 'none', tokens: false, sessionResume: false },
 
   async run(input: RunInput): Promise<RunOutput> {
     const template = input.character.commandTemplate.trim()

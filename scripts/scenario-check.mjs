@@ -115,6 +115,37 @@ check(
   )
 }
 
+// --- S1c: unified CLI timeline -------------------------------------------
+{
+  const { buildCliRows } = await import('../server/cli-timeline.ts')
+  const rows = buildCliRows(
+    [
+      { kind: 'tool_use', id: 't1', name: 'Read', input: 'a.ts', at: 1 },
+      { kind: 'tool_result', id: 't1', name: 'Read', ok: true, output: 'file body', durationMs: 120, at: 2 },
+      { kind: 'tool_use', id: 't2', name: 'Bash', input: 'npm test', at: 3 },
+    ],
+    undefined,
+  )
+  check(
+    'S1c 工具时间线按 id 配对 use/result',
+    rows.length === 2 &&
+      rows[0].name === 'Read' &&
+      rows[0].ok &&
+      rows[0].output === 'file body' &&
+      rows[0].durationMs === 120 &&
+      rows[1].running,
+    JSON.stringify(rows),
+  )
+  const legacy = buildCliRows(undefined, [
+    { id: 'x', name: 'Grep', ok: false, detail: 'no match', durationMs: 5, input: 'needle' },
+  ])
+  check(
+    'S1c 旧消息从 tools 回退渲染',
+    legacy.length === 1 && legacy[0].name === 'Grep' && !legacy[0].ok && legacy[0].input === 'needle',
+    JSON.stringify(legacy),
+  )
+}
+
 // --- S2: worktrees --------------------------------------------------------
 const root = mkdtempSync(join(tmpdir(), 'ac-scenario-'))
 const repo = join(root, 'repo')

@@ -3101,3 +3101,107 @@ select {
 .check-row input {
   accent-color: var(--accent);
 }
+
+/* --------------------------------------------------- CLI timeline (B13) */
+
+.cli-timeline {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11.5px;
+}
+
+.cli-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  line-height: 1.5;
+}
+
+.cli-status {
+  flex: none;
+  width: 12px;
+  font-family: var(--mono);
+  color: var(--text-faint);
+}
+
+.cli-row.is-ok .cli-status {
+  color: var(--green);
+}
+.cli-row.is-fail .cli-status {
+  color: var(--red);
+}
+.cli-row.is-running .cli-status {
+  color: var(--accent-2);
+}
+
+.cli-name {
+  flex: none;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.cli-input {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.cli-duration {
+  flex: none;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.cli-output {
+  flex-basis: 100%;
+  margin-left: 18px;
+}
+
+.cli-output summary {
+  cursor: pointer;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.cli-output pre {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.cli-timeline.is-compact {
+  padding: 4px 8px;
+  margin-top: 6px;
+  font-size: 10.5px;
+}
+
+.readiness-caps {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  white-space: nowrap;
+}

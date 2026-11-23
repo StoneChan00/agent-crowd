@@ -5,7 +5,7 @@ import { dshHome, resolveDsh } from './bins.ts'
 import { describeTimeout, idleTimeoutMs, runProcess, turnTimeoutMs, type ProcessResult } from './process.ts'
 import { runtimeDir } from '../paths.ts'
 import type { HarnessAdapter, RunInput, RunOutput } from './types.ts'
-import type { Character, ToolTrace } from '../types.ts'
+import type { Character } from '../types.ts'
 
 const DSH_MODELS = ['deepseek-flash', 'deepseek-v4-pro']
 
@@ -178,7 +178,6 @@ interface Attempt {
   result: ProcessResult
   text: string
   thinking: string
-  toolTraces: ToolTrace[]
 }
 
 async function attemptRun(
@@ -189,7 +188,6 @@ async function attemptRun(
 ): Promise<Attempt> {
   let stdoutText = ''
   let thinking = ''
-  const toolTraces: ToolTrace[] = []
 
   const result = await runProcess(
     spec.command,
@@ -223,7 +221,7 @@ async function attemptRun(
     },
   )
 
-  return { result, text: stdoutText.trim(), thinking: thinking.trim(), toolTraces }
+  return { result, text: stdoutText.trim(), thinking: thinking.trim() }
 }
 
 /**
@@ -233,6 +231,9 @@ async function attemptRun(
 export const dshAdapter: HarnessAdapter = {
   id: 'dsh',
   label: 'DeepSeek Harness',
+  // DSH headless prints plain stdout + log-style stderr; it exposes no
+  // structured tool stream or usage, so the UI must not pretend it does.
+  capabilities: { thinking: true, tools: 'none', tokens: false, sessionResume: false },
 
   async run(input: RunInput): Promise<RunOutput> {
     const spec = resolveDsh()
@@ -257,7 +258,7 @@ export const dshAdapter: HarnessAdapter = {
       if (retryKey) attempt = await attemptRun(spec, runtime, input, retryKey)
     }
 
-    const { result, text, thinking, toolTraces } = attempt
+    const { result, text, thinking } = attempt
     const stderrTail = result.stderr.trim().slice(-4000)
     let error =
       result.spawnError ||
@@ -275,7 +276,6 @@ export const dshAdapter: HarnessAdapter = {
     return {
       text,
       thinking: thinking || undefined,
-      toolTraces,
       pid: result.pid,
       exitCode: result.code ?? -1,
       durationMs: Date.now() - started,
