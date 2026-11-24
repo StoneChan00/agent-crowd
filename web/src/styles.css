@@ -2100,6 +2100,16 @@ select {
 
 /* --------------------------------------------------------- responsive */
 
+/* Desktop: the panel is a docked column, the header toggle already owns
+   visibility — hide the in-panel collapse to avoid two controls for one
+   job. MUST stay ABOVE the max-width block: media queries add no
+   specificity, so a same-specificity rule written after this one would
+   override the mobile un-hide below (the exact cascade bug the 09:11
+   review caught). */
+.panel-collapse {
+  display: none;
+}
+
 @media (max-width: 1220px) {
   .app {
     grid-template-columns: 232px minmax(0, 1fr);
@@ -2122,6 +2132,14 @@ select {
   }
   .panel-toggle {
     display: block;
+  }
+  /* The fixed drawer covers the header's toggle, so the collapse control
+     lives INSIDE the panel — without it a phone user is trapped once the
+     drawer opens (user report 11-24). This rule is written AFTER the global
+     .panel-collapse{display:none} above on purpose: same specificity, source
+     order wins inside the breakpoint. */
+  .panel-collapse {
+    display: inline-flex;
   }
 }
 

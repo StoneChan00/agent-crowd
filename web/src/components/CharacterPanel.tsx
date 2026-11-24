@@ -19,6 +19,12 @@ interface CharacterPanelProps {
   activeCharacterId: string | null
   onAdd: () => void
   onPickFromLibrary: () => void
+  /**
+   * Collapse the panel back off-screen. On phones the panel is a fixed
+   * overlay covering the header's toggle button, so without an in-panel
+   * collapse control the drawer traps the user once opened.
+   */
+  onCollapse: () => void
   onEdit: (character: Character) => void
   onRun: (character: Character) => void
   onToggle: (character: Character, enabled: boolean) => void
@@ -34,6 +40,7 @@ export function CharacterPanel({
   activeCharacterId,
   onAdd,
   onPickFromLibrary,
+  onCollapse,
   onEdit,
   onRun,
   onToggle,
@@ -55,6 +62,9 @@ export function CharacterPanel({
           <p>每个角色 = 一个 harness + 一个模型 + 一段人设</p>
         </div>
         <div className="panel-head-actions">
+          <button className="btn btn-ghost btn-sm panel-collapse" onClick={onCollapse} title="收起面板" aria-label="收起面板">
+            ✕
+          </button>
           <button className="btn btn-ghost btn-sm" onClick={onPickFromLibrary} title="从角色库批量添加">
             角色库
           </button>
