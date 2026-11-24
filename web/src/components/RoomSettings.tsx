@@ -83,6 +83,7 @@ interface RoomSettingsProps {
     verifyCommand: string
     reviewerCharacterId: string | null
     blindReview: boolean
+    defaultResponderId: string | null
   }) => Promise<void>
   onIsolate: () => Promise<void>
   onUnisolate: () => Promise<void>
@@ -119,6 +120,8 @@ export function RoomSettings({
   const [reviewerCharacterId, setReviewerCharacterId] = useState(room?.reviewerCharacterId ?? '')
   /** B11: auto-queue the designated reviewer with request + diff only. */
   const [blindReview, setBlindReview] = useState(room?.blindReview ?? false)
+  /** B14: who answers a user message that mentions nobody. */
+  const [defaultResponderId, setDefaultResponderId] = useState(room?.defaultResponderId ?? '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   /** Team memory (room scope): shared context every member sees in their prompt. */
@@ -238,6 +241,7 @@ export function RoomSettings({
         verifyCommand: verifyCommand.trim(),
         reviewerCharacterId: reviewerCharacterId || null,
         blindReview,
+        defaultResponderId: defaultResponderId || null,
       })
       onClose()
     } catch (saveError) {
@@ -259,6 +263,18 @@ export function RoomSettings({
             sameDir(other.workingDir, room.workingDir),
         )
       : []
+
+  // B14: a role-tagged reviewer can stand in when no one is explicitly designated.
+  const reviewerPoolAvailable = characters.some(
+    (character) => character.enabled && character.roles.includes('reviewer') && !character.triggers.onRoundEnd,
+  )
+  const designatedReviewer = reviewerCharacterId
+    ? characters.find((character) => character.id === reviewerCharacterId)
+    : undefined
+  const designatedUsable = Boolean(designatedReviewer?.enabled && !designatedReviewer.triggers.onRoundEnd)
+  // B15: an existing blind config whose reviewer went stale must still be
+  // closable — otherwise the checkbox stays on+disabled and every save 400s.
+  const blindConfigBroken = blindReview && !designatedUsable && !reviewerPoolAvailable
 
   const readiness = characters.map((character) => ({
     character,
@@ -384,6 +400,22 @@ export function RoomSettings({
         />
         <span className="field-hint">角色之间最多接力多少层；你和 @ 点名（含 @all）唤起的角色都算第 1 层，不计入上限。</span>
       </div>
+      {room && characters.length > 0 && (
+        <div className="field">
+          <label>默认响应者（没人被 @ 时）</label>
+          <select className="input" value={defaultResponderId} onChange={(event) => setDefaultResponderId(event.target.value)}>
+            <option value="">第一个启用角色（默认）</option>
+            {characters.map((character) => (
+              <option key={character.id} value={character.id} disabled={!character.enabled}>
+                {character.name}（{character.harness}）{character.enabled ? '' : ' — 已停用'}
+              </option>
+            ))}
+          </select>
+          <span className="field-hint">
+            用户消息没人被 @ 时由谁接手。指定的角色停用或被删除时，会回退到第一个启用角色。@名字 / @别名 仍然优先。
+          </span>
+        </div>
+      )}
       <div className="field">
         <label>验证命令（收尾门禁）</label>
         <input
@@ -439,14 +471,21 @@ export function RoomSettings({
             <input
               type="checkbox"
               checked={blindReview}
-              disabled={!reviewerCharacterId}
+              disabled={!blindReview && !reviewerCharacterId && !reviewerPoolAvailable}
               onChange={(event) => setBlindReview(event.target.checked)}
             />
             改动后自动盲审
           </label>
           <span className="field-hint">
-            开启后，有代码改动的回合会自动把指定 reviewer 排进本轮：它只收到原始需求 + 当前未提交 diff，看不到聊天记录；它的 REVIEW 结论直接参与收尾门禁和自动提交。
+            开启后，有代码改动的回合会自动把 reviewer 排进本轮：优先指定 reviewer；没有指定时从带「审查」标签的角色里选。
+            reviewer 只收到原始需求 + 当前未提交 diff，看不到聊天记录；它的 REVIEW 结论直接参与收尾门禁和自动提交。
+            {!blindReview && !reviewerCharacterId && !reviewerPoolAvailable && '（需要先指定 reviewer，或给一个角色加「审查」标签）'}
           </span>
+          {blindConfigBroken && (
+            <span className="field-hint isolation-warn">
+              ⚠ 当前盲审配置不可用（指定 reviewer 停用/不适合，且没有可用的「审查」角色）。可以取消勾选关闭盲审，或先补一个 reviewer。
+            </span>
+          )}
         </div>
       )}
 

@@ -24,6 +24,7 @@ import {
 } from './harnesses/process.ts'
 import { showCommit } from './gitstate.ts'
 import * as orchestrator from './orchestrator.ts'
+import { pickReviewer } from './reviewers.ts'
 import { mediaFileHandler } from './media.ts'
 import { listMcps } from './mcps.ts'
 import { findRoomTemplate, ROOM_TEMPLATES } from './room-templates.ts'
@@ -31,8 +32,8 @@ import { createIsolationWorktree, removeIsolationWorktree } from './worktree.ts'
 import * as restart from './restart.ts'
 import { DATA_DIR, DEFAULT_WORKSPACE, SKILLS_DIR, WEB_DIST } from './paths.ts'
 import { loadSkills } from './skills.ts'
-import type { Character, HarnessKind, Room, RoundReport, Task, Turn } from './types.ts'
-import { HARNESS_LABELS } from './types.ts'
+import type { Character, CharacterRole, HarnessKind, Room, RoundReport, Task, Turn } from './types.ts'
+import { CHARACTER_ROLES, HARNESS_LABELS } from './types.ts'
 import { truncate } from './util.ts'
 
 const PORT = Number(process.env.AC_PORT ?? process.env.PORT ?? 8787)
@@ -319,7 +320,8 @@ app.post('/api/rooms', (req, res) => {
 })
 
 app.patch('/api/rooms/:id', (req, res) => {
-  const { name, topic, workingDir, maxHops, verifyCommand, reviewerCharacterId, blindReview } = req.body ?? {}
+  const { name, topic, workingDir, maxHops, verifyCommand, reviewerCharacterId, blindReview, defaultResponderId } =
+    req.body ?? {}
   if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
     return fail(res, 400, '房间名不能为空')
   }
@@ -345,15 +347,31 @@ app.patch('/api/rooms/:id', (req, res) => {
   }
   const current = db.getRoom(req.params.id)
   if (!current) return fail(res, 404, '房间不存在')
-  // B11: blind review needs a designated reviewer at save time — otherwise
-  // the round would silently run without the gate's independent verdict.
+  // B14: default responder must be a room member (null clears).
+  if (defaultResponderId !== undefined && defaultResponderId !== null) {
+    if (typeof defaultResponderId !== 'string' || !defaultResponderId) {
+      return fail(res, 400, '默认响应者必须是本房间的角色，或传 null 取消')
+    }
+    const responder = db.getCharacter(defaultResponderId)
+    if (!responder || responder.roomId !== req.params.id) {
+      return fail(res, 400, '默认响应者必须是本房间的角色')
+    }
+  }
+  // B11/B14/B15: explicitly ENABLING blind review needs an eligible reviewer
+  // (designation or role pool). Turning it OFF and clearing the reviewer in
+  // one PATCH is allowed — otherwise a room whose pool went stale would be
+  // unable to save any setting (the checkbox was on, no way to close it).
+  // Leaving an existing (now invalid) config untouched is also allowed; the
+  // runtime warns and skips blind review rather than deadlocking settings.
   const nextReviewerId =
     reviewerCharacterId === undefined ? current.reviewerCharacterId : reviewerCharacterId || null
   if (blindReview === true && !nextReviewerId) {
-    return fail(res, 400, '开启盲审前必须先指定 reviewer')
-  }
-  if (blindReview !== true && current.blindReview && reviewerCharacterId === null) {
-    return fail(res, 400, '请先关闭盲审，再清除 reviewer')
+    const hasPool = db
+      .listCharacters(current.id)
+      .some((character) => character.enabled && character.roles.includes('reviewer') && !character.triggers.onRoundEnd)
+    if (!hasPool) {
+      return fail(res, 400, '开启盲审前必须先指定 reviewer，或给至少一个角色加上「审查」角色标签')
+    }
   }
   const room = db.updateRoom(req.params.id, {
     ...(typeof name === 'string' ? { name: name.trim() } : {}),
@@ -363,6 +381,7 @@ app.patch('/api/rooms/:id', (req, res) => {
     ...(verifyCommand !== undefined ? { verifyCommand: normalizeVerifyCommand(verifyCommand) } : {}),
     ...(reviewerCharacterId !== undefined ? { reviewerCharacterId: reviewerCharacterId || null } : {}),
     ...(blindReview !== undefined ? { blindReview: blindReview === true } : {}),
+    ...(defaultResponderId !== undefined ? { defaultResponderId: defaultResponderId || null } : {}),
   })
   if (!room) return fail(res, 404, '房间不存在')
   // Other tabs of the same room only hear about settings changes via SSE.
@@ -528,17 +547,12 @@ app.post('/api/rooms/:id/rounds/:roundId/blind-review', asyncRoute(async (req, r
   if (!report.commitHash) return fail(res, 409, '这一轮没有自动提交，没有 diff 可供盲审')
 
   const author = report.authorCharacterId ? db.getCharacter(report.authorCharacterId) : undefined
-  const eligible = db
-    .listCharacters(room.id)
-    .filter(
-      (character) =>
-        character.enabled &&
-        !character.triggers.onRoundEnd &&
-        character.id !== report.authorCharacterId &&
-        character.harness !== author?.harness,
-    )
-  const designated = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
-  const reviewer = designated && eligible.some((item) => item.id === designated.id) ? designated : eligible[0]
+  const choice = pickReviewer({
+    characters: db.listCharacters(room.id),
+    designatedId: room.reviewerCharacterId,
+    author: author ? { id: author.id, harness: author.harness } : null,
+  })
+  const reviewer = choice.reviewer
   if (!reviewer) return fail(res, 400, '没有可用的独立 reviewer（需要启用、非总结角色、且与实现者不同 harness）')
 
   const shown = await showCommit(room.workingDir, report.commitHash)
@@ -929,6 +943,14 @@ app.post('/api/rooms/:id/characters', (req, res) => {
   // B07: a malformed skills payload is a client bug, not a silent "no
   // skills" — dropping it here would wipe a real selection invisibly.
   if (body.skills !== undefined && !Array.isArray(body.skills)) return fail(res, 400, 'skills 必须是字符串数组')
+  // B14: roles follow the same shape rule — a malformed payload must be a
+  // 400, never a silent "no roles" wipe.
+  if (body.roles !== undefined && !Array.isArray(body.roles)) return fail(res, 400, 'roles 必须是字符串数组')
+  const inputRoles = Array.isArray(body.roles)
+    ? body.roles.map((role: unknown) => String(role).trim().toLowerCase())
+    : undefined
+  const unknownRoles = inputRoles?.filter((role: string) => !(CHARACTER_ROLES as readonly string[]).includes(role)) ?? []
+  if (unknownRoles.length > 0) return fail(res, 400, `未知角色标签：${unknownRoles.join('、')}`)
 
   const harness = String(body.harness ?? 'mock') as HarnessKind
   try {
@@ -947,6 +969,7 @@ app.post('/api/rooms/:id/characters', (req, res) => {
       autoApprove: body.autoApprove,
       enabled: body.enabled,
       skills: body.skills !== undefined ? body.skills.map(String) : undefined,
+      roles: inputRoles as CharacterRole[] | undefined,
     })
     res.status(201).json(character)
   } catch (error) {
@@ -1002,6 +1025,12 @@ app.patch('/api/characters/:id', (req, res) => {
   // B07: same shape rule as POST — a non-array skills patch is a 400, never
   // a silent selection wipe.
   if (body.skills !== undefined && !Array.isArray(body.skills)) return fail(res, 400, 'skills 必须是字符串数组')
+  if (body.roles !== undefined && !Array.isArray(body.roles)) return fail(res, 400, 'roles 必须是字符串数组')
+  const inputRoles = Array.isArray(body.roles)
+    ? body.roles.map((role: unknown) => String(role).trim().toLowerCase())
+    : undefined
+  const unknownRoles = inputRoles?.filter((role: string) => !(CHARACTER_ROLES as readonly string[]).includes(role)) ?? []
+  if (unknownRoles.length > 0) return fail(res, 400, `未知角色标签：${unknownRoles.join('、')}`)
   try {
     const character = db.updateCharacter(current.id, {
       ...(body.name !== undefined ? { name: String(body.name) } : {}),
@@ -1017,6 +1046,7 @@ app.patch('/api/characters/:id', (req, res) => {
       ...(body.autoApprove !== undefined ? { autoApprove: Boolean(body.autoApprove) } : {}),
       ...(body.enabled !== undefined ? { enabled: Boolean(body.enabled) } : {}),
       ...(body.skills !== undefined ? { skills: body.skills.map(String) } : {}),
+      ...(inputRoles !== undefined ? { roles: inputRoles as CharacterRole[] } : {}),
     })
     res.json(character)
   } catch (error) {

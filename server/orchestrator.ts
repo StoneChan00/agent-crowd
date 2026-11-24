@@ -11,6 +11,7 @@ import { ALL_MENTION, matchNames, visibleText } from './mentions.ts'
 import { buildTurnPromptDetailed } from './prompt.ts'
 import { episodeDelivery, memoryQueryFromMessages } from './memory.ts'
 import { buildHandoff, type HandoffInput } from './handoff.ts'
+import { isIndependentReviewerVerdict, pickReviewer, resolveRoundReviewer } from './reviewers.ts'
 // Circular with restart.ts (it imports isBusy): safe - both sides only call
 // functions at runtime, never at module top level.
 import { maybeRestartNow } from './restart.ts'
@@ -166,6 +167,12 @@ interface RoundState {
   blindReviewQueued?: boolean
   /** B11: the ineligible-reviewer notice fires at most once per round. */
   blindWarned?: boolean
+  /** B14: reviewer chosen from the role pool when no explicit designation. */
+  blindReviewer?: { id: string; name: string; harness: HarnessKind }
+  /** B15: automatic repair rounds already started for this round. */
+  repairCount: number
+  /** B15: the message that carried the review verdict (repair feedback). */
+  verdictMessageId?: string
   /** Task card this round executes (B03); undefined on ordinary chat rounds. */
   taskId?: string
 }
@@ -249,6 +256,7 @@ function newRoundState(taskId?: string): RoundState {
     verifyState: 'none',
     gateNoticeSent: false,
     lastTurnOutcome: 'ok',
+    repairCount: 0,
     taskId,
   }
 }
@@ -260,6 +268,16 @@ const REPLAY_TEXT_CAP = 200_000
 
 /** Verification command budget (SOP gate, P0-3): a room verify must answer within 5 minutes. */
 const VERIFY_TIMEOUT_MS = 300_000
+
+/**
+ * B15: maximum automatic repair rounds per round after a REVIEW: CHANGES.
+ * 0 disables auto-repair entirely. Default 1 = one fix attempt, then a human
+ * (or a new message) has to decide.
+ */
+function autoRepairLimit(): number {
+  const raw = Number(process.env.AC_AUTO_REPAIR_LIMIT ?? 1)
+  return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 1
+}
 /**
  * Fetch limit for a resumed turn's increment (B01). Beyond it (a pathological
  * flood — >1000 messages between two turns of one character) the fetch
@@ -362,7 +380,12 @@ export function handleUserMessage(room: Room, message: Message): void {
       broadcast(room.id, 'message', { roomId: room.id, message: notice })
       targets = []
     } else {
-      targets = enabled.slice(0, 1)
+      // B14: an explicit default responder owns the no-@ case; a disabled or
+      // deleted designation falls back to the legacy first-enabled rule.
+      const preferred = room.defaultResponderId
+        ? enabled.find((character) => character.id === room.defaultResponderId)
+        : undefined
+      targets = preferred ? [preferred] : enabled.slice(0, 1)
     }
   }
   for (const character of targets) {
@@ -971,7 +994,7 @@ function sendGateNotice(roomId: string, content: string): void {
 function gateBlockNotice(
   reason: GateBlockReason,
   round: RoundState,
-  reviewer: ReturnType<typeof db.getCharacter>,
+  reviewer: { id: string; name: string } | null | undefined,
 ): string {
   const nameOf = (author: GateAuthor | null | undefined): string => {
     if (!author) return '（未知）'
@@ -1214,10 +1237,16 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
     // (deleted character) reads as no designation — the hard rule still holds.
     // B05b-4: a DISABLED or summarizer-only reviewer is kept (not silently
     // cleared) and the gate blocks with an actionable reason instead.
-    const reviewerCharacter = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
-    const reviewerEligible = reviewerCharacter
-      ? reviewerCharacter.enabled && !reviewerCharacter.triggers.onRoundEnd
-      : true
+    // B14/B15: the reviewer for this round is authoritative — re-read its
+    // CURRENT record at gate time (pool snapshots can go stale: disabled,
+    // deleted, or re-harnessed after the review was queued).
+    const resolvedReviewer = resolveRoundReviewer({
+      designatedId: room.reviewerCharacterId,
+      poolReviewer: round.blindReviewer,
+      characters: db.listCharacters(roomId),
+    })
+    const reviewerCharacter = resolvedReviewer.reviewer
+    const reviewerEligible = resolvedReviewer.eligible
     const decision = gateDecision({
       changed: round.changedPaths.length,
       verifyRequired: room.verifyCommand.trim().length > 0,
@@ -1229,6 +1258,52 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
       reviewerEligible,
     })
     if (decision.action === 'block') {
+      // B15: a REVIEW: CHANGES gets ONE automatic repair round for the
+      // implementer. The round stays alive; the repair turn's diff resets
+      // blindReviewQueued so the same reviewer reviews again. At the limit
+      // this falls through to the normal blocked path.
+      const repairLimit = autoRepairLimit()
+      const repairAuthor = round.changedAuthor ? db.getCharacter(round.changedAuthor.id) : undefined
+      if (
+        decision.reason === 'changes' &&
+        // B15: only an independent reviewer's CHANGES may trigger repair —
+        // same character / same harness / a random third party burns a turn
+        // without a trustworthy re-review (and task-check's 返修演练 depends
+        // on the self-review distinction). Blind review must be on because
+        // the promise is "修复后自动重新盲审".
+        room.blindReview &&
+        isIndependentReviewerVerdict({
+          verdictAuthor: round.verdictAuthor,
+          changedAuthor: round.changedAuthor,
+          designatedId: room.reviewerCharacterId,
+          poolReviewerId: round.blindReviewer?.id,
+        }) &&
+        repairLimit > 0 &&
+        round.repairCount < repairLimit &&
+        repairAuthor?.enabled &&
+        rounds.get(roomId) === round
+      ) {
+        round.repairCount += 1
+        round.blindReviewQueued = false
+        round.blindWarned = false
+        const feedbackMessage = round.verdictMessageId ? db.getMessageById(round.verdictMessageId) : undefined
+        const feedback = (feedbackMessage?.content ?? '').trim().slice(0, 2_000)
+        const override = [
+          '系统返修任务：reviewer 最后给出了 REVIEW: CHANGES。',
+          feedback ? `【review 意见】\n${feedback}` : '【review 意见】（未找到原文，请查看最近的群聊记录）',
+          '请根据 review 意见修复本轮改动；不要自行提交，修复后服务器会重新盲审，PASS 后自动提交。',
+        ].join('\n\n')
+        enqueue(roomId, repairAuthor.id, null, 1, override, {
+          allowActive: true,
+          roundId: round.roundId,
+          taskId: round.taskId,
+        })
+        sendGateNotice(
+          roomId,
+          `↩️ 已自动排入返修回合（${round.repairCount}/${repairLimit}）：${repairAuthor.name} 根据 review 意见修复，修复后自动重新盲审。`,
+        )
+        return true
+      }
       if (!round.gateNoticeSent) {
         round.gateNoticeSent = true
         // A block always carries a reason (close/run-verify carry null).
@@ -1240,10 +1315,12 @@ async function maybeStartRoundSummary(roomId: string): Promise<boolean> {
           `🚧 SOP 门禁：${reasonText}改动文件：${round.changedPaths.slice(0, 5).join('、')}${round.changedPaths.length > 5 ? ` 等 ${round.changedPaths.length} 个` : ''}。请继续处理，处理完成后重新给出 review 结论即可收尾。`,
         )
       }
-      // No summary, no re-queue: the next human/character message starts the
-      // next round (deliberate — auto-requeue would gate-loop forever). The
-      // card stays `running` with `result='blocked'` (B03) so the panel
-      // offers a re-dispatch instead of a false done.
+      // A CHANGES verdict already had its one automatic repair attempt above.
+      // At the cap there is no summary and no further re-queue: the next
+      // human/character message starts the next round (auto-requeue here
+      // would gate-loop forever). The card stays `running` with
+      // `result='blocked'` (B03) so the panel offers a re-dispatch instead of
+      // a false done.
       recordFailureLesson(
         roomId,
         round,
@@ -1924,6 +2001,7 @@ async function pump(roomId: string): Promise<void> {
       if (round && round.roundId === item.roundId && !item.isRoundSummary) {
         round.verdict = verdict
         round.verdictAuthor = { id: character.id, harness: character.harness }
+        round.verdictMessageId = message.id
       }
     }
     // Fold this turn's changes into the round's evidence (3a): the gate at
@@ -1959,23 +2037,28 @@ async function pump(roomId: string): Promise<void> {
       changedPaths &&
       changedPaths.length > 0
     ) {
-      const reviewer = room.reviewerCharacterId ? db.getCharacter(room.reviewerCharacterId) : undefined
-      const eligible =
-        reviewer !== undefined &&
-        reviewer.enabled &&
-        !reviewer.triggers.onRoundEnd &&
-        reviewer.id !== character.id &&
-        reviewer.harness !== character.harness
-      if (!eligible) {
+      const choice = pickReviewer({
+        characters: db.listCharacters(roomId),
+        designatedId: room.reviewerCharacterId,
+        author: { id: character.id, harness: character.harness },
+      })
+      if (!choice.reviewer) {
         if (!round.blindWarned) {
           round.blindWarned = true
           sendGateNotice(
             roomId,
-            '⚠️ 已开启盲审，但指定 reviewer 不可用（停用 / 轮末总结角色 / 与实现者同 harness），本轮按原流程处理。',
+            choice.reason === 'designated-ineligible'
+              ? '⚠️ 已开启盲审，但指定 reviewer 不可用（停用 / 轮末总结角色 / 与实现者同 harness），本轮按原流程处理。'
+              : '⚠️ 已开启盲审，但没有符合条件的独立 reviewer（启用、非总结角色、与实现者不同 harness），本轮按原流程处理。',
           )
         }
       } else if (rounds.get(roomId) === round) {
+        const reviewer = choice.reviewer
         round.blindReviewQueued = true
+        // B14: bind the pool-selected reviewer to this round so the gate
+        // checks ITS verdict and harness, not just "someone other than the
+        // implementer".
+        round.blindReviewer = { id: reviewer.id, name: reviewer.name, harness: reviewer.harness }
         const diff = await renderWorktreeDiff(cwd, round.changedPaths, 2_400)
         if (rounds.get(roomId) !== round) return
         const request = [...fetched].reverse().find((entry) => entry.authorType === 'user')?.content?.trim() ?? ''

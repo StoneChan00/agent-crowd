@@ -26,6 +26,8 @@
 - **B11 盲审**：prompt 层提供 `blind` 模式（隐藏聊天记录、记忆、交接和技能）。房间开启「改动后自动盲审」时，有改动的回合会自动把指定 reviewer 排进**同一轮**，只注入原始需求 + 当前未提交 diff，其 VERDICT 直接参与收尾门禁和自动提交；轮次报告里另提供对已提交轮次的事后盲审。
 - **B12 重启自愈**：运行中的回合每 2 秒把已流出的文本 checkpoint 到 `turns.output`；重启后 `startupRecovery` 仍然把 running 标成 error，但启动后对有部分产出的中断回合自动排一次续跑（`restart_recovery=1`）：先把部分输出作为带标记的聊天消息放回上下文，再让同一角色带着「从中断处继续」的 override 重跑。零产出、总结回合、同房间还有排队回合时跳过；续跑回合再次被中断也不会二次自动恢复（防循环）。
 - **B13 统一 CLI 事件**：`AdapterEvent` 扩展为带结构字段的事件（phase/toolId/toolName/toolInput/toolOk/toolOutput/toolDurationMs），每个适配器通过共享 `timeline.ts` 记录 `CliEvent[]`；`RunOutput.events` 随消息落库，SSE delta 也带上结构化字段。前端新增 `buildCliRows` + `CliTimeline`，按 id 配对 use/result，旧消息回退到 `tools`。每个 adapter 增加 `capabilities`（thinking/tools/tokens/sessionResume）并在就绪面板展示；Claude/Codex 的 token 在适配器边界归一化为总输入（含 cache）。
+- **B14 分工配置**：房间增加 `defaultResponderId`（没人被 @ 时谁接手，停用/删除自动回退）；角色增加 `roles`（architect/implementer/reviewer/summarizer/assistant）。新增 `reviewers.ts`：指定 reviewer 优先，否则从带 `reviewer` 标签的角色里选，最后回退到任意合格角色；作者本人、同 harness、轮末总结角色一律排除。自动盲审与事后盲审共用这一套选择；池里选中的 reviewer 会绑定到本轮 `RoundState`，门禁按它校验 verdict 作者和 harness。角色创建/编辑 API 会校验并透传 `roles`，未知标签返回 400；删除角色时同时清空房间的 `default_responder_id` 与 `reviewer_character_id`；角色面板的「用户发言·默认」标记读取房间配置而不是写死第一个启用角色。
+- **B15 自动返修与报告作者修正**：门禁遇到**独立 reviewer** 给出的 `REVIEW: CHANGES` 时，先给最后改动工作区的实现者排一次返修回合（带上 review 原文），并重置盲审排队标记，让返修后的 diff 重新进入盲审；默认上限 1（`AC_AUTO_REPAIR_LIMIT`，0 关闭），到上限后仍按原逻辑拦截。实现者自己的 CHANGES、同 harness 的 CHANGES、以及非本轮选中 reviewer 的第三方 CHANGES 都不触发自动返修（task-check 的返修演练依赖这一点），且只在盲审开启时触发。门禁在收尾时重新读取 reviewer 的当前记录：池 reviewer 被停用/删除 → fail closed，被改 harness → 用新 harness 判断独立性。盲审配置因 reviewer 池失效而不可用时，可以在一次 PATCH 里关闭盲审并清空指定，不再死锁。轮次报告的 `authorCharacterId` 改为“最后一个实际改动工作区的回合”，避免自动盲审后把 reviewer 当成实现者、事后盲审选中实现者自审。
 
 ## 关键决策
 
@@ -45,7 +47,7 @@
 
 ## 验证
 
-- `npm test` 全绿：sop 147/147、session 127/127、task 53/53、queue 29/29；`lesson-check` 覆盖教训去重/升级/A→B→A、用量聚合、轮次报告；`scenario-check` 覆盖模板、盲审 prompt、worktree 创建/复用/解除、commit diff；`collision-check` 覆盖同目录两房间从不并发、B 排队后自动继续；`blind-check` 覆盖自动盲审进入同一轮、BLIND-OK、门禁放行、自动提交与报告证据；`restart-recovery-check` 覆盖硬杀后的部分输出 checkpoint、自动续跑、原回合 error 与续跑回合完成；`cli-events-check` 覆盖结构化工具事件从 adapter 到 message.meta.events 的落库；`scenario-check` 覆盖时间线配对与旧 tools 回退。
+- `npm test` 全绿：sop 147/147、session 127/127、task 53/53、queue 29/29；`lesson-check` 覆盖教训去重/升级/A→B→A、用量聚合、轮次报告；`scenario-check` 覆盖模板、盲审 prompt、worktree 创建/复用/解除、commit diff；`collision-check` 覆盖同目录两房间从不并发、B 排队后自动继续；`blind-check` 覆盖自动盲审进入同一轮、BLIND-OK、门禁放行、自动提交与报告证据；`restart-recovery-check` 覆盖硬杀后的部分输出 checkpoint、自动续跑、原回合 error 与续跑回合完成；`cli-events-check` 覆盖结构化工具事件从 adapter 到 message.meta.events 的落库；`scenario-check` 覆盖时间线配对与旧 tools 回退；`role-check` 覆盖 reviewer 选择、roles 创建/编辑落库、未知标签 400、默认响应者路由；`blind-check` 覆盖角色池选中 reviewer 后的门禁校验；`repair-check` 覆盖 CHANGES → 一次自动返修 → 重新盲审 → PASS 提交，以及上限后的拦截。
 - `npm run typecheck`、`npm run build` 通过。
 - 临时仓库 + 临时端口实测模板添加、隔离创建/解除、轮次报告接口。
 - 未做浏览器端 E2E；状态面板、来源跳转、diff 展开、导出按钮只过了构建与接口验证。
