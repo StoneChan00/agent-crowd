@@ -645,6 +645,7 @@ export default function App() {
           activeCharacterId={activeCharacterId}
           onAdd={() => setEditingCharacter(null)}
           onPickFromLibrary={() => setPickingPresets(true)}
+          onCollapse={() => setPanelOpen(false)}
           onEdit={(character) => setEditingCharacter(character)}
           onRun={runCharacter}
           onToggle={toggleCharacter}
