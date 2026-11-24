@@ -1,6 +1,7 @@
 import { useEffect, useState, type ChangeEvent } from 'react'
 import type { Character, CharacterPreset, HarnessKind, HarnessMap, Memory, Room, SkillInfo, Triggers } from '../types'
 import { api } from '../lib/api'
+import { CHARACTER_ROLE_LABELS, CHARACTER_ROLES, type CharacterRole } from '../../../server/types.ts'
 import { HARNESS_META, HARNESS_ORDER } from '../lib/format'
 import { isImageAvatar } from './Avatar'
 import { AvatarCropper } from './AvatarCropper'
@@ -21,6 +22,8 @@ export interface CharacterDraft {
   triggers: Triggers
   /** B07: checked skill names — room characters only; presets never carry any. */
   skills: string[]
+  /** B14: role tags — room characters only; presets don't store roles yet. */
+  roles: CharacterRole[]
 }
 
 interface CharacterEditorProps {
@@ -75,6 +78,7 @@ function toDraft(character: Character | CharacterPreset | null): CharacterDraft 
     // B07: presets carry no skills (a template stays skill-neutral); the
     // `?? []` also covers a legacy character JSON predating the field.
     skills: character && 'skills' in character ? character.skills ?? [] : [],
+    roles: character && 'roles' in character ? (character as { roles?: CharacterRole[] }).roles ?? [] : [],
     triggers: {
       onUser: character?.triggers.onUser ?? true,
       onAll: character?.triggers.onAll ?? false,
@@ -176,6 +180,10 @@ export function CharacterEditor({
   const toggleSkill = (name: string) => {
     const key = skillKey(name)
     set('skills', draft.skills.includes(key) ? draft.skills.filter((item) => item !== key) : [...draft.skills, key])
+  }
+
+  const toggleRole = (role: CharacterRole) => {
+    set('roles', draft.roles.includes(role) ? draft.roles.filter((item) => item !== role) : [...draft.roles, role])
   }
 
   const suggestions = models[draft.harness] ?? []
@@ -583,6 +591,24 @@ export function CharacterEditor({
           <span className="field-hint">这段文字会作为角色的系统提示注入，写清职责、输出格式和边界。</span>
         </div>
       </section>
+
+      {!isLibrary && (
+        <section className="form-section">
+          <h4>角色标签</h4>
+          <p className="field-hint">
+            只用于分工与 reviewer 池：带「审查」标签的角色会被优先选为盲审 reviewer；总结角色不参与 reviewer。
+          </p>
+          <div className="skill-checks">
+            {CHARACTER_ROLES.map((role) => (
+              <label key={role} className="skill-check">
+                <input type="checkbox" checked={draft.roles.includes(role)} onChange={() => toggleRole(role)} />
+                <span className="skill-name">{CHARACTER_ROLE_LABELS[role]}</span>
+                <span className="skill-desc">{role}</span>
+              </label>
+            ))}
+          </div>
+        </section>
+      )}
 
       {!isLibrary && (
         <section className="form-section">

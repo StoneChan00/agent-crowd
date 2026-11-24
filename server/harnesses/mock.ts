@@ -12,6 +12,9 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
  */
 const mockSessionId = (characterId: string): string => `mock-${characterId.slice(0, 8)}`
 
+/** B15 repair-loop test seam: per-character review attempts. */
+const repairReviewCalls = new Map<string, number>()
+
 /**
  * Mock adapter: no API key, no subprocess. It streams a canned reply so the
  * chat room and the hand-off chain can be exercised offline.
@@ -383,6 +386,24 @@ export const mockAdapter: HarnessAdapter = {
         toolTraces: timeline.tools,
         events: timeline.events,
       }
+    }
+    //   MOCK-返修评审 → first review CHANGES, second PASS (B15 repair loop);
+    //                  MOCK-返修评审不改 keeps returning CHANGES (cap test).
+    if (input.character.persona.includes('MOCK-返修评审')) {
+      const always = input.character.persona.includes('MOCK-返修评审不改')
+      const attempt = (repairReviewCalls.get(input.character.id) ?? 0) + 1
+      repairReviewCalls.set(input.character.id, attempt)
+      const blind =
+        input.prompt.includes('【盲审模式】') &&
+        !input.prompt.includes('【最近的群聊记录】') &&
+        !input.prompt.includes('【房间共享记忆】')
+      const verdict = !always && attempt >= 2 ? 'PASS' : 'CHANGES'
+      const reply = `（mock 模式）第 ${attempt} 次返修评审：${blind ? 'BLIND-OK' : 'BLIND-FAIL'}\nREVIEW: ${verdict}`
+      for (const chunk of reply.match(/[\s\S]{1,12}/g) ?? []) {
+        input.emit({ kind: 'text', text: chunk })
+        await sleep(10)
+      }
+      return { text: reply, exitCode: 0, sessionId: mockSessionId(input.character.id), durationMs: Date.now() - started, tokens: { input: 0, output: reply.length, total: reply.length } }
     }
     //   MOCK-盲审     → BLIND-OK iff the prompt is the blind shape (no chat
     //                  transcript), then a PASS verdict (B11 gate test)

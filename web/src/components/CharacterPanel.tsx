@@ -1,4 +1,4 @@
-import type { Character, CharacterPreset, HarnessMap } from '../types'
+import type { Character, CharacterPreset, HarnessMap, Room } from '../types'
 import { Avatar } from './Avatar'
 import { HARNESS_META, modelShort, triggerSummary } from '../lib/format'
 
@@ -11,6 +11,7 @@ import { HARNESS_META, modelShort, triggerSummary } from '../lib/format'
 const SYNC_COVERAGE = '名字、别名、外观、人设、harness、模型、工作目录、触发规则、命令模板与自动批准'
 
 interface CharacterPanelProps {
+  room: Room | null
   characters: Character[]
   members: Character[]
   presets: CharacterPreset[]
@@ -25,6 +26,7 @@ interface CharacterPanelProps {
 }
 
 export function CharacterPanel({
+  room,
   characters,
   members,
   presets,
@@ -37,9 +39,13 @@ export function CharacterPanel({
   onToggle,
   onSync,
 }: CharacterPanelProps) {
-  // Mirrors the router: with no @mention the first *enabled* character takes
-  // the user message. The badge below makes that fallback visible.
-  const firstEnabledId = characters.find((character) => character.enabled)?.id ?? null
+  // Mirrors the router: the room's configured default responder wins; a
+  // disabled/missing designation falls back to the first enabled character.
+  const configuredResponder = room?.defaultResponderId
+    ? characters.find((character) => character.id === room.defaultResponderId && character.enabled)
+    : undefined
+  const defaultResponderId =
+    configuredResponder?.id ?? characters.find((character) => character.enabled)?.id ?? null
 
   return (
     <aside className="character-panel">
@@ -64,7 +70,7 @@ export function CharacterPanel({
           const available = harnesses[character.harness]?.available ?? true
           const triggers = triggerSummary(character, members)
           const isActive = character.id === activeCharacterId
-          const isDefaultResponder = character.id === firstEnabledId
+          const isDefaultResponder = character.id === defaultResponderId
           // Mirrors the server's sync rule: the linked template (preset_id)
           // wins; otherwise only a *unique* same-name template can be
           // adopted — several presets sharing the name are ambiguous and
@@ -134,7 +140,7 @@ export function CharacterPanel({
                 {isDefaultResponder && (
                   <span
                     className="trigger-chip default-chip"
-                    title="没有 @ 任何人时，用户消息默认由这个（第一个启用的）角色接手回复"
+                    title="没有 @ 任何人时，用户消息由这个角色接手回复；可在房间设置里更换默认响应者"
                   >
                     用户发言·默认
                   </span>

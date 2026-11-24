@@ -493,6 +493,7 @@ export default function App() {
     verifyCommand: string
     reviewerCharacterId: string | null
     blindReview: boolean
+    defaultResponderId: string | null
   }) => {
     if (roomForm === 'create') {
       const created = await api.createRoom({
@@ -638,6 +639,7 @@ export default function App() {
 
       {!libraryMode && (
         <CharacterPanel
+          room={room}
           characters={characters}
           members={characters}
           presets={presets}

@@ -175,6 +175,16 @@ check(
   JSON.stringify(report),
 )
 
+// A reviewer turn after the implementer must not become the report's author.
+const reviewTurn = db.createTurn({ roomId: ROOM, characterId: 'c2', triggerMessageId: null, roundId: 'r-9' })
+db.updateTurn(reviewTurn.id, { status: 'done', output: 'REVIEW: PASS', endedAt: Date.now() })
+const reportAfterReview = db.listRoundReports(ROOM).find((item) => item.roundId === 'r-9')
+check(
+  'L4 报告作者取最后改动者，而不是最后发言的 reviewer',
+  reportAfterReview?.authorCharacterId === 'c1' && reportAfterReview.turnCount === 2,
+  JSON.stringify({ author: reportAfterReview?.authorCharacterId, turns: reportAfterReview?.turnCount }),
+)
+
 // The DB handle keeps the temp dir open on Windows; prompt-check leaves its
 // temp dir in place too, so this script does the same.
 

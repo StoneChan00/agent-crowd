@@ -54,6 +54,17 @@ export const DEFAULT_TRIGGERS: Triggers = {
   onRoundEnd: false,
 }
 
+/** B14: fixed role vocabulary — routing/reviewer selection read these tags. */
+export const CHARACTER_ROLES = ['architect', 'implementer', 'reviewer', 'summarizer', 'assistant'] as const
+export type CharacterRole = (typeof CHARACTER_ROLES)[number]
+export const CHARACTER_ROLE_LABELS: Record<CharacterRole, string> = {
+  architect: '架构/设计',
+  implementer: '实现',
+  reviewer: '审查',
+  summarizer: '总结',
+  assistant: '助理/问答',
+}
+
 export interface Room {
   id: string
   name: string
@@ -84,6 +95,12 @@ export interface Room {
   isolationSource: string
   /** Branch checked out in the isolation worktree (empty when not isolated). */
   isolationBranch: string
+  /**
+   * B14: who answers a user message that mentions nobody. Null = first
+   * enabled character (legacy behavior). A disabled/missing id falls back the
+   * same way.
+   */
+  defaultResponderId: string | null
   /**
    * B11 pre-commit blind review: after a changed turn, automatically queue
    * the designated reviewer with the worktree diff only (no transcript), so
@@ -170,6 +187,8 @@ export interface Character {
    * deliberately carry nothing here (a template stays skill-neutral).
    */
   skills: string[]
+  /** B14: role tags used by routing hints and the reviewer pool. */
+  roles: CharacterRole[]
   createdAt: number
 }
 

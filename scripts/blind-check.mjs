@@ -131,12 +131,15 @@ try {
       harness: 'mock',
       model: 'mock',
       persona: 'MOCK-盲审',
+      roles: ['reviewer'],
       triggers: { onUser: false, mention: true },
     }),
   })
+  // No explicit reviewer designation: the role pool must select this one and
+  // the gate must bind that selection to the round.
   await req(port, `/api/rooms/${room.id}`, {
     method: 'PATCH',
-    body: JSON.stringify({ reviewerCharacterId: reviewer.id, blindReview: true }),
+    body: JSON.stringify({ blindReview: true }),
   })
 
   await req(port, `/api/rooms/${room.id}/messages`, {
@@ -150,7 +153,7 @@ try {
   const blindMessage = messages?.find(
     (message) => message.authorType === 'character' && message.authorName === '盲审员',
   )
-  check('B1 未被 @ 的指定 reviewer 自动进入盲审', Boolean(blindMessage), JSON.stringify(messages?.map((m) => m.authorName)))
+  check('B1 未被 @ 的角色池 reviewer 自动进入盲审', Boolean(blindMessage), JSON.stringify(messages?.map((m) => m.authorName)))
   check(
     'B2 盲审 prompt 只有需求 + diff（BLIND-OK）且给出 PASS',
     Boolean(blindMessage?.content.includes('BLIND-OK')) && Boolean(blindMessage?.content.includes('REVIEW: PASS')),
@@ -173,7 +176,7 @@ try {
   const { rounds } = await req(port, `/api/rooms/${room.id}/rounds`)
   const latest = rounds[0]
   check(
-    'B6 轮次报告记录了 review/commit 证据',
+    'B6 角色池选中的 reviewer 被门禁认可，报告记录 review/commit 证据',
     Boolean(latest?.commitHash) &&
       latest.checks.some((check) => check.kind === 'review' && check.verdict === 'pass') &&
       latest.checks.some((check) => check.kind === 'commit'),

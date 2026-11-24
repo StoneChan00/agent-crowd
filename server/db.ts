@@ -16,7 +16,9 @@ import { DEFAULT_TRIGGERS,
   type AuthorType,
   type Character,
   type CharacterPreset,
+  type CharacterRole,
   type CharacterUsage,
+  CHARACTER_ROLES,
   type HarnessKind,
   type Identity,
   type Memory,
@@ -237,6 +239,8 @@ addColumnIfMissing('rooms', 'verify_command', "verify_command text not null defa
 addColumnIfMissing('rooms', 'isolation_source', "isolation_source text not null default ''")
 addColumnIfMissing('rooms', 'isolation_branch', "isolation_branch text not null default ''")
 addColumnIfMissing('rooms', 'blind_review', 'blind_review integer not null default 0')
+addColumnIfMissing('rooms', 'default_responder_id', 'default_responder_id text')
+addColumnIfMissing('characters', 'roles', "roles text not null default '[]'")
 addColumnIfMissing('turns', 'round_id', 'round_id text')
 addColumnIfMissing('turns', 'changed', 'changed text')
 // Session continuity (P0-1 review): the cursor's same-millisecond tiebreaker.
@@ -360,6 +364,10 @@ function mapRoom(row: Record<string, unknown>): Room {
     isolationSource: String(row.isolation_source ?? ''),
     isolationBranch: String(row.isolation_branch ?? ''),
     blindReview: Number(row.blind_review ?? 0) === 1,
+    defaultResponderId:
+      row.default_responder_id === null || row.default_responder_id === undefined
+        ? null
+        : String(row.default_responder_id),
     createdAt: Number(row.created_at),
   }
 }
@@ -392,6 +400,7 @@ export function createRoom(input: {
     isolationSource: '',
     isolationBranch: '',
     blindReview: false,
+    defaultResponderId: null,
     createdAt: now(),
   }
   db.prepare(
@@ -412,7 +421,17 @@ export function createRoom(input: {
 export function updateRoom(
   id: string,
   patch: Partial<
-    Pick<Room, 'name' | 'topic' | 'workingDir' | 'maxHops' | 'verifyCommand' | 'reviewerCharacterId' | 'blindReview'>
+    Pick<
+      Room,
+      | 'name'
+      | 'topic'
+      | 'workingDir'
+      | 'maxHops'
+      | 'verifyCommand'
+      | 'reviewerCharacterId'
+      | 'blindReview'
+      | 'defaultResponderId'
+    >
   >,
 ): Room | undefined {
   const current = getRoom(id)
@@ -427,9 +446,11 @@ export function updateRoom(
     reviewerCharacterId:
       patch.reviewerCharacterId === undefined ? current.reviewerCharacterId : patch.reviewerCharacterId || null,
     blindReview: patch.blindReview === undefined ? current.blindReview : patch.blindReview,
+    defaultResponderId:
+      patch.defaultResponderId === undefined ? current.defaultResponderId : patch.defaultResponderId || null,
   }
   db.prepare(
-    'update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ?, reviewer_character_id = ?, blind_review = ? where id = ?',
+    'update rooms set name = ?, topic = ?, working_dir = ?, max_hops = ?, verify_command = ?, reviewer_character_id = ?, blind_review = ?, default_responder_id = ? where id = ?',
   ).run(
     next.name,
     next.topic,
@@ -438,6 +459,7 @@ export function updateRoom(
     next.verifyCommand,
     next.reviewerCharacterId,
     next.blindReview ? 1 : 0,
+    next.defaultResponderId,
     id,
   )
   return next
@@ -600,6 +622,42 @@ function normalizeSkills(input: string[] | undefined): string[] {
   return out
 }
 
+const CHARACTER_ROLE_SET = new Set<string>(CHARACTER_ROLES)
+
+function parseRolesColumn(raw: unknown): CharacterRole[] {
+  if (typeof raw !== 'string' || raw.trim() === '') return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(parsed)) return []
+  const seen = new Set<string>()
+  const out: CharacterRole[] = []
+  for (const entry of parsed) {
+    if (typeof entry !== 'string') continue
+    const role = entry.trim().toLowerCase()
+    if (!CHARACTER_ROLE_SET.has(role) || seen.has(role)) continue
+    seen.add(role)
+    out.push(role as CharacterRole)
+  }
+  return out
+}
+
+function normalizeRoles(input: CharacterRole[] | undefined): CharacterRole[] {
+  if (!Array.isArray(input)) return []
+  const seen = new Set<string>()
+  const out: CharacterRole[] = []
+  for (const entry of input) {
+    const role = String(entry).trim().toLowerCase()
+    if (!CHARACTER_ROLE_SET.has(role) || seen.has(role)) continue
+    seen.add(role)
+    out.push(role as CharacterRole)
+  }
+  return out
+}
+
 /** Raised when a character is about to be stored under a call-name the chip grammar can't highlight. */
 export class InvalidCallNameError extends Error {
   constructor(message: string) {
@@ -671,6 +729,7 @@ function mapCharacter(row: Record<string, unknown>): Character {
     identityId: row.identity_id === null || row.identity_id === undefined ? null : String(row.identity_id),
     presetId: row.preset_id === null || row.preset_id === undefined ? null : String(row.preset_id),
     skills: parseSkillsColumn(row.skills),
+    roles: parseRolesColumn(row.roles),
     createdAt: Number(row.created_at),
   }
 }
@@ -712,6 +771,8 @@ export interface CharacterInput {
   presetId?: string | null
   /** B07: checked skill names; absent = leave as-is (update) / none (create). */
   skills?: string[]
+  /** B14: role tags; absent = leave as-is (update) / none (create). */
+  roles?: CharacterRole[]
 }
 
 export function createCharacter(input: CharacterInput): Character {
@@ -735,14 +796,15 @@ export function createCharacter(input: CharacterInput): Character {
     identityId: null,
     presetId: input.presetId ?? null,
     skills: normalizeSkills(input.skills),
+    roles: normalizeRoles(input.roles),
     createdAt: now(),
   }
   // Ambiguous call-names would make @mentions wake the wrong character.
   assertCallNamesFree(input.roomId, null, character.name, character.aliases)
   db.prepare(
     `insert into characters
-       (id, room_id, name, aliases, avatar, color, harness, model, persona, cwd, triggers, command_template, auto_approve, enabled, preset_id, skills, created_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, room_id, name, aliases, avatar, color, harness, model, persona, cwd, triggers, command_template, auto_approve, enabled, preset_id, skills, roles, created_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     character.id,
     character.roomId,
@@ -760,6 +822,7 @@ export function createCharacter(input: CharacterInput): Character {
     character.enabled ? 1 : 0,
     character.presetId,
     JSON.stringify(character.skills),
+    JSON.stringify(character.roles),
     character.createdAt,
   )
   return character
@@ -793,6 +856,7 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
     // "↻ 对齐" refresh routes through here WITHOUT skills, so a re-alignment
     // never silently wipes the room-local selection.
     skills: patch.skills === undefined ? current.skills : normalizeSkills(patch.skills),
+    roles: patch.roles === undefined ? current.roles : normalizeRoles(patch.roles),
   }
   // Only police call-names when they actually change: rooms with legacy
   // duplicate names (created before the check existed) stay editable for
@@ -806,7 +870,7 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
   }
   db.prepare(
     `update characters set name = ?, aliases = ?, avatar = ?, color = ?, harness = ?, model = ?, persona = ?,
-       cwd = ?, triggers = ?, command_template = ?, auto_approve = ?, enabled = ?, skills = ? where id = ?`,
+       cwd = ?, triggers = ?, command_template = ?, auto_approve = ?, enabled = ?, skills = ?, roles = ? where id = ?`,
   ).run(
     next.name,
     JSON.stringify(next.aliases),
@@ -821,6 +885,7 @@ export function updateCharacter(id: string, patch: Partial<CharacterInput>): Cha
     next.autoApprove ? 1 : 0,
     next.enabled ? 1 : 0,
     JSON.stringify(next.skills),
+    JSON.stringify(next.roles),
     id,
   )
 
@@ -862,6 +927,9 @@ export function deleteCharacter(id: string): void {
   // Self-review ban (B05): a stale reviewer id would block the room forever
   // (the PASS author can never match a deleted character) — clear it.
   db.prepare('update rooms set reviewer_character_id = null where reviewer_character_id = ?').run(id)
+  // B14: a stale default responder would make the settings page PATCH a
+  // dangling id and fail validation on the next save — clear it too.
+  db.prepare('update rooms set default_responder_id = null where default_responder_id = ?').run(id)
 }
 
 /* --------------------------------------------------------------- messages */
@@ -1427,7 +1495,12 @@ export function listRoundReports(roomId: string, limit = 20): RoundReport[] {
         addUsage(tokens, turnTokens)
       }
       if (!turn.isRoundSummary) {
-        authorCharacterId = turn.characterId
+        // B15: provenance for the post-commit blind review must be the
+        // IMPLEMENTER (last turn that actually changed files), not the last
+        // speaker — after an auto blind review the last speaker is the
+        // reviewer, and the endpoint would then pick the real implementer to
+        // "independently" review itself.
+        if (turn.changed && turn.changed.length > 0) authorCharacterId = turn.characterId
         if (turn.output.trim()) delivery = turn.output.trim()
       }
     }
